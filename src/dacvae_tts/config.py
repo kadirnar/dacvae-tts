@@ -51,6 +51,10 @@ class TrainConfig:
     ema_decay: float = 0.999
     precision: str = "bf16"
     workers: int = 4
+    worker_threads: int = 1
+    prefetch_factor: int = 2
+    loader_start_method: str = "spawn"
+    cuda_prefetch: bool = True
     checkpoint_every: int = 2000
     validate_every: int = 1000
     log_every: int = 50
@@ -63,6 +67,10 @@ class TrainConfig:
     diagnostics_every: int = 0
 
     def __post_init__(self):
+        if self.worker_threads < 1 or self.prefetch_factor < 1:
+            raise ValueError("worker_threads and prefetch_factor must be positive")
+        if self.loader_start_method not in {"spawn", "forkserver"}:
+            raise ValueError("loader_start_method must be spawn or forkserver")
         if (
             min(
                 self.steps,

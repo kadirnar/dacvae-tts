@@ -126,6 +126,12 @@ class LatentDataset(Dataset):
     def __len__(self):
         return len(self.ids)
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # SQLite handles and mmap objects are reopened in each spawned worker.
+        state.update(_pid=None, _db=None, _maps=OrderedDict())
+        return state
+
     def _connection(self):
         if self._pid != os.getpid():
             self._db = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)

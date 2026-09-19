@@ -23,6 +23,9 @@ dacvae-tts = "dacvae_tts.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.data-files]
+"share/dacvae-tts/licenses/fast-dacvae" = ["third_party/fast-dacvae/LICENSE"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

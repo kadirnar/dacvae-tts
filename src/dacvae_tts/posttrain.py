@@ -20,10 +20,11 @@ from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
-from .codec import check_compatibility
+from .codec import backend_options, check_compatibility
 from .data import LatentDataset, collate, jsonl, move_batch
 from .inference import Synthesizer
 from .model import flow_loss, per_example_mse, sample
+from .parallel import loader_options
 from .training import Objective, atomic_save, autocast, distributed_device, load_model
 
 
@@ -45,7 +46,7 @@ def representation_id(checkpoint):
 
 
 def candidates(args):
-    tts = Synthesizer(args.checkpoint, args.device, args.precision)
+    tts = Synthesizer(args.checkpoint, args.device, args.precision, codec_options=backend_options(args))
     dataset = LatentDataset(args.cache, args.split)
     check_compatibility(dataset.meta, tts.checkpoint["codec"])
     if not torch.equal(dataset.mean, tts.mean.cpu()) or not torch.equal(dataset.std, tts.std.cpu()):
@@ -231,7 +232,7 @@ class PreferenceObjective(nn.Module):
 def distill_cache(args):
     if args.teacher_steps % args.student_steps or args.student_steps < 1:
         raise ValueError("teacher-steps must be divisible by student-steps")
-    tts = Synthesizer(args.checkpoint, args.device, args.precision)
+    tts = Synthesizer(args.checkpoint, args.device, args.precision, codec_options=backend_options(args))
     data = LatentDataset(args.cache, "train")
     check_compatibility(data.meta, tts.checkpoint["codec"])
     if not torch.equal(data.mean, tts.mean.cpu()) or not torch.equal(data.std, tts.std.cpu()):
@@ -356,7 +357,13 @@ def post_train(args):
             batch_size=args.batch_size,
             sampler=sampler,
             collate_fn=collator,
-            num_workers=args.workers,
+            **loader_options(
+                args.workers,
+                device,
+                getattr(args, "prefetch_factor", None) or 2,
+                getattr(args, "worker_threads", None) or 1,
+                getattr(args, "loader_start_method", None) or "spawn",
+            ),
             generator=torch.Generator().manual_seed(args.seed + rank),
         )
         optimizer = torch.optim.AdamW(

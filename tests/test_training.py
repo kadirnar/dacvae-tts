@@ -42,7 +42,9 @@ def run(args):
 def test_pretraining_resume_is_exact(cache, tmp_path, reduction):
     config = config_file(tmp_path)
     cfg = yaml.safe_load(config.read_text())
-    cfg["train"].update(flow_reduction=reduction, diagnostics_every=1)
+    cfg["train"].update(
+        flow_reduction=reduction, diagnostics_every=1, workers=2 if reduction == "frame" else 0
+    )
     config.write_text(yaml.safe_dump(cfg))
     base = ["-m", "dacvae_tts", "train", "--config", str(config), "--cache", str(cache), "--device", "cpu"]
     full, resumed = tmp_path / "full", tmp_path / "resumed"
@@ -61,7 +63,9 @@ def test_pretraining_resume_is_exact(cache, tmp_path, reduction):
 def test_two_rank_ddp_smoke(cache, tmp_path, reduction):
     config = config_file(tmp_path)
     cfg = yaml.safe_load(config.read_text())
-    cfg["train"].update(flow_reduction=reduction, diagnostics_every=1)
+    cfg["train"].update(
+        flow_reduction=reduction, diagnostics_every=1, workers=2 if reduction == "frame" else 0
+    )
     config.write_text(yaml.safe_dump(cfg))
     output = tmp_path / "ddp"
     run(

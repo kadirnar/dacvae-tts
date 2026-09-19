@@ -13,6 +13,24 @@ from .contracts import normalization_stats
 PREPROCESSING = "mono-mean_scipy-resample-poly_no-gain_no-trim_v1"
 
 
+def backend_options(args):
+    """Keep legacy callers and the reference backend's constructor compatible."""
+    if (
+        getattr(args, "codec_backend", "reference") == "reference"
+        and not getattr(args, "codec_compile", False)
+        and not getattr(args, "codec_graphs", False)
+        and getattr(args, "codec_layout", "native") == "native"
+    ):
+        return {}
+    return dict(
+        backend=getattr(args, "codec_backend", "reference"),
+        compile_model=getattr(args, "codec_compile", False),
+        cuda_graphs=getattr(args, "codec_graphs", False),
+        graph_max_shapes=getattr(args, "codec_graph_max_shapes", 4),
+        layout=getattr(args, "codec_layout", "native"),
+    )
+
+
 def file_digest(path):
     digest = hashlib.sha256()
     with open(path, "rb") as stream:
@@ -57,10 +75,24 @@ class Codec:
         *,
         encoder_only=False,
         fold_weight_norm=False,
+        backend="reference",
+        compile_model=False,
+        cuda_graphs=False,
+        graph_max_shapes=4,
+        graph_warmup=3,
+        layout="native",
     ):
         from dacvae import DACVAE
 
         self.device = torch.device(device)
+        if backend not in {"reference", "fast"}:
+            raise ValueError("Codec backend must be reference or fast")
+        if (compile_model or cuda_graphs or layout != "native") and backend != "fast":
+            raise ValueError("Codec layout/compile/graphs require --codec-backend fast")
+        if cuda_graphs and self.device.type != "cuda":
+            raise ValueError("Codec CUDA graphs require a CUDA device")
+        self.backend, self._fast = backend, None
+        self.runtime = dict(backend=backend, compile=compile_model, cuda_graphs=cuda_graphs, layout=layout)
         self.encoder_only = encoder_only
         path = Path(checkpoint)
         if not path.exists() and str(checkpoint).startswith("facebook/"):
@@ -75,9 +107,14 @@ class Codec:
             self.model.quantizer.in_proj.to(self.device)
         else:
             self.model.to(self.device)
-        if fold_weight_norm:
+        if fold_weight_norm or backend == "fast":
             # Frozen weights: materialize the exact effective weight once, not every forward.
-            for component in (self.model.encoder, self.model.quantizer.in_proj):
+            components = (
+                (self.model,)
+                if backend == "fast" and not encoder_only
+                else (self.model.encoder, self.model.quantizer.in_proj)
+            )
+            for component in components:
                 for module in component.modules():
                     if hasattr(module, "weight_g") and hasattr(module, "weight_v"):
                         torch.nn.utils.remove_weight_norm(module)
@@ -90,6 +127,13 @@ class Codec:
             z = self.encode(torch.zeros(self.sample_rate, device=self.device))
         self.latent_dim = z.size(-1)
         self.checkpoint = checkpoint
+        if backend == "fast":
+            from .fast_codec import SOURCE_REVISION, FastCodec
+
+            self._fast = FastCodec(
+                self.model, encoder_only, compile_model, cuda_graphs, graph_max_shapes, graph_warmup, layout
+            )
+            self.runtime["source_revision"] = SOURCE_REVISION
 
     @property
     def metadata(self):
@@ -102,6 +146,7 @@ class Codec:
             "format_version": 1,
             "weights_sha256": self.weights_sha256,
             "preprocessing": PREPROCESSING,
+            "codec_runtime": self.runtime,
         }
 
     def _posterior_mean(self, audio, precision="fp32"):
@@ -116,8 +161,11 @@ class Codec:
             ),
             torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=precision == "bf16"),
         ):
-            z = self.model.encoder(audio)
-            mean, _ = self.model.quantizer.in_proj(z).chunk(2, dim=1)
+            if getattr(self, "_fast", None) is not None:
+                mean = self._fast.encode(audio)
+            else:
+                z = self.model.encoder(audio)
+                mean, _ = self.model.quantizer.in_proj(z).chunk(2, dim=1)
         return mean
 
     @torch.inference_mode()
@@ -173,7 +221,21 @@ class Codec:
             raise ValueError(f"Codec.decode requires [frames,C={self.latent_dim}]")
         if not torch.isfinite(latents).all():
             raise ValueError("Cannot decode nonfinite latents")
-        waveform = self.model.decode(latents.to(self.device).T[None].contiguous())
+        inputs = latents.to(self.device).T[None].contiguous()
+        with (
+            torch.backends.cudnn.flags(
+                enabled=torch.backends.cudnn.enabled,
+                benchmark=torch.backends.cudnn.benchmark,
+                deterministic=torch.backends.cudnn.deterministic,
+                allow_tf32=False,
+            ),
+            torch.autocast(self.device.type, enabled=False),
+        ):
+            waveform = (
+                self._fast.decode(inputs.float(), self.model)
+                if getattr(self, "_fast", None)
+                else self.model.decode(inputs.float())
+            )
         return waveform[0, 0].float().cpu()
 
     @torch.inference_mode()

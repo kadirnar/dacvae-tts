@@ -20,6 +20,7 @@ from .config import Config
 from .data import BucketBatchSampler, LatentDataset, collate, move_batch
 from .diagnostics import ActivationProbe, gradient_contributions, gradient_groups, loss_buckets
 from .model import FlowTTS, flow_loss, reduce_flow
+from .parallel import device_batches, loader_options
 from .text import BYTE_OFFSET
 
 
@@ -126,7 +127,18 @@ def train(args):
         if (Path(args.output) / "last.pt").exists() and not args.resume:
             raise ValueError("Output already has a checkpoint; pass --resume or choose a new run directory")
         cfg = Config.load(args.config)
-        for key in ("steps", "batch_size", "accumulation", "workers", "precision", "learning_rate"):
+        for key in (
+            "steps",
+            "batch_size",
+            "accumulation",
+            "workers",
+            "precision",
+            "learning_rate",
+            "worker_threads",
+            "prefetch_factor",
+            "loader_start_method",
+            "cuda_prefetch",
+        ):
             value = getattr(args, key, None)
             if value is not None:
                 setattr(cfg.train, key, value)
@@ -157,9 +169,13 @@ def train(args):
             data,
             batch_sampler=sampler,
             collate_fn=collate,
-            num_workers=cfg.train.workers,
-            pin_memory=device.type == "cuda",
-            persistent_workers=cfg.train.workers > 0,
+            **loader_options(
+                cfg.train.workers,
+                device,
+                cfg.train.prefetch_factor,
+                cfg.train.worker_threads,
+                cfg.train.loader_start_method,
+            ),
             generator=loader_rng,
         )
         validation = None
@@ -266,8 +282,7 @@ def train(args):
             buckets = torch.zeros(9, 2, device=device)
             diagnostics = {}
             diagnose = cfg.train.diagnostics_every > 0 and step % cfg.train.diagnostics_every == 0
-            for micro, batch in enumerate(batches):
-                batch = move_batch(batch, device)
+            for micro, batch in enumerate(device_batches(batches, device, cfg.train.cuda_prefetch)):
                 sync = objective.no_sync() if world > 1 and micro < len(batches) - 1 else nullcontext()
                 with sync:
                     probe = ActivationProbe(model) if diagnose and micro == 0 else None

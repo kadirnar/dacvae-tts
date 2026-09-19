@@ -19,6 +19,7 @@ def main():
     p.add_argument("--manifest", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--codec", default="facebook/dacvae-watermarked")
+    add_codec_args(p)
     p.add_argument("--device", default="cuda")
     p.add_argument("--text-column", default="text")
     p.add_argument("--audio-column", default="audio")
@@ -28,7 +29,13 @@ def main():
     )
     p.add_argument("--min-seconds", type=float, default=1.0)
     p.add_argument("--max-seconds", type=float, default=15.0)
-    p.add_argument("--workers", type=int, default=4, help="CPU audio-loading threads per GPU; 0 is serial")
+    p.add_argument(
+        "--workers", type=int, default=4, help="CPU audio-loading workers per codec process; 0 is serial"
+    )
+    p.add_argument("--worker-backend", choices=["thread", "process"], default="thread")
+    p.add_argument(
+        "--worker-threads", type=positive_int, default=1, help="Torch threads per spawned CPU worker"
+    )
     p.add_argument("--prefetch", type=positive_int, default=16, help="Maximum queued CPU loading tasks")
     p.add_argument("--batch-size", type=positive_int, default=8, help="Maximum recordings per codec forward")
     p.add_argument(
@@ -70,6 +77,8 @@ def main():
     p.add_argument("--batch-size", type=positive_int)
     p.add_argument("--accumulation", type=positive_int)
     p.add_argument("--workers", type=int)
+    add_loader_args(p)
+    p.add_argument("--cuda-prefetch", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--precision", choices=["fp32", "bf16"])
     p.add_argument("--learning-rate", type=float)
     p.add_argument(
@@ -116,6 +125,7 @@ def main():
     p.add_argument("--device", default="cuda")
     p.add_argument("--limit", type=positive_int, default=32)
     p.add_argument("--cache-precision", choices=["float16", "float32"], default="float16")
+    add_codec_args(p)
 
     p = sub.add_parser(
         "make-cases", help="Freeze distinct original-audio reference/target pairs for evaluation"
@@ -193,6 +203,7 @@ def main():
     p.add_argument("--batch-size", type=positive_int, default=2)
     p.add_argument("--accumulation", type=positive_int, default=2)
     p.add_argument("--workers", type=int, default=2)
+    add_loader_args(p)
     p.add_argument("--precision", choices=["fp32", "bf16"], default="bf16")
     p.add_argument("--learning-rate", type=float, default=1e-5)
     p.add_argument("--beta", type=float, default=10.0)
@@ -257,7 +268,27 @@ def add_partition_args(parser):
     parser.add_argument("--seed", type=int, default=42)
 
 
+def add_codec_args(parser):
+    parser.add_argument("--codec-backend", choices=["reference", "fast"], default="reference")
+    parser.add_argument("--codec-compile", action="store_true", help="Compile the exact fast codec trunk")
+    parser.add_argument("--codec-graphs", action="store_true", help="Bounded repeated-shape CUDA graphs")
+    parser.add_argument("--codec-graph-max-shapes", type=positive_int, default=4)
+    parser.add_argument(
+        "--codec-layout",
+        choices=["native", "channels_last"],
+        default="native",
+        help="channels_last is experimental and can be slower in strict FP32",
+    )
+
+
+def add_loader_args(parser):
+    parser.add_argument("--worker-threads", type=positive_int)
+    parser.add_argument("--prefetch-factor", type=positive_int)
+    parser.add_argument("--loader-start-method", choices=["spawn", "forkserver"])
+
+
 def add_inference_args(parser, steps=True):
+    add_codec_args(parser)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="cuda")

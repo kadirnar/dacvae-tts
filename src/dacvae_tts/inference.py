@@ -7,7 +7,7 @@ from pathlib import Path
 import soundfile as sf
 import torch
 
-from .codec import Codec, check_compatibility, read_audio
+from .codec import Codec, backend_options, check_compatibility, read_audio
 from .contracts import normalization_stats, target_mask
 from .model import sample
 from .text import BYTE_OFFSET, tokenize
@@ -39,12 +39,13 @@ class Synthesizer:
         asr_model="small.en",
         asr_device="cpu",
         profile=False,
+        codec_options=None,
     ):
         started = time.perf_counter()
         self.device = torch.device(device)
         self.precision = precision
         self.model, self.checkpoint = load_model(checkpoint, device)
-        self.codec = Codec(self.checkpoint["codec"]["checkpoint"], device)
+        self.codec = Codec(self.checkpoint["codec"]["checkpoint"], device, **(codec_options or {}))
         check_compatibility(self.codec.metadata, self.checkpoint["codec"])
         self.mean = self.checkpoint["mean"].to(device)
         self.std = self.checkpoint["std"].to(device)
@@ -258,6 +259,7 @@ class Synthesizer:
                 "guidance": guidance,
                 "seed": seed,
                 "sway": sway,
+                "codec_runtime": getattr(self.codec, "runtime", {"backend": "reference"}),
                 "profiled_stages": stages,
                 **sampler_stats,
             },
@@ -273,6 +275,7 @@ def infer(args):
         args.asr_model,
         args.asr_device,
         args.profile,
+        codec_options=backend_options(args),
     )
     result = tts.synthesize(
         args.text,

@@ -27,6 +27,8 @@ design choices, quality risks, and post-training experiments. Core capabilities:
   train-only normalization, exact-audio deduplication and speaker-disjoint splits.
 - DDP, rank-balanced length buckets, gradient accumulation, EMA, cosine LR, validation
   loss, atomic checkpoints and exact same-topology pretraining resume.
+- An exact fast-dacvae adaptation with optional codec compilation/CUDA graphs;
+  parallel CPU or GPU preparation, spawned training workers and CUDA transfer prefetch.
 - WER/CER, official-model DNSMOS and speaker verification evaluation; offline
   preference learning with real-data replay; optional teacher-trajectory distillation.
 
@@ -82,10 +84,15 @@ the bounds are rejected; audio is never cropped while retaining the original tex
 ```bash
 bash scripts/prepare_8gpu.sh /dataset/manifest.jsonl /cache/english
 # Or /dataset/parquet-directory instead of the JSONL file.
-# Explicit per-GPU throughput controls (these are the defaults):
+# Explicit per-GPU throughput controls:
 bash scripts/prepare_8gpu.sh /dataset/parquet-directory /cache/english-fast \
   --workers 4 --prefetch 16 --batch-size 8 --bucket-size 256 \
   --batch-seconds 120 --precision fp32
+# Optional compiled native-convolution backend and spawned CPU decoding:
+bash scripts/prepare_8gpu.sh /dataset/parquet-directory /cache/english-compiled \
+  --codec-compile --worker-backend process --workers 2 --prefetch 8
+# CPU-only preparation with two codec processes:
+PREPARE_PROCESSES=2 bash scripts/prepare_cpu.sh /dataset/parquet-directory /cache/english-cpu
 ```
 
 This starts one frozen-codec encoder per GPU, writes `part-0` … `part-7`, then merges
@@ -94,6 +101,12 @@ batches equal hop-rounded lengths, folds frozen encoder weight normalization onc
 and leaves the unused decoder off GPU. A CUDA batch OOM retries smaller batches;
 single-recording OOMs and other codec failures stop the job instead of dropping data.
 The launcher respects an existing eight-device `CUDA_VISIBLE_DEVICES` assignment.
+Both launchers use `--codec-backend fast` with native convolutions; compilation and
+CUDA graphs are opt-in. The reference backend remains available for comparison.
+See [fast codec and CPU/GPU parallelism](docs/fast-codec-parallel.md) for provenance,
+measured speed, numerical checks, CPU DDP training and tuning controls. The fork's
+channels-last layout is experimental and was substantially slower in strict FP32
+on the tested GPU, so it is not the default.
 
 Directory inputs distribute files across encoders; single Parquet inputs distribute
 row groups when possible. A single JSONL file is scanned on each worker, but only

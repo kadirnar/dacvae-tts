@@ -19,6 +19,7 @@ class ToyCodec(Codec):
     """Biased convolutions make padding at the wrong boundary observable."""
 
     def __init__(self, *args, **kwargs):
+        self.runtime = {"backend": "reference"}
         self.device = torch.device("cpu")
         self.sample_rate, self.hop_length, self.latent_dim = 8000, 8, 4
         self.checkpoint, self.weights_sha256 = "fixture", "fixture"
@@ -303,7 +304,10 @@ def test_folded_codec_parameters_stay_frozen(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_launcher_preserves_gpu_assignment_and_skips_merge_on_failure(tmp_path, monkeypatch, fail):
+@pytest.mark.parametrize("device_kind", ["cuda", "cpu"])
+def test_launcher_preserves_gpu_assignment_and_skips_merge_on_failure(
+    tmp_path, monkeypatch, fail, device_kind
+):
     import os
     import subprocess
     import sys
@@ -333,11 +337,16 @@ else:
     monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
     devices = [f"GPU-{i}" for i in (7, 4, 1, 5, 0, 6, 2, 3)]
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ",".join(devices))
+    if device_kind == "cpu":
+        monkeypatch.setenv("PREPARE_PROCESSES", "2")
+        devices = ["", ""]
     if fail:
         monkeypatch.setenv("FAIL_PREPARE", "1")
     else:
         monkeypatch.delenv("FAIL_PREPARE", raising=False)
-    script = Path(__file__).resolve().parents[1] / "scripts/prepare_8gpu.sh"
+    script = Path(__file__).resolve().parents[1] / (
+        "scripts/prepare_8gpu.sh" if device_kind == "cuda" else "scripts/prepare_cpu.sh"
+    )
     output = tmp_path / "cache"
     result = subprocess.run(
         ["bash", str(script), "manifest.jsonl", str(output), "--batch-size", "4"],
@@ -351,4 +360,5 @@ else:
         for rank, device in enumerate(devices):
             launched = json.loads((output / f"part-{rank}/launch.json").read_text())
             assert launched["device"] == device
+            assert launched["args"][launched["args"].index("--device") + 1] == device_kind
             assert launched["args"][-2:] == ["--batch-size", "4"]

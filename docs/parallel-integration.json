@@ -1,0 +1,149 @@
+{
+  "scope": "Synthetic tones and two-step toy training; NOT speech quality or learnability",
+  "hardware": "1x RTX 5070 Ti, AMD Ryzen 5 5600",
+  "tests": [
+    {
+      "name": "prepare_cpu",
+      "wall_seconds": 10.029814556000929,
+      "command": [
+        "bash",
+        "scripts/prepare_cpu.sh",
+        "/tmp/dacvae-fast-prepare-smoke-20260919/manifest.jsonl",
+        "/tmp/dacvae-parallel-check-20260919/cpu-cache",
+        "--workers",
+        "2",
+        "--worker-backend",
+        "process",
+        "--prefetch",
+        "4",
+        "--bucket-size",
+        "8"
+      ]
+    },
+    {
+      "name": "train_cpu",
+      "wall_seconds": 5.138342076003028,
+      "command": [
+        "bash",
+        "scripts/train_cpu.sh",
+        "/tmp/dacvae-fast-prepare-smoke-20260919/toy.yaml",
+        "/tmp/dacvae-parallel-check-20260919/cpu-cache/merged",
+        "/tmp/dacvae-parallel-check-20260919/cpu-train",
+        "--batch-size",
+        "1",
+        "--accumulation",
+        "2",
+        "--no-validation"
+      ]
+    },
+    {
+      "name": "cuda-prefetch",
+      "wall_seconds": 4.189956287998939,
+      "command": [
+        "/home/kadir/kadir_projects/github/dacvae-tts/.venv/bin/python",
+        "-m",
+        "dacvae_tts",
+        "train",
+        "--config",
+        "/tmp/dacvae-fast-prepare-smoke-20260919/toy.yaml",
+        "--cache",
+        "/tmp/dacvae-fast-prepare-smoke-20260919/cache",
+        "--output",
+        "/tmp/dacvae-parallel-check-20260919/cuda-prefetch",
+        "--workers",
+        "2",
+        "--accumulation",
+        "2",
+        "--cuda-prefetch"
+      ]
+    },
+    {
+      "name": "no-cuda-prefetch",
+      "wall_seconds": 3.990781448999769,
+      "command": [
+        "/home/kadir/kadir_projects/github/dacvae-tts/.venv/bin/python",
+        "-m",
+        "dacvae_tts",
+        "train",
+        "--config",
+        "/tmp/dacvae-fast-prepare-smoke-20260919/toy.yaml",
+        "--cache",
+        "/tmp/dacvae-fast-prepare-smoke-20260919/cache",
+        "--output",
+        "/tmp/dacvae-parallel-check-20260919/no-cuda-prefetch",
+        "--workers",
+        "2",
+        "--accumulation",
+        "2",
+        "--no-cuda-prefetch"
+      ]
+    },
+    {
+      "name": "cuda_prefetch_model_equivalence",
+      "result": "bitwise_equal_after_two_updates"
+    },
+    {
+      "name": "prepare_gpu",
+      "wall_seconds": 10.023413233997417,
+      "command": [
+        "/home/kadir/kadir_projects/github/dacvae-tts/.venv/bin/python",
+        "-m",
+        "dacvae_tts",
+        "prepare",
+        "--manifest",
+        "/tmp/dacvae-fast-prepare-smoke-20260919/manifest.jsonl",
+        "--output",
+        "/tmp/dacvae-parallel-check-20260919/gpu-cache",
+        "--codec-backend",
+        "fast",
+        "--codec-compile",
+        "--codec-graphs",
+        "--workers",
+        "2",
+        "--worker-backend",
+        "process",
+        "--batch-size",
+        "2",
+        "--bucket-size",
+        "2",
+        "--prefetch",
+        "4"
+      ]
+    },
+    {
+      "name": "infer",
+      "wall_seconds": 11.014583069001674,
+      "command": [
+        "/home/kadir/kadir_projects/github/dacvae-tts/.venv/bin/python",
+        "-m",
+        "dacvae_tts",
+        "infer",
+        "--checkpoint",
+        "/tmp/dacvae-parallel-check-20260919/cuda-prefetch/last.pt",
+        "--ref-audio",
+        "/tmp/dacvae-fast-prepare-smoke-20260919/tone-4.wav",
+        "--reference-text",
+        "Synthetic test words.",
+        "--text",
+        "Synthetic test words.",
+        "--seconds",
+        "1",
+        "--steps",
+        "2",
+        "--codec-backend",
+        "fast",
+        "--codec-compile",
+        "--codec-graphs",
+        "--profile",
+        "--output",
+        "/tmp/dacvae-parallel-check-20260919/synthetic-inference.wav"
+      ]
+    }
+  ],
+  "environment": {
+    "OMP_NUM_THREADS": "2",
+    "MKL_NUM_THREADS": "2",
+    "OPENBLAS_NUM_THREADS": "1"
+  },
+  "unit_tests": "95 passed"
+}

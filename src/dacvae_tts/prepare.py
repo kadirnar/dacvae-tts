@@ -1,11 +1,13 @@
 import hashlib
 import io
 import json
+import multiprocessing
 import sqlite3
 import time
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import closing
+from functools import partial
 from itertools import islice
 from pathlib import Path
 
@@ -14,8 +16,9 @@ import soundfile as sf
 import torch
 from tqdm import tqdm
 
-from .codec import Codec, check_compatibility, file_digest, read_audio
+from .codec import Codec, backend_options, check_compatibility, file_digest, read_audio
 from .data import SCHEMA, ShardWriter, save_stats, speaker_split
+from .parallel import initialize_worker
 from .text import normalize
 
 
@@ -93,12 +96,22 @@ def source_rows(path, shard_index=0, num_shards=1):
                 index += 1
 
 
-def ordered_prefetch(function, rows, workers, prefetch):
-    """Bounded threaded CPU decoding; results retain manifest order on every rank."""
+def ordered_prefetch(function, rows, workers, prefetch, backend="thread", worker_threads=1):
+    """Bounded CPU decoding; results retain manifest order on every rank."""
+    if workers < 0 or prefetch < 1 or worker_threads < 1 or backend not in {"thread", "process"}:
+        raise ValueError("Invalid CPU prefetch configuration")
     if workers == 0:
         yield from map(function, rows)
         return
-    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="audio-decode")
+    executor = (
+        ThreadPoolExecutor(max_workers=workers, thread_name_prefix="audio-decode")
+        if backend == "thread"
+        else ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=partial(initialize_worker, threads=worker_threads),
+        )
+    )
     pending = deque()
     rows = iter(rows)
     try:
@@ -225,7 +238,10 @@ def prepare(args):
     if (out / "index.sqlite").exists():
         raise ValueError("Output already contains a cache; use a new partition directory")
     started = time.perf_counter()
-    codec = Codec(args.codec, args.device, encoder_only=True, fold_weight_norm=fold)
+    options = backend_options(args)
+    if options.get("backend") == "fast" and not fold:
+        raise ValueError("Fast codec requires folded weight normalization")
+    codec = Codec(args.codec, args.device, encoder_only=True, fold_weight_norm=fold, **options)
     if precision == "bf16" and (codec.device.type != "cuda" or not torch.cuda.is_bf16_supported()):
         raise ValueError("BF16 cache encoding requires a BF16-capable CUDA device")
     setup_seconds = time.perf_counter() - started
@@ -242,7 +258,12 @@ def prepare(args):
     db.executescript(SCHEMA)
     rows = source_rows(args.manifest, args.shard_index, args.num_shards)
     records = ordered_prefetch(
-        lambda row: prepare_record(row, args, root, codec.sample_rate), rows, workers, prefetch
+        partial(prepare_record, args=args, root=root, sample_rate=codec.sample_rate),
+        rows,
+        workers,
+        prefetch,
+        getattr(args, "worker_backend", "thread"),
+        getattr(args, "worker_threads", 1),
     )
     try:
         with closing(records), open(out / "rejected.jsonl", "w") as failures, tqdm(desc="Encode") as bar:
@@ -348,6 +369,10 @@ def prepare(args):
         },
         "preparation": {
             "workers": workers,
+            "worker_backend": getattr(args, "worker_backend", "thread"),
+            "worker_threads": getattr(args, "worker_threads", 1),
+            "codec_runtime": codec.metadata.get("codec_runtime", {"backend": "reference"}),
+            "codec_graphs": codec._fast.graph_statistics() if getattr(codec, "_fast", None) else {},
             "prefetch": prefetch,
             "batch_size": batch_size,
             "bucket_size": bucket_size,

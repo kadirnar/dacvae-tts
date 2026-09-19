@@ -16,7 +16,8 @@ from types import SimpleNamespace
 import soundfile as sf
 import torch
 
-from dacvae_tts.codec import Codec
+from dacvae_tts.cli import add_codec_args
+from dacvae_tts.codec import Codec, backend_options
 from dacvae_tts.prepare import encode_records, prepare
 
 
@@ -65,6 +66,11 @@ def benchmark_pipeline(args, records, sample_rate):
                     bucket_size=1 if name == "serial" else 256,
                     batch_seconds=args.batch_seconds,
                     no_fold_weight_norm=name == "serial",
+                    **(
+                        {key: value for key, value in vars(args).items() if key.startswith("codec_")}
+                        if name == "optimized"
+                        else {}
+                    ),
                 )
                 tick = time.perf_counter()
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -93,6 +99,7 @@ def benchmark_pipeline(args, records, sample_rate):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--codec", default="facebook/dacvae-watermarked")
+    add_codec_args(parser)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--records", type=int, default=32)
     parser.add_argument("--repeats", type=int, default=3)
@@ -101,13 +108,20 @@ def main():
     parser.add_argument("--precision", choices=["fp32", "bf16"], default="fp32")
     parser.add_argument("--output", required=True)
     parser.add_argument("--pipeline", action="store_true", help="Also benchmark temporary WAV-to-cache jobs")
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="Record failed numerical comparisons without aborting this synthetic benchmark",
+    )
     args = parser.parse_args()
     if min(args.records, args.repeats, args.batch_size, args.batch_seconds) < 1:
         parser.error("record/repeat/batch limits must be positive")
     torch.set_num_threads(2)
     torch.manual_seed(42)
     baseline = Codec(args.codec, args.device, encoder_only=True)
-    optimized = Codec(args.codec, args.device, encoder_only=True, fold_weight_norm=True)
+    optimized = Codec(
+        args.codec, args.device, encoder_only=True, fold_weight_norm=True, **backend_options(args)
+    )
     assert not any(p.requires_grad for p in optimized.model.parameters())
     records = []
     for i in range(args.records):
@@ -150,6 +164,7 @@ def main():
     report = {
         "scope": "warm encoder + transfers only; synthetic signals; excludes disk, merge, decoder and startup",
         "codec": baseline.metadata,
+        "optimized_codec": optimized.metadata,
         "torch_version": torch.__version__,
         "device": torch.cuda.get_device_name(optimized.device) if optimized.device.type == "cuda" else "cpu",
         "records": args.records,
@@ -171,9 +186,18 @@ def main():
         if optimized.device.type == "cuda"
         else None,
     }
-    if args.precision == "fp32":
-        for expected, actual in zip(reference, output, strict=True):
-            torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+    mismatch_count = sum(
+        int((~torch.isclose(a, b, atol=2e-4, rtol=2e-4)).sum())
+        for a, b in zip(reference, output, strict=True)
+    )
+    report["numerical_check"] = dict(
+        atol=2e-4,
+        rtol=2e-4,
+        mismatched_values=mismatch_count,
+        total_values=sum(z.numel() for z in reference),
+        passed=mismatch_count == 0,
+        report_only=args.report_only,
+    )
     if args.pipeline:
         sample_rate = baseline.sample_rate
         del baseline, optimized
@@ -183,6 +207,8 @@ def main():
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
+    if args.precision == "fp32" and mismatch_count and not args.report_only:
+        raise AssertionError(f"FP32 numerical gate failed for {mismatch_count} values; see {args.output}")
 
 
 if __name__ == "__main__":

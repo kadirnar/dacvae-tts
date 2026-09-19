@@ -11,7 +11,7 @@ import numpy as np
 import soundfile as sf
 import yaml
 
-from .codec import Codec, check_compatibility, file_digest, read_audio
+from .codec import Codec, backend_options, check_compatibility, file_digest, read_audio
 from .data import LatentDataset, jsonl, load_stats
 from .inference import Synthesizer
 from .metrics import Evaluator, summarize
@@ -110,7 +110,7 @@ def codec_reconstruct(args):
     root = Path(args.cache)
     meta = json.loads((root / "metadata.json").read_text())
     stats = load_stats(root)
-    codec = Codec(meta["checkpoint"], args.device)
+    codec = Codec(meta["checkpoint"], args.device, **backend_options(args))
     check_compatibility(codec.metadata, meta)
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -272,7 +272,11 @@ def run_eval(args):
     output = Path(config["output"]).resolve()
     output.mkdir(parents=True, exist_ok=True)
     tts = Synthesizer(
-        config["checkpoint"], config.get("device", "cuda"), config.get("precision", "bf16"), profile=True
+        config["checkpoint"],
+        config.get("device", "cuda"),
+        config.get("precision", "bf16"),
+        profile=True,
+        codec_options=config.get("codec_options"),
     )
     if "reference_paths" in config:
         if config["reference_paths"] not in {"both", "full", "summary"}:
