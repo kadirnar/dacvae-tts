@@ -1,0 +1,251 @@
+import argparse
+import json
+
+
+def positive_int(value):
+    result = int(value)
+    if result < 1:
+        raise argparse.ArgumentTypeError("must be positive")
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Compact DACVAE flow TTS")
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("inspect", help="Count trainable TTS parameters; excludes frozen codec")
+    p.add_argument("--config", default="configs/tiny.yaml")
+
+    p = sub.add_parser("prepare", help="Stream JSONL/Parquet audio into a latent-cache partition")
+    p.add_argument("--manifest", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--codec", default="facebook/dacvae-watermarked")
+    p.add_argument("--device", default="cuda")
+    p.add_argument("--text-column", default="text")
+    p.add_argument("--audio-column", default="audio")
+    p.add_argument("--speaker-column", default="speaker_id")
+    p.add_argument(
+        "--text-normalization", choices=["unicode-v1", "english-explicit-v2"], default="unicode-v1"
+    )
+    p.add_argument("--min-seconds", type=float, default=1.0)
+    p.add_argument("--max-seconds", type=float, default=15.0)
+    add_partition_args(p)
+
+    p = sub.add_parser("merge", help="Merge partitions, deduplicate, check splits and calculate statistics")
+    p.add_argument("--inputs", nargs="+", required=True)
+    p.add_argument("--output", required=True)
+
+    p = sub.add_parser("train", help="Pretrain from scratch; launch with torchrun for DDP")
+    p.add_argument("--config", required=True)
+    p.add_argument("--cache", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--resume")
+    p.add_argument("--device", default="auto", choices=["auto", "cpu"])
+    p.add_argument("--steps", type=positive_int)
+    p.add_argument("--batch-size", type=positive_int)
+    p.add_argument("--accumulation", type=positive_int)
+    p.add_argument("--workers", type=int)
+    p.add_argument("--precision", choices=["fp32", "bf16"])
+    p.add_argument("--learning-rate", type=float)
+    p.add_argument(
+        "--frame-budget",
+        type=int,
+        default=0,
+        help="Maximum padded prompt+target frames per rank/microbatch; 0 disables",
+    )
+    p.add_argument("--compile", action="store_true")
+    p.add_argument("--no-validation", action="store_true", help="For smoke tests only")
+    p.add_argument(
+        "--stop-after", type=positive_int, help="Gracefully checkpoint early without changing LR schedule"
+    )
+
+    p = sub.add_parser("infer", help="Synthesize using a complete reference utterance and transcript")
+    add_inference_args(p)
+    p.add_argument("--reference", "--ref-audio", dest="reference", required=True)
+    p.add_argument(
+        "--reference-text", help="Optional; omitted transcripts use ASR, not a transcript-free TTS model"
+    )
+    p.add_argument("--asr-model", default="small.en")
+    p.add_argument("--asr-device", choices=["cpu", "cuda"], default="cpu")
+    p.add_argument("--profile", action="store_true")
+    p.add_argument("--text", required=True)
+    p.add_argument("--seconds", type=float)
+    p.add_argument("--duration-scale", type=float, default=1.0)
+    p.add_argument("--compile", action="store_true")
+    p.add_argument("--seed", type=int, default=42)
+
+    p = sub.add_parser(
+        "audit-cache",
+        help="Read-only audit of speaker balance, splits, supplied sessions/intervals and optional latents",
+    )
+    p.add_argument("--cache", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--scan-latents", action="store_true")
+
+    p = sub.add_parser(
+        "codec-reconstruct", help="Reconstruct original audio through the production codec and normalization"
+    )
+    p.add_argument("--manifest", required=True)
+    p.add_argument("--cache", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--device", default="cuda")
+    p.add_argument("--limit", type=positive_int, default=32)
+    p.add_argument("--cache-precision", choices=["float16", "float32"], default="float16")
+
+    p = sub.add_parser(
+        "make-cases", help="Freeze distinct original-audio reference/target pairs for evaluation"
+    )
+    p.add_argument("--cache", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--split", choices=["train", "val", "test"], default="val")
+    p.add_argument("--limit", type=positive_int, default=1000)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--cross-session", action="store_true")
+
+    p = sub.add_parser(
+        "run-eval", help="Run a bounded, configured duration/sampler/profile comparison on frozen cases"
+    )
+    p.add_argument("--config", required=True)
+
+    p = sub.add_parser("candidates", help="Generate a pool for evaluation or offline preferences")
+    add_inference_args(p)
+    add_partition_args(p)
+    p.add_argument("--cache", required=True)
+    p.add_argument("--split", choices=["train", "val", "test"], default="train")
+    p.add_argument("--limit", type=positive_int, default=1000)
+    p.add_argument("--candidates", type=positive_int, default=4)
+    p.add_argument("--duration-scale", type=float, default=1.0)
+
+    p = sub.add_parser("evaluate", help="Score synthesized audio; optional external frozen judges")
+    p.add_argument("--manifest", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    p.add_argument("--asr-model", default="large-v3")
+    p.add_argument("--dnsmos-model", help="Path to official non-personalized sig_bak_ovr.onnx")
+    p.add_argument("--speaker-model", default="microsoft/wavlm-base-plus-sv")
+    p.add_argument("--no-speaker", action="store_true")
+    p.add_argument(
+        "--metric-normalization",
+        choices=["english-unicode-v2", "legacy-ascii-v1"],
+        default="english-unicode-v2",
+    )
+
+    p = sub.add_parser(
+        "compare", help="Paired before/after metrics with speaker-clustered bootstrap intervals"
+    )
+    p.add_argument("--before", required=True)
+    p.add_argument("--after", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--bootstrap", type=positive_int, default=2000)
+    p.add_argument("--seed", type=int, default=42)
+
+    p = sub.add_parser("rank-pairs", help="Select non-regressing metric-ranked training pairs")
+    p.add_argument("--scores", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--min-margin", type=float, default=0.05)
+    p.add_argument("--max-wer", type=float, default=0.1)
+    p.add_argument("--max-cer", type=float, default=0.05)
+    p.add_argument("--min-similarity", type=float, default=0.6)
+
+    p = sub.add_parser("distill-cache", help="Save coarse segments from an in-domain teacher's trajectories")
+    add_inference_args(p, steps=False)
+    add_partition_args(p)
+    p.add_argument("--cache", required=True)
+    p.add_argument("--limit", type=positive_int, default=1000)
+    p.add_argument("--teacher-steps", type=positive_int, default=32)
+    p.add_argument("--student-steps", type=positive_int, default=8)
+
+    p = sub.add_parser(
+        "post-train", help="Experimental preference learning or trajectory distillation with DDP"
+    )
+    p.add_argument("--mode", choices=["preference", "distill"], required=True)
+    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--cache", required=True)
+    p.add_argument("--data", required=True, help="Pair or trajectory JSONL")
+    p.add_argument("--output", required=True)
+    p.add_argument("--device", default="auto", choices=["auto", "cpu"])
+    p.add_argument("--steps", type=positive_int, default=1000)
+    p.add_argument("--batch-size", type=positive_int, default=2)
+    p.add_argument("--accumulation", type=positive_int, default=2)
+    p.add_argument("--workers", type=int, default=2)
+    p.add_argument("--precision", choices=["fp32", "bf16"], default="bf16")
+    p.add_argument("--learning-rate", type=float, default=1e-5)
+    p.add_argument("--beta", type=float, default=10.0)
+    p.add_argument("--anchor", type=float, default=0.1)
+    p.add_argument("--replay-weight", type=float, default=1.0)
+    p.add_argument("--grad-checkpoint", action="store_true")
+    p.add_argument("--save-every", type=positive_int, default=100)
+    p.add_argument("--seed", type=int, default=42)
+
+    args = parser.parse_args()
+    if hasattr(args, "num_shards") and not 0 <= args.shard_index < args.num_shards:
+        parser.error("shard-index must be between zero and num-shards - 1")
+    if args.command == "inspect":
+        from .config import Config
+        from .model import FlowTTS
+
+        cfg = Config.load(args.config)
+        model = FlowTTS(cfg.model)
+        print(
+            json.dumps(
+                {
+                    "parameters": sum(p.numel() for p in model.parameters()),
+                    "config": cfg.to_dict(),
+                    "codec_included": False,
+                },
+                indent=2,
+            )
+        )
+    elif args.command in {"prepare", "merge"}:
+        from . import prepare
+
+        getattr(prepare, args.command)(args)
+    elif args.command == "train":
+        from .training import train
+
+        train(args)
+    elif args.command == "infer":
+        from .inference import infer
+
+        infer(args)
+    elif args.command == "evaluate":
+        from .metrics import evaluate
+
+        evaluate(args)
+    elif args.command == "compare":
+        from .comparison import compare
+
+        compare(args)
+    elif args.command in {"audit-cache", "codec-reconstruct", "make-cases", "run-eval"}:
+        from . import experiments
+
+        getattr(experiments, args.command.replace("-", "_"))(args)
+    else:
+        from . import posttrain
+
+        getattr(posttrain, args.command.replace("-", "_"))(args)
+
+
+def add_partition_args(parser):
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--num-shards", type=positive_int, default=1)
+    parser.add_argument("--seed", type=int, default=42)
+
+
+def add_inference_args(parser, steps=True):
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--precision", choices=["fp32", "bf16"], default="bf16")
+    if steps:
+        parser.add_argument("--steps", type=positive_int, default=16)
+    parser.add_argument(
+        "--guidance",
+        type=float,
+        default=1.5,
+        help="1 disables CFG; use 1 for a distilled model with baked-in guidance",
+    )
+    parser.add_argument("--sway", type=float, default=-1.0)
+
+
+if __name__ == "__main__":
+    main()

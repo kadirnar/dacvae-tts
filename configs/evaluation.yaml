@@ -1,0 +1,20 @@
+# Replace paths with a real checkpoint and frozen cases. No jobs run merely by creating this file.
+checkpoint: runs/tiny/last.pt
+cases: data/evaluation-cases.jsonl
+output: outputs/duration-evaluation
+max_cases: 32
+device: cuda
+precision: bf16
+sampling:
+  steps: [16]
+  guidance: [1.5]
+  sway: [-1.0]
+  duration: [ground_truth, predicted]
+  duration_scale: [1.0]
+  seed: [42]
+# Optional. Omit to generate manifests for scoring in a separate evaluator environment.
+# judges:
+#   asr_model: large-v3
+#   dnsmos_model: /models/DNSMOS/sig_bak_ovr.onnx
+#   speaker_model: microsoft/wavlm-base-plus-sv
+#   device: cpu

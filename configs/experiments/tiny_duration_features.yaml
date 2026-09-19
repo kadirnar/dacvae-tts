@@ -1,0 +1,25 @@
+# Experimental; quality has not been established.
+model:
+  depth: 8
+  heads: 4
+  latent_dim: 128
+  patch_size: 2
+  text_depth: 3
+  width: 256
+  duration_features: text_stats
+train:
+  accumulation: 2
+  batch_size: 16
+  checkpoint_every: 2000
+  compile: false
+  ema_decay: 0.999
+  grad_checkpoint: false
+  learning_rate: 0.0003
+  log_every: 50
+  precision: bf16
+  seed: 42
+  steps: 200000
+  validate_every: 1000
+  warmup: 5000
+  weight_decay: 0.01
+  workers: 4

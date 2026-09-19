@@ -1,0 +1,229 @@
+"""Optional, frozen evaluators. Missing models produce errors, never proxy scores."""
+
+import importlib.metadata
+import json
+import re
+import unicodedata
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.nn import functional as F
+
+from .codec import file_digest, read_audio
+from .data import jsonl
+
+
+def metric_text(text, version="english-unicode-v2"):
+    text = unicodedata.normalize("NFKC", text).lower().replace("’", "'")
+    if version == "legacy-ascii-v1":
+        text = re.sub(r"[^a-z0-9'\s]", " ", text)
+    elif version == "english-unicode-v2":
+        text = "".join(
+            c if c.isalnum() or c.isspace() or c == "'" or unicodedata.category(c) == "Mn" else " "
+            for c in text
+        )
+    else:
+        raise ValueError("Unsupported metric normalization version")
+    return " ".join(text.split())
+
+
+def edit_distance(reference, hypothesis):
+    previous = list(range(len(hypothesis) + 1))
+    for i, ref in enumerate(reference, 1):
+        current = [i]
+        for j, hyp in enumerate(hypothesis, 1):
+            current.append(min(current[-1] + 1, previous[j] + 1, previous[j - 1] + (ref != hyp)))
+        previous = current
+    return previous[-1]
+
+
+def word_edit_counts(reference, hypothesis):
+    previous = [(j, 0, 0, j) for j in range(len(hypothesis) + 1)]
+    for i, ref in enumerate(reference, 1):
+        current = [(i, 0, i, 0)]
+        for j, hyp in enumerate(hypothesis, 1):
+            d, s, de, ins = previous[j - 1]
+            diagonal = (d + (ref != hyp), s + (ref != hyp), de, ins)
+            d, s, de, ins = previous[j]
+            deletion = (d + 1, s, de + 1, ins)
+            d, s, de, ins = current[-1]
+            insertion = (d + 1, s, de, ins + 1)
+            current.append(min((diagonal, deletion, insertion), key=lambda item: item[0]))
+        previous = current
+    return previous[-1]
+
+
+def error_counts(reference, hypothesis, normalization="english-unicode-v2"):
+    ref, hyp = metric_text(reference, normalization), metric_text(hypothesis, normalization)
+    if not ref:
+        raise ValueError("Reference transcript is empty after metric normalization")
+    rw, hw = ref.split(), hyp.split()
+    rc, hc = ref.replace(" ", ""), hyp.replace(" ", "")
+    we, substitutions, deletions, insertions = word_edit_counts(rw, hw)
+    ce = edit_distance(rc, hc)
+    return {
+        "word_edits": we,
+        "words": len(rw),
+        "char_edits": ce,
+        "chars": len(rc),
+        "wer": we / len(rw),
+        "cer": ce / len(rc),
+        "word_substitutions": substitutions,
+        "word_deletions": deletions,
+        "word_insertions": insertions,
+    }
+
+
+class DNSMOS:
+    """Official non-personalized SIG/BAK/OVRL ONNX model, 9.01s windows / 1s hop.
+
+    Calibration follows Microsoft's DNS-Challenge/DNSMOS/dnsmos_local.py.
+    P.808 is a different model/metric and is deliberately not reported as OVRL.
+    """
+
+    def __init__(self, model_path):
+        import onnxruntime as ort
+
+        self.session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        self.input_name = self.session.get_inputs()[0].name
+
+    def __call__(self, audio):
+        audio = np.asarray(audio, dtype=np.float32)
+        if not audio.size or not np.isfinite(audio).all():
+            raise ValueError("Cannot score empty/nonfinite audio")
+        size, hop = 144160, 16000
+        while len(audio) < size:
+            audio = np.tile(audio, 2)
+        outputs = []
+        calibration = [
+            (-0.08397278, 1.22083953, 0.0052439),
+            (-0.13166888, 1.60915514, -0.39604546),
+            (-0.06766283, 1.11546468, 0.04602535),
+        ]
+        # Preserve the official implementation's integer-second hop-count convention.
+        num_hops = int(np.floor(len(audio) / hop) - 9.01) + 1
+        for index in range(num_hops):
+            start = index * hop
+            raw = np.asarray(
+                self.session.run(None, {self.input_name: audio[None, start : start + size]})[0]
+            ).reshape(-1)
+            if raw.size != 3:
+                raise ValueError("Expected the standard sig_bak_ovr.onnx DNSMOS model")
+            outputs.append([np.polyval(coeff, value) for coeff, value in zip(calibration, raw)])
+        scores = np.mean(outputs, axis=0)
+        return dict(zip(("dnsmos_sig", "dnsmos_bak", "dnsmos_ovrl"), map(float, scores)))
+
+
+class Evaluator:
+    def __init__(
+        self,
+        asr_model="large-v3",
+        dnsmos_model=None,
+        speaker_model="microsoft/wavlm-base-plus-sv",
+        device="cpu",
+        metric_normalization="english-unicode-v2",
+    ):
+        from faster_whisper import WhisperModel
+
+        self.asr = WhisperModel(
+            asr_model, device=device, compute_type="float16" if device == "cuda" else "int8"
+        )
+        self.dnsmos = DNSMOS(dnsmos_model) if dnsmos_model else None
+        self.device = torch.device(device)
+        self.speaker_name = speaker_model
+        self.asr_name = asr_model
+        self.metric_normalization = metric_normalization
+        self.dnsmos_path = str(dnsmos_model) if dnsmos_model else None
+        self.extractor = self.speaker = None
+        if speaker_model:
+            from transformers import AutoFeatureExtractor, AutoModelForAudioXVector
+
+            self.extractor = AutoFeatureExtractor.from_pretrained(speaker_model)
+            self.speaker = AutoModelForAudioXVector.from_pretrained(speaker_model).to(device).eval()
+        self.identity = {
+            "asr_model": asr_model,
+            "faster_whisper_version": importlib.metadata.version("faster-whisper"),
+            "speaker_model": speaker_model,
+            "speaker_revision": getattr(getattr(self.speaker, "config", None), "_commit_hash", None),
+            "dnsmos_sha256": file_digest(dnsmos_model) if dnsmos_model else None,
+            "metric_normalization": metric_normalization,
+        }
+
+    @torch.inference_mode()
+    def embedding(self, audio):
+        inputs = self.extractor(audio.numpy(), sampling_rate=16000, return_tensors="pt", padding=True)
+        inputs = {key: value.to(self.device) for key, value in inputs.items()}
+        return F.normalize(self.speaker(**inputs).embeddings.float(), dim=-1)
+
+    def score(self, audio_path, text, reference_path=None):
+        audio = read_audio(audio_path, 16000)
+        segments, _ = self.asr.transcribe(
+            audio.numpy(), language="en", beam_size=5, vad_filter=False, condition_on_previous_text=False
+        )
+        hypothesis = " ".join(segment.text for segment in segments)
+        result = {
+            **error_counts(text, hypothesis, self.metric_normalization),
+            "hypothesis": hypothesis,
+            "audio_seconds": len(audio) / 16000,
+            "clipped_fraction": float((audio.abs() >= 0.999).float().mean()),
+            "evaluator": self.identity,
+        }
+        if self.dnsmos:
+            result.update(self.dnsmos(audio.numpy()))
+        if self.speaker is not None and reference_path:
+            ref = read_audio(reference_path, 16000)
+            result["speaker_similarity"] = float((self.embedding(audio) * self.embedding(ref)).sum())
+        return result
+
+
+def summarize(rows):
+    if not rows:
+        raise ValueError("No successful evaluation rows")
+    result = {"count": len(rows)}
+    for prefix, denominator in (("word", "words"), ("char", "chars")):
+        result["wer" if prefix == "word" else "cer"] = sum(r[f"{prefix}_edits"] for r in rows) / sum(
+            r[denominator] for r in rows
+        )
+    for key in ("dnsmos_sig", "dnsmos_bak", "dnsmos_ovrl", "speaker_similarity", "rtf"):
+        if all(key in row for row in rows):
+            result[key] = float(np.mean([row[key] for row in rows]))
+    return result
+
+
+def evaluate(args):
+    evaluator = Evaluator(
+        args.asr_model,
+        args.dnsmos_model,
+        None if args.no_speaker else args.speaker_model,
+        args.device,
+        getattr(args, "metric_normalization", "english-unicode-v2"),
+    )
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.exists():
+        raise ValueError("Evaluation output exists; use a new path")
+    rows, failed = [], 0
+    with open(out, "w") as stream:
+        for row in jsonl(args.manifest):
+            try:
+                result = {**row, **evaluator.score(row["audio"], row["text"], row.get("reference_audio"))}
+                rows.append(result)
+            except (ValueError, OSError) as exc:
+                result = {**row, "error": str(exc)}
+                failed += 1
+            stream.write(json.dumps(result) + "\n")
+    summary = summarize(rows)
+    summary.update(
+        {
+            "failed": failed,
+            "failure_rate": failed / (len(rows) + failed),
+            "asr_model": args.asr_model,
+            "speaker_model": evaluator.speaker_name,
+            "dnsmos_model": evaluator.dnsmos_path,
+            "normalization": evaluator.metric_normalization,
+            "evaluator": evaluator.identity,
+        }
+    )
+    out.with_suffix(".summary.json").write_text(json.dumps(summary, indent=2))
+    print(json.dumps(summary, indent=2))

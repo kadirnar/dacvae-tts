@@ -1,0 +1,25 @@
+# Run explicitly on a small CLEAN SPEECH subset, not the full corpus.
+model:
+  depth: 8
+  heads: 4
+  latent_dim: 128
+  patch_size: 2
+  text_depth: 3
+  width: 256
+train:
+  accumulation: 1
+  batch_size: 4
+  checkpoint_every: 100
+  compile: false
+  ema_decay: 0.999
+  grad_checkpoint: false
+  learning_rate: 0.0003
+  log_every: 10
+  precision: bf16
+  seed: 42
+  steps: 500
+  validate_every: 100
+  warmup: 25
+  weight_decay: 0.01
+  workers: 0
+  diagnostics_every: 50

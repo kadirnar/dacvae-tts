@@ -1,0 +1,6 @@
+{
+  "source_sha256": "57f91c31b83980e3547af75208a093da3c9f01ce2e6ae8cdf628dfa8a117983b",
+  "checkpoint_status": "No trained checkpoint in repository. Saved deterministic Tiny initialization only.",
+  "baseline_tests": "18 passed before changes; archived-source rerun recorded in docs/validation-results.json",
+  "seed": 42
+}
