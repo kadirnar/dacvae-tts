@@ -1,0 +1,51 @@
+{
+  "scope": "warm encoder + transfers only; synthetic signals; excludes disk, merge, decoder and startup",
+  "codec": {
+    "checkpoint": "facebook/dacvae-watermarked",
+    "sample_rate": 48000,
+    "hop_length": 1920,
+    "latent_dim": 128,
+    "posterior": "mean",
+    "format_version": 1,
+    "weights_sha256": "573cf4770ea4a25507f26965d05ae720bcd34295a9f60c06ef3c3805826b68e4",
+    "preprocessing": "mono-mean_scipy-resample-poly_no-gain_no-trim_v1"
+  },
+  "torch_version": "2.8.0+cu128",
+  "device": "NVIDIA GeForce RTX 5070 Ti",
+  "records": 32,
+  "audio_seconds": 120.30033333333333,
+  "precision": "bf16",
+  "cudnn_allow_tf32": false,
+  "batch_size": 8,
+  "batch_seconds": 64,
+  "serial_encoder_calls": 32,
+  "batched": {
+    "encoder_calls": 5,
+    "oom_retries": 0
+  },
+  "wall_seconds": {
+    "serial": [
+      0.6599945100024343,
+      0.6571857899980387,
+      0.6569106050010305
+    ],
+    "batched": [
+      0.3006534680025652,
+      0.3014686719980091,
+      0.3007598340045661
+    ]
+  },
+  "median_seconds": {
+    "serial": 0.6571857899980387,
+    "batched": 0.3007598340045661
+  },
+  "audio_seconds_per_wall_second": {
+    "serial": 183.05376525821163,
+    "batched": 399.988029423859
+  },
+  "median_speedup": 2.1850849604740152,
+  "max_latent_absolute_error": 1.3701144456863403,
+  "relative_latent_rmse": 0.054337490831056726,
+  "shapes_match": true,
+  "peak_cuda_allocated_bytes_both_models": 3123239936
+}

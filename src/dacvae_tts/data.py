@@ -14,7 +14,7 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, Sampler
 
 from .contracts import normalization_stats
-from .text import tokenize
+from .text import tokenize, tokenize_bytes
 
 SCHEMA = """
 CREATE TABLE samples (
@@ -26,6 +26,7 @@ CREATE TABLE samples (
 CREATE INDEX speaker_split ON samples(split, speaker, id);
 CREATE TABLE provenance (uid TEXT PRIMARY KEY, original_text TEXT, normalized_text TEXT,
  session TEXT, source_recording TEXT, start_seconds REAL, end_seconds REAL);
+CREATE TABLE text_tokens (uid TEXT PRIMARY KEY, utf8 BLOB NOT NULL);
 """
 
 
@@ -129,17 +130,21 @@ class LatentDataset(Dataset):
         if self._pid != os.getpid():
             self._db = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
             self._pid, self._maps = os.getpid(), OrderedDict()
+            self._has_text_tokens = bool(
+                self._db.execute("SELECT 1 FROM sqlite_master WHERE name='text_tokens'").fetchone()
+            )
         return self._db
 
     def row(self, index):
-        row = (
-            self._connection()
-            .execute(
-                "SELECT uid,text,shard,offset,frames,speaker FROM samples WHERE id=?", (int(self.ids[index]),)
-            )
-            .fetchone()
+        connection = self._connection()
+        query = (
+            "SELECT s.uid,s.text,s.shard,s.offset,s.frames,s.speaker,t.utf8 "
+            "FROM samples s LEFT JOIN text_tokens t ON t.uid=s.uid WHERE s.id=?"
+            if self._has_text_tokens
+            else "SELECT uid,text,shard,offset,frames,speaker,NULL FROM samples WHERE id=?"
         )
-        uid, text, shard, offset, frames, speaker = row
+        row = connection.execute(query, (int(self.ids[index]),)).fetchone()
+        uid, text, shard, offset, frames, speaker, text_bytes = row
         if shard not in self._maps:
             self._maps[shard] = np.memmap(shard, dtype="<f2", mode="r").reshape(-1, self.channels)
             if len(self._maps) > 32:
@@ -148,7 +153,13 @@ class LatentDataset(Dataset):
         z = torch.from_numpy(np.array(self._maps[shard][offset : offset + frames], dtype=np.float32))
         if offset < 0 or frames < 1 or z.shape != (frames, self.channels) or not torch.isfinite(z).all():
             raise ValueError(f"Corrupt/truncated latent record: {uid}")
-        return {"uid": uid, "text": text, "speaker": speaker, "latents": (z - self.mean) / self.std}
+        return {
+            "uid": uid,
+            "text": text,
+            "text_bytes": text_bytes,
+            "speaker": speaker,
+            "latents": (z - self.mean) / self.std,
+        }
 
     def __getitem__(self, index):
         # Epoch travels through the sampler index so persistent workers see it.
@@ -163,6 +174,8 @@ class LatentDataset(Dataset):
             "reference": ref["latents"],
             "text": target["text"],
             "reference_text": ref["text"],
+            "text_bytes": target["text_bytes"],
+            "reference_text_bytes": ref["text_bytes"],
             "uid": target["uid"],
             "reference_uid": ref["uid"],
             "speaker": target["speaker"],
@@ -187,9 +200,12 @@ def collate(items):
             raise ValueError("Reference and target latents must be finite")
         z = torch.cat([ref, target])
         mask = torch.arange(len(z)) < len(ref)
-        tok, seg = tokenize(
-            item["reference_text"], item["text"], item.get("text_normalization", "unicode-v1")
-        )
+        if item.get("text_bytes") is not None and item.get("reference_text_bytes") is not None:
+            tok, seg = tokenize_bytes(item["reference_text_bytes"], item["text_bytes"])
+        else:
+            tok, seg = tokenize(
+                item["reference_text"], item["text"], item.get("text_normalization", "unicode-v1")
+            )
         latents.append(z)
         prompts.append(z * mask[:, None])
         masks.append(mask)

@@ -28,6 +28,32 @@ def main():
     )
     p.add_argument("--min-seconds", type=float, default=1.0)
     p.add_argument("--max-seconds", type=float, default=15.0)
+    p.add_argument("--workers", type=int, default=4, help="CPU audio-loading threads per GPU; 0 is serial")
+    p.add_argument("--prefetch", type=positive_int, default=16, help="Maximum queued CPU loading tasks")
+    p.add_argument("--batch-size", type=positive_int, default=8, help="Maximum recordings per codec forward")
+    p.add_argument(
+        "--bucket-size",
+        type=positive_int,
+        default=256,
+        help="Bounded lookahead window for equal hop-rounded length batches",
+    )
+    p.add_argument(
+        "--batch-seconds",
+        type=float,
+        default=120.0,
+        help="Maximum total hop-padded audio seconds in one encoder batch",
+    )
+    p.add_argument(
+        "--precision",
+        choices=["fp32", "bf16"],
+        default="fp32",
+        help="BF16 is experimental; compare codec reconstruction before corpus use",
+    )
+    p.add_argument(
+        "--no-fold-weight-norm",
+        action="store_true",
+        help="Keep the original encoder weight-normalization hooks for comparison",
+    )
     add_partition_args(p)
 
     p = sub.add_parser("merge", help="Merge partitions, deduplicate, check splits and calculate statistics")

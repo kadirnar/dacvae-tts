@@ -82,15 +82,42 @@ the bounds are rejected; audio is never cropped while retaining the original tex
 ```bash
 bash scripts/prepare_8gpu.sh /dataset/manifest.jsonl /cache/english
 # Or /dataset/parquet-directory instead of the JSONL file.
+# Explicit per-GPU throughput controls (these are the defaults):
+bash scripts/prepare_8gpu.sh /dataset/parquet-directory /cache/english-fast \
+  --workers 4 --prefetch 16 --batch-size 8 --bucket-size 256 \
+  --batch-seconds 120 --precision fp32
 ```
 
 This starts one frozen-codec encoder per GPU, writes `part-0` … `part-7`, then merges
-their indexes. Directory inputs distribute files across encoders; single Parquet
-inputs distribute row groups when possible. A single JSONL file is scanned on each
-worker, so Parquet shards are preferable at 4M rows. Encoding uses deterministic
-posterior means and stores float16 latents. Preparation logs every rejected row.
+their indexes. Each GPU overlaps bounded CPU decoding/resampling with codec encoding,
+batches equal hop-rounded lengths, folds frozen encoder weight normalization once,
+and leaves the unused decoder off GPU. A CUDA batch OOM retries smaller batches;
+single-recording OOMs and other codec failures stop the job instead of dropping data.
+The launcher respects an existing eight-device `CUDA_VISIBLE_DEVICES` assignment.
+
+Directory inputs distribute files across encoders; single Parquet inputs distribute
+row groups when possible. A single JSONL file is scanned on each worker, but only
+that worker's rows are deserialized. Parquet shards avoid the repeated scan at 4M rows.
+Encoding uses posterior means, strict FP32 convolution (TF32 disabled), and float16
+latent storage. Normalized UTF-8 text bytes are cached in SQLite before training;
+training only assembles reference/target segments and the existing special tokens.
+Old caches without text bytes still work through the original text fallback.
+
+`--bucket-size` bounds decoded lookahead RAM; `--batch-size` and `--batch-seconds`
+bound GPU batches. Exact-length buckets preserve each utterance's convolution
+boundaries; arbitrary zero-padding to a larger recording is not used. A recording
+must individually fit `--batch-seconds` after rounding to a codec hop. Preparation
+records per-partition throughput and logs rejected rows, including corrupt files.
 Partially completed partitions must be rerun into new directories; preparation does
 not currently support in-place resume.
+
+`--precision bf16` is experimental, changes cached latents, and is **not** the default.
+Do not mix FP32/BF16 partitions; merge rejects them. A synthetic real-codec benchmark
+found about 5.4% relative latent RMS error with BF16, so validate codec reconstruction
+and speech metrics on real data before using it. No BF16 quality claim is made.
+
+The measured FP32 speedup and its limits, serial comparison command, and reproducible
+benchmark are in [preparation performance](docs/preparation-performance.md).
 
 For manually partitioned jobs, call `dacvae-tts prepare --manifest ... --output ...
 --shard-index 0 --num-shards 8`, then:

@@ -50,17 +50,39 @@ def read_audio(path, sample_rate):
 class Codec:
     """Frozen DACVAE; model-specific details are discovered, never guessed."""
 
-    def __init__(self, checkpoint="facebook/dacvae-watermarked", device="cpu"):
+    def __init__(
+        self,
+        checkpoint="facebook/dacvae-watermarked",
+        device="cpu",
+        *,
+        encoder_only=False,
+        fold_weight_norm=False,
+    ):
         from dacvae import DACVAE
 
         self.device = torch.device(device)
+        self.encoder_only = encoder_only
         path = Path(checkpoint)
         if not path.exists() and str(checkpoint).startswith("facebook/"):
             from huggingface_hub import hf_hub_download
 
             path = Path(hf_hub_download(repo_id=checkpoint, filename="weights.pth"))
         self.weights_sha256 = file_digest(path)
-        self.model = DACVAE.load(str(path)).to(self.device).eval().requires_grad_(False)
+        self.model = DACVAE.load(str(path)).eval().requires_grad_(False)
+        if encoder_only:
+            # The decoder is not needed when building the training cache.
+            self.model.encoder.to(self.device)
+            self.model.quantizer.in_proj.to(self.device)
+        else:
+            self.model.to(self.device)
+        if fold_weight_norm:
+            # Frozen weights: materialize the exact effective weight once, not every forward.
+            for component in (self.model.encoder, self.model.quantizer.in_proj):
+                for module in component.modules():
+                    if hasattr(module, "weight_g") and hasattr(module, "weight_v"):
+                        torch.nn.utils.remove_weight_norm(module)
+            # remove_weight_norm registers fresh Parameters; keep those frozen too.
+            self.model.requires_grad_(False)
         self.sample_rate = int(self.model.sample_rate)
         self.hop_length = int(self.model.hop_length)
         # Probe the posterior, not DAC's pre-bottleneck latent_dim attribute.
@@ -82,6 +104,22 @@ class Codec:
             "preprocessing": PREPROCESSING,
         }
 
+    def _posterior_mean(self, audio, precision="fp32"):
+        # Use the same explicit math for cache preparation and inference references.
+        # TF32 kernels can drift substantially across batch sizes.
+        with (
+            torch.backends.cudnn.flags(
+                enabled=torch.backends.cudnn.enabled,
+                benchmark=torch.backends.cudnn.benchmark,
+                deterministic=torch.backends.cudnn.deterministic,
+                allow_tf32=False,
+            ),
+            torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=precision == "bf16"),
+        ):
+            z = self.model.encoder(audio)
+            mean, _ = self.model.quantizer.in_proj(z).chunk(2, dim=1)
+        return mean
+
     @torch.inference_mode()
     def encode(self, audio):
         if audio.ndim != 1 or not audio.is_floating_point() or not torch.isfinite(audio).all():
@@ -89,12 +127,48 @@ class Codec:
         audio = audio.to(self.device).reshape(1, 1, -1)
         if audio.size(-1) < self.hop_length * 2:
             raise ValueError("Audio too short for DACVAE")
-        z = self.model.encoder(self.model._pad(audio))
-        mean, _ = self.model.quantizer.in_proj(z).chunk(2, dim=1)
+        mean = self._posterior_mean(self.model._pad(audio))
         return mean[0].transpose(0, 1).contiguous().float()
 
     @torch.inference_mode()
+    def encode_batch(self, audios, precision="fp32"):
+        """Return CPU [B,L,C] posterior means, preserving single-utterance boundaries.
+
+        Only equal hop-rounded lengths may share a batch. Padding arbitrary-length
+        inputs to the longest waveform changes intermediate convolution boundaries,
+        even if the output is subsequently trimmed. Reflect-pad each input first.
+        """
+        if not audios:
+            raise ValueError("encode_batch requires at least one waveform")
+        if precision not in {"fp32", "bf16"}:
+            raise ValueError("Encoder precision must be fp32 or bf16")
+        if precision == "bf16" and self.device.type != "cuda":
+            raise ValueError("BF16 cache encoding requires CUDA")
+        lengths = []
+        padded = []
+        for audio in audios:
+            if audio.ndim != 1 or not audio.is_floating_point() or not torch.isfinite(audio).all():
+                raise ValueError("encode_batch requires finite mono float waveforms [samples]")
+            if len(audio) < 2 * self.hop_length:
+                raise ValueError("Audio too short for DACVAE")
+            lengths.append(math.ceil(len(audio) / self.hop_length))
+            padded.append(self.model._pad(audio.reshape(1, 1, -1)))
+        if len(set(lengths)) != 1:
+            raise ValueError("encode_batch requires equal hop-rounded lengths; bucket inputs first")
+        audio = torch.cat(padded, dim=0)
+        if self.device.type == "cuda" and audio.device.type == "cpu":
+            audio = audio.pin_memory()
+        audio = audio.to(self.device, non_blocking=True)
+        mean = self._posterior_mean(audio, precision)
+        if mean.shape != (len(audios), self.latent_dim, lengths[0]):
+            raise ValueError(f"Unexpected codec batch shape: {tuple(mean.shape)}")
+        # One device-to-host transfer/synchronization for the whole batch.
+        return mean.transpose(1, 2).contiguous().float().cpu()
+
+    @torch.inference_mode()
     def decode(self, latents):
+        if getattr(self, "encoder_only", False):
+            raise ValueError("This codec was loaded encoder-only; reload with encoder_only=False to decode")
         if latents.ndim != 2 or latents.size(1) != self.latent_dim or latents.size(0) < 1:
             raise ValueError(f"Codec.decode requires [frames,C={self.latent_dim}]")
         if not torch.isfinite(latents).all():

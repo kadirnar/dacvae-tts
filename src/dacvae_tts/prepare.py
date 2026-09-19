@@ -2,14 +2,20 @@ import hashlib
 import io
 import json
 import sqlite3
+import time
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+from itertools import islice
 from pathlib import Path
 
 import numpy as np
+import soundfile as sf
 import torch
 from tqdm import tqdm
 
 from .codec import Codec, check_compatibility, file_digest, read_audio
-from .data import SCHEMA, ShardWriter, jsonl, save_stats, speaker_split
+from .data import SCHEMA, ShardWriter, save_stats, speaker_split
 from .text import normalize
 
 
@@ -24,6 +30,8 @@ def source_manifest_digest(path):
 
 
 def source_rows(path, shard_index=0, num_shards=1):
+    if not 0 <= shard_index < num_shards:
+        raise ValueError("Invalid shard index")
     path = Path(path)
     if path.is_dir():
         files = sorted([*path.rglob("*.parquet"), *path.rglob("*.jsonl")])
@@ -66,118 +74,261 @@ def source_rows(path, shard_index=0, num_shards=1):
                     index += 1
             offset += count
     else:
-        for index, row in enumerate(jsonl(path)):
-            if index % num_shards == shard_index:
-                if "id" not in row:
-                    row.update(id=str(index), _generated_id=True)
-                yield row
+        # Scan lines on each rank, but deserialize only this rank's rows. Preserve
+        # the legacy row numbering (blank lines do not consume an index).
+        index = 0
+        with open(path, "rb") as stream:
+            for line_number, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+                selected = index % num_shards == shard_index
+                if selected:
+                    try:
+                        row = json.loads(line)
+                    except (ValueError, UnicodeDecodeError) as exc:
+                        raise ValueError(f"{path}:{line_number}: {exc}") from exc
+                    if "id" not in row:
+                        row.update(id=str(index), _generated_id=True)
+                    yield row
+                index += 1
+
+
+def ordered_prefetch(function, rows, workers, prefetch):
+    """Bounded threaded CPU decoding; results retain manifest order on every rank."""
+    if workers == 0:
+        yield from map(function, rows)
+        return
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="audio-decode")
+    pending = deque()
+    rows = iter(rows)
+    try:
+        for row in islice(rows, prefetch):
+            pending.append(executor.submit(function, row))
+        while pending:
+            result = pending.popleft().result()
+            # Refill before yielding so CPU decoding overlaps the consumer's GPU work.
+            for row in islice(rows, 1):
+                pending.append(executor.submit(function, row))
+            yield result
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def prepare_record(row, args, root, sample_rate):
+    missing = {args.text_column, args.audio_column, args.speaker_column} - row.keys()
+    if missing:
+        raise ValueError(f"Missing required dataset columns: {sorted(missing)}")
+    uid = str(row["id"])
+    try:
+        text = normalize(
+            row[args.text_column], getattr(args, "text_normalization", "unicode-v1"), row.get("spoken_text")
+        )
+        speaker = str(row[args.speaker_column]).strip()
+        if not speaker or row[args.speaker_column] is None:
+            raise ValueError("Missing speaker identity")
+        language = row.get("language", "en")
+        if language not in {"en", "eng", "English", "english", "en-US", "en-GB"}:
+            raise ValueError(f"Non-English language tag: {language}")
+        split = row.get("split") or speaker_split(speaker, args.seed)
+        if split not in {"train", "val", "test"}:
+            raise ValueError("split must be train, val or test")
+        source = row[args.audio_column]
+        if isinstance(source, dict):
+            source = io.BytesIO(source["bytes"]) if source.get("bytes") else source["path"]
+        if isinstance(source, (str, Path)):
+            source = Path(source)
+            source = source if source.is_absolute() else root / source
+        audio = read_audio(source, sample_rate)
+        duration = len(audio) / sample_rate
+        if not args.min_seconds <= duration <= args.max_seconds:
+            raise ValueError(f"Duration {duration:.3f}s outside accepted range")
+        array = audio.numpy()
+        if np.sqrt(np.mean(np.square(array))) < 1e-5:
+            raise ValueError("Silent audio")
+        digest = hashlib.sha256(memoryview(array)).hexdigest()
+        return dict(
+            uid=uid,
+            text=text,
+            text_bytes=text.encode("utf-8"),
+            speaker=speaker,
+            split=split,
+            audio=audio,
+            digest=digest,
+            provenance=(
+                uid,
+                row[args.text_column],
+                text,
+                row.get("session_id"),
+                row.get("source_recording"),
+                row.get("start_seconds"),
+                row.get("end_seconds"),
+            ),
+            source=str(source) if not isinstance(source, io.BytesIO) else "embedded",
+        )
+    except (ValueError, KeyError, OSError, sf.LibsndfileError) as exc:
+        return {"uid": uid, "error": str(exc)}
+
+
+def encode_records(codec, records, batch_size, batch_seconds, precision, counters):
+    """Bucket within a bounded window, then restore source order before persistence."""
+    groups = defaultdict(list)
+    for i, record in enumerate(records):
+        frames = (len(record["audio"]) + codec.hop_length - 1) // codec.hop_length
+        groups[frames].append(i)
+    results = [None] * len(records)
+
+    def run(indices):
+        counters["encoder_calls"] += 1
+        try:
+            output = codec.encode_batch([records[i]["audio"] for i in indices], precision)
+        except torch.cuda.OutOfMemoryError:
+            if len(indices) == 1:
+                raise
+            counters["oom_retries"] += 1
+        else:
+            for i, latent in zip(indices, output, strict=True):
+                results[i] = latent
+            return
+        # Release the failed call's traceback before retrying smaller batches.
+        torch.cuda.empty_cache()
+        middle = len(indices) // 2
+        run(indices[:middle])
+        run(indices[middle:])
+
+    for frames, indices in groups.items():
+        limit = min(batch_size, int(batch_seconds * codec.sample_rate / (frames * codec.hop_length)))
+        if limit < 1:
+            raise ValueError("--batch-seconds is smaller than one hop-rounded recording")
+        for start in range(0, len(indices), limit):
+            run(indices[start : start + limit])
+    return results
 
 
 def prepare(args):
+    workers = getattr(args, "workers", 4)
+    prefetch = getattr(args, "prefetch", 16)
+    batch_size = getattr(args, "batch_size", 8)
+    bucket_size = getattr(args, "bucket_size", 256)
+    batch_seconds = getattr(args, "batch_seconds", 120.0)
+    precision = getattr(args, "precision", "fp32")
+    fold = not getattr(args, "no_fold_weight_norm", False)
+    if workers < 0 or min(prefetch, batch_size, bucket_size, batch_seconds) <= 0:
+        raise ValueError("workers must be nonnegative; prefetch and batching limits must be positive")
+    if not np.isfinite(batch_seconds) or not 0 < args.min_seconds <= args.max_seconds < float("inf"):
+        raise ValueError("Duration and batch-seconds limits must be finite and positive")
+    if precision not in {"fp32", "bf16"}:
+        raise ValueError("Encoder precision must be fp32 or bf16")
+    if not 0 <= args.shard_index < args.num_shards:
+        raise ValueError("Invalid shard index")
     out = Path(args.output).resolve()
     out.mkdir(parents=True, exist_ok=True)
     if (out / "index.sqlite").exists():
         raise ValueError("Output already contains a cache; use a new partition directory")
-    if not 0 <= args.shard_index < args.num_shards:
-        raise ValueError("Invalid shard index")
-    codec = Codec(args.codec, args.device)
+    started = time.perf_counter()
+    codec = Codec(args.codec, args.device, encoder_only=True, fold_weight_norm=fold)
+    if precision == "bf16" and (codec.device.type != "cuda" or not torch.cuda.is_bf16_supported()):
+        raise ValueError("BF16 cache encoding requires a BF16-capable CUDA device")
+    setup_seconds = time.perf_counter() - started
+    processing_started = time.perf_counter()
     writer = ShardWriter(out, codec.latent_dim)
     sums = torch.zeros(codec.latent_dim, dtype=torch.float64)
     squares, count = sums.clone(), 0
-    accepted, rejected = 0, 0
+    accepted, rejected, committed, audio_seconds = 0, 0, 0, 0.0
+    counters = {"encoder_calls": 0, "oom_retries": 0}
+    timings = {"input_wait_seconds": 0.0, "encode_seconds": 0.0, "write_seconds": 0.0}
     source_path = Path(args.manifest).resolve()
     root = source_path if source_path.is_dir() else source_path.parent
     db = sqlite3.connect(out / "index.sqlite")
     db.executescript(SCHEMA)
+    rows = source_rows(args.manifest, args.shard_index, args.num_shards)
+    records = ordered_prefetch(
+        lambda row: prepare_record(row, args, root, codec.sample_rate), rows, workers, prefetch
+    )
     try:
-        with open(out / "rejected.jsonl", "w") as failures:
-            for index, row in enumerate(
-                tqdm(source_rows(args.manifest, args.shard_index, args.num_shards), desc="Encode")
-            ):
-                missing = {args.text_column, args.audio_column, args.speaker_column} - row.keys()
-                if missing:
-                    raise ValueError(f"Missing required dataset columns: {sorted(missing)}")
-                uid = str(row.get("id", index))
-                try:
-                    text = normalize(
-                        row[args.text_column],
-                        getattr(args, "text_normalization", "unicode-v1"),
-                        row.get("spoken_text"),
-                    )
-                    speaker = str(row[args.speaker_column]).strip()
-                    if not speaker or row[args.speaker_column] is None:
-                        raise ValueError("Missing speaker identity")
-                    language = row.get("language", "en")
-                    if language not in {"en", "eng", "English", "english", "en-US", "en-GB"}:
-                        raise ValueError(f"Non-English language tag: {language}")
-                    source = row[args.audio_column]
-                    if isinstance(source, dict):
-                        source = io.BytesIO(source["bytes"]) if source.get("bytes") else source["path"]
-                    if isinstance(source, (str, Path)):
-                        source = Path(source)
-                        source = source if source.is_absolute() else root / source
-                    audio = read_audio(source, codec.sample_rate)
-                    duration = len(audio) / codec.sample_rate
-                    if not args.min_seconds <= duration <= args.max_seconds:
-                        raise ValueError(f"Duration {duration:.3f}s outside accepted range")
-                    if audio.square().mean().sqrt() < 1e-5:
-                        raise ValueError("Silent audio")
-                    digest = hashlib.sha256(audio.numpy().tobytes()).hexdigest()
-                    if db.execute("SELECT 1 FROM samples WHERE uid=? OR digest=?", (uid, digest)).fetchone():
-                        raise ValueError("Duplicate audio or ID")
-                    split = row.get("split") or speaker_split(speaker, args.seed)
-                    if split not in {"train", "val", "test"}:
-                        raise ValueError("split must be train, val or test")
-                    z = codec.encode(audio).cpu()
+        with closing(records), open(out / "rejected.jsonl", "w") as failures, tqdm(desc="Encode") as bar:
+            while True:
+                tick = time.perf_counter()
+                window = list(islice(records, bucket_size))
+                timings["input_wait_seconds"] += time.perf_counter() - tick
+                if not window:
+                    break
+                selected, seen_ids, seen_digests = [], set(), set()
+                for record in window:
+                    uid = record["uid"]
+                    if "error" not in record:
+                        digest = record["digest"]
+                        if (
+                            uid in seen_ids
+                            or digest in seen_digests
+                            or db.execute(
+                                "SELECT 1 FROM samples WHERE uid=? OR digest=?", (uid, digest)
+                            ).fetchone()
+                        ):
+                            record["error"] = "Duplicate audio or ID"
+                    if "error" in record:
+                        failures.write(json.dumps({"id": uid, "reason": record["error"]}) + "\n")
+                        rejected += 1
+                        # Release rejected waveforms before GPU work.
+                        record.pop("audio", None)
+                    else:
+                        selected.append(record)
+                        seen_ids.add(uid)
+                        seen_digests.add(record["digest"])
+                tick = time.perf_counter()
+                latents = encode_records(codec, selected, batch_size, batch_seconds, precision, counters)
+                timings["encode_seconds"] += time.perf_counter() - tick
+                tick = time.perf_counter()
+                for record, z in zip(selected, latents, strict=True):
+                    uid, split = record["uid"], record["split"]
                     shard, offset = writer.write(z.numpy())
                     db.execute(
                         "INSERT INTO samples VALUES (NULL,?,?,?,?,?,?,?,?,?,?)",
                         (
                             uid,
-                            speaker,
-                            text,
-                            str(source) if not isinstance(source, io.BytesIO) else "embedded",
+                            record["speaker"],
+                            record["text"],
+                            record["source"],
                             shard,
                             offset,
                             len(z),
                             split,
-                            len(audio),
-                            digest,
+                            len(record["audio"]),
+                            record["digest"],
                         ),
                     )
+                    db.execute("INSERT INTO text_tokens VALUES (?,?)", (uid, record["text_bytes"]))
                     db.execute(
                         "INSERT INTO provenance VALUES (?,?,?,?,?,?,?)",
-                        (
-                            uid,
-                            row[args.text_column],
-                            text,
-                            row.get("session_id"),
-                            row.get("source_recording"),
-                            row.get("start_seconds"),
-                            row.get("end_seconds"),
-                        ),
+                        record["provenance"],
                     )
                     if split == "train":
-                        z64 = z.double()
+                        # Compute statistics on the stored representation, as merge does.
+                        z64 = z.half().double()
                         sums += z64.sum(0)
                         squares += z64.square().sum(0)
                         count += len(z)
                     accepted += 1
-                    if accepted % 1000 == 0:
-                        db.commit()
-                except (ValueError, KeyError, OSError, RuntimeError) as exc:
-                    # CUDA OOM or a broken codec is not a dataset error to silently skip 4M times.
-                    if isinstance(exc, RuntimeError):
-                        raise
-                    failures.write(json.dumps({"id": uid, "reason": str(exc)}) + "\n")
-                    rejected += 1
+                    audio_seconds += len(record["audio"]) / codec.sample_rate
+                if accepted - committed >= 1000:
+                    db.commit()
+                    committed = accepted
+                timings["write_seconds"] += time.perf_counter() - tick
+                bar.update(len(window))
+                bar.set_postfix(
+                    accepted=accepted, rejected=rejected, calls=counters["encoder_calls"], refresh=False
+                )
+                # Avoid retaining the previous window while filling the next one.
+                del window, selected, latents
     finally:
         writer.close()
         db.commit()
         db.close()
+    processing_seconds = time.perf_counter() - processing_started
+    if not accepted:
+        raise ValueError("No accepted samples; inspect rejected.jsonl")
     metadata = {
         **codec.metadata,
-        "source": str(Path(args.manifest).resolve()),
+        "source": str(source_path),
         "seed": args.seed,
         "partition": args.shard_index,
         "partitions": args.num_shards,
@@ -185,6 +336,8 @@ def prepare(args):
         "rejected": rejected,
         "complete": True,
         "text_normalization": getattr(args, "text_normalization", "unicode-v1"),
+        "text_tokenizer": "utf8-bytes-v1",
+        "encoder_precision": precision,
         "source_inventory_sha256": source_manifest_digest(args.manifest),
         "pairing_version": "distinct_utterance_same_speaker_v1",
         "split_version": "speaker_sha256_98_1_1_v1",
@@ -193,12 +346,28 @@ def prepare(args):
             "max_seconds": args.max_seconds,
             "silence_rms_min": 1e-5,
         },
+        "preparation": {
+            "workers": workers,
+            "prefetch": prefetch,
+            "batch_size": batch_size,
+            "bucket_size": bucket_size,
+            "batch_seconds": batch_seconds,
+            "fold_weight_norm": fold,
+            "cudnn_allow_tf32": False,
+            "batching": "exact_hop_length_v1",
+            "setup_seconds": setup_seconds,
+            "processing_seconds": processing_seconds,
+            "audio_seconds": audio_seconds,
+            "audio_seconds_per_wall_second": audio_seconds / processing_seconds,
+            "rows_per_second": accepted / processing_seconds,
+            **timings,
+            **counters,
+        },
     }
-    (out / "metadata.json").write_text(json.dumps(metadata, indent=2))
     save_stats(out / "stats.pt", count, sums, squares)
+    # A completion marker is written only after both the index and statistics exist.
+    (out / "metadata.json").write_text(json.dumps(metadata, indent=2))
     print(json.dumps(metadata, indent=2))
-    if not accepted:
-        raise ValueError("No accepted samples; inspect rejected.jsonl")
 
 
 def merge(args):
@@ -211,11 +380,14 @@ def merge(args):
     db.executescript(SCHEMA)
     meta, duplicates, rejected = None, 0, 0
     partitions = {}
+    preparation_partitions = []
     fields = "uid,speaker,text,audio,shard,offset,frames,split,samples,digest"
     try:
         for directory in args.inputs:
             directory = Path(directory).resolve()
             current = json.loads((directory / "metadata.json").read_text())
+            if "preparation" in current:
+                preparation_partitions.append({"directory": str(directory), **current["preparation"]})
             if not current.get("complete"):
                 raise ValueError(f"Incomplete partition: {directory}")
             rejected += current.get("rejected", 0)
@@ -225,6 +397,10 @@ def merge(args):
             if meta is None:
                 meta = current.copy()
             check_compatibility(meta, current)
+            if meta.get("encoder_precision", "fp32") != current.get("encoder_precision", "fp32"):
+                raise ValueError("Cannot merge different encoder precisions")
+            if meta.get("text_tokenizer", "utf8-bytes-v1") != current.get("text_tokenizer", "utf8-bytes-v1"):
+                raise ValueError("Cannot merge different text tokenizers")
             if meta.get("text_normalization", "unicode-v1") != current.get(
                 "text_normalization", "unicode-v1"
             ):
@@ -253,6 +429,11 @@ def merge(args):
                         "INSERT OR IGNORE INTO provenance VALUES (?,?,?,?,?,?,?)",
                         source.execute("SELECT * FROM provenance"),
                     )
+                if source.execute("SELECT 1 FROM sqlite_master WHERE name='text_tokens'").fetchone():
+                    db.executemany(
+                        "INSERT OR IGNORE INTO text_tokens VALUES (?,?)",
+                        source.execute("SELECT * FROM text_tokens"),
+                    )
             db.commit()
         for (source, expected), observed in partitions.items():
             if observed != set(range(expected)):
@@ -270,6 +451,7 @@ def merge(args):
         )
         singletons = db.total_changes - before
         db.execute("DELETE FROM provenance WHERE uid NOT IN (SELECT uid FROM samples)")
+        db.execute("DELETE FROM text_tokens WHERE uid NOT IN (SELECT uid FROM samples)")
         db.commit()
         channels = meta["latent_dim"]
         sums = torch.zeros(channels, dtype=torch.float64)
@@ -288,6 +470,8 @@ def merge(args):
             count += frames
         save_stats(out / "stats.pt", count, sums, squares)
         splits = dict(db.execute("SELECT split,count(*) FROM samples GROUP BY split").fetchall())
+        # A merged cache must not present the first rank's timing as aggregate throughput.
+        meta.pop("preparation", None)
         meta.update(
             {
                 "complete": True,
@@ -299,6 +483,7 @@ def merge(args):
                 "singleton_rows_removed": singletons,
                 "inputs": [str(Path(p).resolve()) for p in args.inputs],
                 "index_sha256": file_digest(out / "index.sqlite"),
+                "preparation_partitions": preparation_partitions,
             }
         )
         (out / "metadata.json").write_text(json.dumps(meta, indent=2))

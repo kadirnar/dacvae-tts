@@ -1,0 +1,203 @@
+{
+  "scope": "warm encoder + transfers only; synthetic signals; excludes disk, merge, decoder and startup",
+  "codec": {
+    "checkpoint": "facebook/dacvae-watermarked",
+    "sample_rate": 48000,
+    "hop_length": 1920,
+    "latent_dim": 128,
+    "posterior": "mean",
+    "format_version": 1,
+    "weights_sha256": "573cf4770ea4a25507f26965d05ae720bcd34295a9f60c06ef3c3805826b68e4",
+    "preprocessing": "mono-mean_scipy-resample-poly_no-gain_no-trim_v1"
+  },
+  "torch_version": "2.8.0+cu128",
+  "device": "NVIDIA GeForce RTX 5070 Ti",
+  "records": 32,
+  "audio_seconds": 120.30033333333333,
+  "precision": "fp32",
+  "cudnn_allow_tf32": false,
+  "batch_size": 8,
+  "batch_seconds": 64,
+  "serial_encoder_calls": 32,
+  "batched": {
+    "encoder_calls": 5,
+    "oom_retries": 0
+  },
+  "wall_seconds": {
+    "serial": [
+      0.6498364560029586,
+      0.6505164650006918,
+      0.6513155339998775
+    ],
+    "batched": [
+      0.5033799680022639,
+      0.506973540999752,
+      0.5024712239974178
+    ]
+  },
+  "median_seconds": {
+    "serial": 0.6505164650006918,
+    "batched": 0.5033799680022639
+  },
+  "audio_seconds_per_wall_second": {
+    "serial": 184.9304972368461,
+    "batched": 238.98514239802304
+  },
+  "median_speedup": 1.292297084411921,
+  "max_latent_absolute_error": 0.00016405712813138962,
+  "relative_latent_rmse": 3.7305265094743275e-06,
+  "shapes_match": true,
+  "peak_cuda_allocated_bytes_both_models": 3122714624,
+  "pipeline": {
+    "scope": "synthetic WAV load/resample, encode, index and shard writes; excludes merge",
+    "runs": {
+      "serial": [
+        {
+          "workers": 0,
+          "prefetch": 16,
+          "batch_size": 1,
+          "bucket_size": 1,
+          "batch_seconds": 64,
+          "fold_weight_norm": false,
+          "cudnn_allow_tf32": false,
+          "batching": "exact_hop_length_v1",
+          "setup_seconds": 1.2321473819974926,
+          "processing_seconds": 0.6614910000062082,
+          "audio_seconds": 120.30099999999995,
+          "audio_seconds_per_wall_second": 181.8633964768544,
+          "rows_per_second": 48.37556368824319,
+          "input_wait_seconds": 0.07521905600879109,
+          "encode_seconds": 0.5791470490075881,
+          "write_seconds": 0.004552134014375042,
+          "encoder_calls": 32,
+          "oom_retries": 0,
+          "total_wall_seconds": 1.894372431001102,
+          "accepted": 32,
+          "rejected": 0
+        },
+        {
+          "workers": 0,
+          "prefetch": 16,
+          "batch_size": 1,
+          "bucket_size": 1,
+          "batch_seconds": 64,
+          "fold_weight_norm": false,
+          "cudnn_allow_tf32": false,
+          "batching": "exact_hop_length_v1",
+          "setup_seconds": 1.3359400830013328,
+          "processing_seconds": 0.6535043740004767,
+          "audio_seconds": 120.30099999999995,
+          "audio_seconds_per_wall_second": 184.0859905245442,
+          "rows_per_second": 48.96677248556053,
+          "input_wait_seconds": 0.07479651101311902,
+          "encode_seconds": 0.5722715040028561,
+          "write_seconds": 0.004605244022968691,
+          "encoder_calls": 32,
+          "oom_retries": 0,
+          "total_wall_seconds": 1.9901134429965168,
+          "accepted": 32,
+          "rejected": 0
+        },
+        {
+          "workers": 0,
+          "prefetch": 16,
+          "batch_size": 1,
+          "bucket_size": 1,
+          "batch_seconds": 64,
+          "fold_weight_norm": false,
+          "cudnn_allow_tf32": false,
+          "batching": "exact_hop_length_v1",
+          "setup_seconds": 1.2815070819997345,
+          "processing_seconds": 0.6517342689985526,
+          "audio_seconds": 120.30099999999995,
+          "audio_seconds_per_wall_second": 184.58596658551204,
+          "rows_per_second": 49.099765843479176,
+          "input_wait_seconds": 0.07448304502031533,
+          "encode_seconds": 0.5709616240128526,
+          "write_seconds": 0.00449555300292559,
+          "encoder_calls": 32,
+          "oom_retries": 0,
+          "total_wall_seconds": 1.9338960210006917,
+          "accepted": 32,
+          "rejected": 0
+        }
+      ],
+      "optimized": [
+        {
+          "workers": 4,
+          "prefetch": 16,
+          "batch_size": 8,
+          "bucket_size": 256,
+          "batch_seconds": 64,
+          "fold_weight_norm": true,
+          "cudnn_allow_tf32": false,
+          "batching": "exact_hop_length_v1",
+          "setup_seconds": 1.883381138999539,
+          "processing_seconds": 0.6119152550018043,
+          "audio_seconds": 120.30099999999995,
+          "audio_seconds_per_wall_second": 196.59748472792236,
+          "rows_per_second": 52.294823079554774,
+          "input_wait_seconds": 0.029185431994847022,
+          "encode_seconds": 0.5778243219974684,
+          "write_seconds": 0.003489939001156017,
+          "encoder_calls": 5,
+          "oom_retries": 0,
+          "total_wall_seconds": 2.496000938001089,
+          "accepted": 32,
+          "rejected": 0
+        },
+        {
+          "workers": 4,
+          "prefetch": 16,
+          "batch_size": 8,
+          "bucket_size": 256,
+          "batch_seconds": 64,
+          "fold_weight_norm": true,
+          "cudnn_allow_tf32": false,
+          "batching": "exact_hop_length_v1",
+          "setup_seconds": 1.195409973995993,
+          "processing_seconds": 0.5363654750035494,
+          "audio_seconds": 120.30099999999995,
+          "audio_seconds_per_wall_second": 224.28923114263435,
+          "rows_per_second": 59.66081243351512,
+          "input_wait_seconds": 0.026417231005325448,
+          "encode_seconds": 0.505015923998144,
+          "write_seconds": 0.003516519005643204,
+          "encoder_calls": 5,
+          "oom_retries": 0,
+          "total_wall_seconds": 1.7324423819954973,
+          "accepted": 32,
+          "rejected": 0
+        },
+        {
+          "workers": 4,
+          "prefetch": 16,
+          "batch_size": 8,
+          "bucket_size": 256,
+          "batch_seconds": 64,
+          "fold_weight_norm": true,
+          "cudnn_allow_tf32": false,
+          "batching": "exact_hop_length_v1",
+          "setup_seconds": 1.2239982789978967,
+          "processing_seconds": 0.5337851790027344,
+          "audio_seconds": 120.30099999999995,
+          "audio_seconds_per_wall_second": 225.37343622907838,
+          "rows_per_second": 59.949210391688446,
+          "input_wait_seconds": 0.025137114003882743,
+          "encode_seconds": 0.5036262550056563,
+          "write_seconds": 0.003584809004678391,
+          "encoder_calls": 5,
+          "oom_retries": 0,
+          "total_wall_seconds": 1.7584617330066976,
+          "accepted": 32,
+          "rejected": 0
+        }
+      ]
+    },
+    "median_processing_seconds": {
+      "serial": 0.6535043740004767,
+      "optimized": 0.5363654750035494
+    },
+    "median_processing_speedup": 1.2183938088038797
+  }
+}
