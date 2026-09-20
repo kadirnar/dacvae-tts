@@ -15,6 +15,14 @@ alone has 107,671,171 parameters. Frame-budget limits can reduce the actual batc
 The tested `facebook/dacvae-watermarked` checkpoint is 48 kHz, 128 channels,
 25 latent frames/s; the adapter probes these properties instead of assuming them.
 
+The [comprehensive Turkish research report](docs/kapsamli-tts-arastirma-raporu.md)
+collects the model comparisons, architecture diagrams, numerical evidence, text
+encoder and AdaLN research, recommendations, and complete technical appendices.
+
+The [Flow-DiT architecture guide (Turkish)](docs/flow-dit-mimarileri-aciklamasi.md)
+explains rectified flow, flow matching, reference conditioning, and encoder–decoder
+designs with diagrams, equations, and examples from this implementation.
+
 The [research and architecture record](docs/research.md) explains the evidence,
 design choices, quality risks, and post-training experiments. Core capabilities:
 
