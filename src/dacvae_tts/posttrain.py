@@ -24,6 +24,7 @@ from .codec import backend_options, check_compatibility
 from .data import LatentDataset, collate, jsonl, move_batch
 from .inference import Synthesizer
 from .model import flow_loss, per_example_mse, sample
+from .optim import build_optimizer
 from .parallel import loader_options
 from .training import Objective, atomic_save, autocast, distributed_device, load_model
 
@@ -366,11 +367,13 @@ def post_train(args):
             ),
             generator=torch.Generator().manual_seed(args.seed + rank),
         )
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=args.learning_rate,
-            betas=(0.9, 0.95),
-            weight_decay=0.01,
+        # Fine-tune with the optimizer family used for pretraining unless explicitly overridden.
+        optimizer = build_optimizer(
+            model,
+            getattr(args, "optimizer", None) or saved["config"]["train"].get("optimizer", "adamw"),
+            args.learning_rate,
+            0.01,
+            saved["config"]["train"].get("muon_momentum", 0.95),
             fused=device.type == "cuda",
         )
         if world > 1:

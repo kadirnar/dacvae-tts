@@ -29,7 +29,7 @@ design choices, quality risks, and post-training experiments. Core capabilities:
 - Parallel conditional flow generation with cross-attention to English byte text.
 - Reference-audio prefix plus pooled voice conditioning; an optional ASR frontend
   supplies the reference transcript automatically for audio-only requests.
-- Two-frame reversible packing, native SDPA, BF16, fused CUDA AdamW, cached text
+- Two-frame reversible packing, native SDPA, BF16, Muon (AdamW for non-matrix parameters), cached text
   encoding during sampling, optional `torch.compile` and activation checkpointing.
 - Streaming JSONL/Parquet preparation, binary latent shards, SQLite metadata,
   train-only normalization, exact-audio deduplication and speaker-disjoint splits.
@@ -166,6 +166,15 @@ keep the partition directories and mount them at the same paths on every node.
 bash scripts/train_8gpu.sh configs/tiny.yaml /cache/english/merged runs/tiny
 bash scripts/train_8gpu.sh configs/small.yaml /cache/english/merged runs/small
 ```
+
+The default optimizer is **Muon** for hidden weight matrices (attention, feed-forward, adaptive
+modulation and encoder MLP projections; fused key/value and modulation rows are orthogonalized
+separately) with AdamW for embeddings, convolution filters, boundary projections, output heads,
+biases and gains. Its updates are RMS-matched to AdamW, so `learning_rate` and `weight_decay` keep
+their meaning. `train.optimizer: adamw` or `--optimizer adamw` restores the previous plain AdamW.
+Muon has not been compared against AdamW on real speech metrics here; see
+[the improvement roadmap](docs/iyilestirme-yol-haritasi.md) for the small-scale loss comparison.
+Post-training reuses the optimizer recorded in the checkpoint unless `--optimizer` is passed.
 
 Tiny defaults to 16 pairs/GPU × 2 accumulation × 8 GPUs; small uses 8 × 4 × 8.
 Treat these as starting points for throughput profiling, not GPU-specific limits.

@@ -20,6 +20,7 @@ from .config import Config
 from .data import BucketBatchSampler, LatentDataset, collate, move_batch
 from .diagnostics import ActivationProbe, gradient_contributions, gradient_groups, loss_buckets
 from .model import FlowTTS, flow_loss, reduce_flow
+from .optim import build_optimizer
 from .parallel import device_batches, loader_options
 from .text import BYTE_OFFSET
 
@@ -134,6 +135,7 @@ def train(args):
             "workers",
             "precision",
             "learning_rate",
+            "optimizer",
             "worker_threads",
             "prefetch_factor",
             "loader_start_method",
@@ -192,16 +194,19 @@ def train(args):
         model = FlowTTS(cfg.model).to(device)
         model.grad_checkpoint = cfg.train.grad_checkpoint
         ema = copy.deepcopy(model).eval().requires_grad_(False)
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=cfg.train.learning_rate,
-            weight_decay=cfg.train.weight_decay,
-            betas=(0.9, 0.95),
+        optimizer = build_optimizer(
+            model,
+            cfg.train.optimizer,
+            cfg.train.learning_rate,
+            cfg.train.weight_decay,
+            cfg.train.muon_momentum,
             fused=device.type == "cuda",
         )
         start_step, epoch, batch_offset = 0, 0, 0
         if args.resume:
             saved = torch.load(args.resume, map_location="cpu", weights_only=True)
+            # Checkpoints written before the optimizer became configurable were trained with AdamW.
+            saved["config"]["train"].setdefault("optimizer", "adamw")
             if Config.from_dict(saved["config"]).to_dict() != cfg.to_dict():
                 raise ValueError(
                     "Resume requires the original configuration; use finetuning for changed schedules"
@@ -239,6 +244,7 @@ def train(args):
                 json.dumps(
                     {
                         "parameters": sum(p.numel() for p in model.parameters()),
+                        "optimizer": cfg.train.optimizer,
                         "ranks": world,
                         "maximum_global_batch": cfg.train.batch_size * cfg.train.accumulation * world,
                         "train_rows": len(data),

@@ -48,6 +48,8 @@ class TrainConfig:
     learning_rate: float = 3e-4
     warmup: int = 5000
     weight_decay: float = 0.01
+    optimizer: str = "muon"
+    muon_momentum: float = 0.95
     ema_decay: float = 0.999
     precision: str = "bf16"
     workers: int = 4
@@ -85,6 +87,8 @@ class TrainConfig:
             raise ValueError("Training counts/intervals must be positive")
         if self.precision not in {"fp32", "bf16"}:
             raise ValueError("precision must be fp32 or bf16")
+        if self.optimizer not in {"muon", "adamw"} or not 0 <= self.muon_momentum < 1:
+            raise ValueError("optimizer must be muon or adamw, with Muon momentum in [0,1)")
         if self.workers < 0 or self.warmup < 0 or not 0 <= self.ema_decay < 1:
             raise ValueError("Invalid training configuration")
         if self.flow_reduction not in {"utterance", "frame"} or self.duration_weight < 0:

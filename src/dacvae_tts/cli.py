@@ -81,6 +81,7 @@ def main():
     p.add_argument("--cuda-prefetch", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--precision", choices=["fp32", "bf16"])
     p.add_argument("--learning-rate", type=float)
+    p.add_argument("--optimizer", choices=["muon", "adamw"], help="Default comes from the config (muon)")
     p.add_argument(
         "--frame-budget",
         type=int,
@@ -206,6 +207,9 @@ def main():
     add_loader_args(p)
     p.add_argument("--precision", choices=["fp32", "bf16"], default="bf16")
     p.add_argument("--learning-rate", type=float, default=1e-5)
+    p.add_argument(
+        "--optimizer", choices=["muon", "adamw"], help="Default: the optimizer recorded in the checkpoint"
+    )
     p.add_argument("--beta", type=float, default=10.0)
     p.add_argument("--anchor", type=float, default=0.1)
     p.add_argument("--replay-weight", type=float, default=1.0)
