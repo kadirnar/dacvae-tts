@@ -26,24 +26,53 @@ from .text import BYTE_OFFSET
 
 
 class Objective(nn.Module):
-    def __init__(self, model, duration_weight=0.1):
+    """Flow (+ optional duration) loss. Text and reference are encoded once per step.
+
+    `expansion` > 1 is context-sharing batch expansion (SupertonicTTS, arXiv:2503.23108): every
+    utterance receives several independent (time, noise) draws that share one condition encoding.
+    Flow entries are then [B * expansion] while duration entries stay [B].
+    """
+
+    def __init__(self, model, duration_weight=0.1, time_sampling="uniform", expansion=1, ctc_weight=0.0):
         super().__init__()
         self.model = model
-        self.duration_weight = duration_weight
+        self.duration_weight, self.ctc_weight = duration_weight, ctc_weight
+        self.time_sampling, self.expansion = time_sampling, expansion
 
     def forward(self, batch):
-        details = flow_loss(
-            self.model, batch, self.model.cfg.cond_dropout if self.training else 0, return_details=True
-        )
-        flow = details["flow"]
-        frames = (batch["valid"] & ~batch["prompt_mask"]).sum(1)
-        characters = ((batch["segments"] == 1) & (batch["tokens"] >= BYTE_OFFSET)).sum(1)
-        log_rate = (frames / characters.clamp_min(1)).log()
-        duration = self.model.predict_duration(
+        cached = self.model.conditions(
             batch["prompt"], batch["prompt_mask"], batch["tokens"], batch["segments"]
         )
-        duration_loss = F.smooth_l1_loss(duration.float(), log_rate, reduction="none")
-        return {"loss": flow + self.duration_weight * duration_loss, "duration": duration_loss, **details}
+        expanded, shared = batch, cached
+        if self.expansion > 1 and self.training:
+            expanded = {key: value.repeat_interleave(self.expansion, 0) for key, value in batch.items()}
+            shared = tuple(value.repeat_interleave(self.expansion, 0) for value in cached)
+        details = flow_loss(
+            self.model,
+            expanded,
+            self.model.cfg.cond_dropout if self.training else 0,
+            return_details=True,
+            cached=shared,
+            time_sampling=self.time_sampling,
+        )
+        flow = details["flow"]
+        if self.model.duration is None:
+            duration_loss = flow.new_zeros(batch["latents"].size(0))
+        else:
+            frames = (batch["valid"] & ~batch["prompt_mask"]).sum(1)
+            characters = ((batch["segments"] == 1) & (batch["tokens"] >= BYTE_OFFSET)).sum(1)
+            log_rate = (frames / characters.clamp_min(1)).log()
+            duration = self.model.predict_duration(
+                batch["prompt"], batch["prompt_mask"], batch["tokens"], batch["segments"], cached=cached
+            )
+            duration_loss = F.smooth_l1_loss(duration.float(), log_rate, reduction="none")
+        copies = flow.numel() // duration_loss.numel()
+        total = flow + self.duration_weight * duration_loss.repeat_interleave(copies)
+        return {"loss": total, "duration": duration_loss, **details}
+
+    def auxiliary(self, losses):
+        """Weighted auxiliary terms [B * expansion] that join the flow term in the optimized loss."""
+        return self.ctc_weight * losses["ctc"] if "ctc" in losses else None
 
 
 def distributed_device(requested="auto"):
@@ -151,7 +180,14 @@ def train(args):
             raise ValueError("This GPU does not support BF16; pass --precision fp32")
         torch.manual_seed(cfg.train.seed)
         random.seed(cfg.train.seed)
-        data = LatentDataset(args.cache, "train", cfg.train.seed)
+        pairing = dict(
+            pairing=cfg.train.pairing,
+            layout=cfg.model.text_layout,
+            prompt_fraction=(cfg.train.prompt_fraction_min, cfg.train.prompt_fraction_max),
+        )
+        data = LatentDataset(
+            args.cache, "train", cfg.train.seed, prompt_dropout=cfg.train.prompt_dropout, **pairing
+        )
         if not data.meta.get("merged"):
             raise ValueError("Run merge on all prepared partitions before training")
         if cfg.model.latent_dim != data.channels:
@@ -182,7 +218,7 @@ def train(args):
         )
         validation = None
         if not args.no_validation:
-            val_data = LatentDataset(args.cache, "val", cfg.train.seed)
+            val_data = LatentDataset(args.cache, "val", cfg.train.seed, **pairing)
             val_sampler = BucketBatchSampler(val_data.costs, cfg.train.batch_size, rank, world, 12345)
             validation = DataLoader(
                 val_data,
@@ -226,7 +262,14 @@ def train(args):
         else:
             torch.manual_seed(cfg.train.seed + rank)
             random.seed(cfg.train.seed + rank)
-        objective = Objective(model, cfg.train.duration_weight).train()
+        objective = Objective(
+            model,
+            cfg.train.duration_weight,
+            cfg.train.time_sampling,
+            cfg.train.batch_expansion,
+            cfg.train.ctc_weight,
+        ).train()
+        raw_objective = objective  # compile/DDP wrap the module; helper methods stay reachable here
         if cfg.train.compile:
             objective = torch.compile(objective, dynamic=True)
         if world > 1:
@@ -280,11 +323,14 @@ def train(args):
             if world > 1:
                 dist.all_reduce(counts)
             denominator, frame_denominator = counts.unbind()
+            # Batch expansion multiplies the flow terms only; duration terms stay per utterance.
+            flow_examples = denominator * cfg.train.batch_expansion
+            frame_denominator = frame_denominator * cfg.train.batch_expansion
             learning_rate = cfg.train.learning_rate * lr_multiplier(step, cfg.train.warmup, cfg.train.steps)
             for group in optimizer.param_groups:
                 group["lr"] = learning_rate
             optimizer.zero_grad(set_to_none=True)
-            metrics = torch.zeros(3, device=device)
+            metrics = torch.zeros(4, device=device)
             buckets = torch.zeros(9, 2, device=device)
             diagnostics = {}
             diagnose = cfg.train.diagnostics_every > 0 and step % cfg.train.diagnostics_every == 0
@@ -300,13 +346,16 @@ def train(args):
                             else torch.ones_like(losses["flow"])
                         )
                         flow_denominator = (
-                            frame_denominator if cfg.train.flow_reduction == "frame" else denominator
+                            frame_denominator if cfg.train.flow_reduction == "frame" else flow_examples
                         )
                         loss = (
                             losses["flow"] * flow_weights
                         ).sum() * world / flow_denominator + cfg.train.duration_weight * losses[
                             "duration"
                         ].sum() * world / denominator
+                        auxiliary = raw_objective.auxiliary(losses)
+                        if auxiliary is not None:
+                            loss = loss + auxiliary.sum() * world / flow_examples
                     if probe is not None:
                         diagnostics["activation_max_abs"] = probe.close()
                         if world == 1:
@@ -330,6 +379,7 @@ def train(args):
                         losses["loss"].detach().sum(),
                         (losses["flow"].detach() * flow_weights).sum(),
                         losses["duration"].detach().sum(),
+                        losses["ctc"].detach().sum() if "ctc" in losses else losses["flow"].new_zeros(()),
                     ]
                 )
             norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -342,9 +392,9 @@ def train(args):
                 diagnostics["consecutive_inactive_diagnostic_checks"] = dict(inactive)
             optimizer.step()
             with torch.no_grad():
-                torch._foreach_lerp_(
-                    list(ema.parameters()), list(model.parameters()), 1 - cfg.train.ema_decay
-                )
+                # Warm-up keeps the average from being dominated by the random initialization.
+                decay = min(cfg.train.ema_decay, (1 + step) / (10 + step))
+                torch._foreach_lerp_(list(ema.parameters()), list(model.parameters()), 1 - decay)
             if (step + 1) % cfg.train.log_every == 0 or step == start_step or diagnose:
                 if world > 1:
                     dist.all_reduce(metrics)
@@ -360,6 +410,7 @@ def train(args):
                         ).item(),
                         "flow": (metrics[1] / flow_denominator).item(),
                         "duration": (metrics[2] / denominator).item(),
+                        "ctc": (metrics[3] / flow_examples).item(),
                         "elapsed_seconds": time.monotonic() - last_time,
                         "valid_target_frames": int(frame_denominator),
                         "gradient_norm_before_clip": float(norm),
@@ -383,7 +434,13 @@ def train(args):
                 if rank == 0:
                     print(json.dumps({"step": step + 1, "validation_loss": val_loss}), flush=True)
             stopping = args.stop_after is not None and step + 1 >= args.stop_after
-            if (step + 1) % cfg.train.checkpoint_every == 0 or step + 1 == cfg.train.steps or stopping:
+            keeping = cfg.train.keep_every and (step + 1) % cfg.train.keep_every == 0
+            if (
+                (step + 1) % cfg.train.checkpoint_every == 0
+                or step + 1 == cfg.train.steps
+                or stopping
+                or keeping
+            ):
                 states = [None] * world
                 state = rng_state(device)
                 if world > 1:
@@ -409,6 +466,10 @@ def train(args):
                         "stage": "pretrain",
                     }
                     atomic_save(saved, out / "last.pt")
+                    if keeping:
+                        # Permanent, optimizer-free snapshot for later speech evaluation and selection.
+                        keep = {k: v for k, v in saved.items() if k not in {"optimizer", "rng"}}
+                        atomic_save(keep, out / f"step-{step + 1:07d}.pt")
                 if world > 1:
                     dist.barrier()
             if stopping:

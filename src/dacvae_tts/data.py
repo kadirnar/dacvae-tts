@@ -81,7 +81,27 @@ def load_stats(directory):
 
 
 class LatentDataset(Dataset):
-    def __init__(self, directory, split="train", seed=42):
+    """`cross` pairs a target with another utterance of the same speaker; `within` cuts the voice
+    prompt from the start of the target utterance itself, so no speaker labels are needed."""
+
+    def __init__(
+        self,
+        directory,
+        split="train",
+        seed=42,
+        pairing="cross",
+        layout="segments",
+        prompt_fraction=(0.1, 0.5),
+        prompt_dropout=0.0,
+    ):
+        if pairing not in {"cross", "within"} or layout not in {"segments", "joined"}:
+            raise ValueError("pairing must be cross or within; layout must be segments or joined")
+        if pairing == "within" and layout != "joined":
+            raise ValueError("Within-utterance prompts have no transcript boundary; use the joined layout")
+        if not 0 <= prompt_fraction[0] <= prompt_fraction[1] < 1 or not 0 <= prompt_dropout <= 1:
+            raise ValueError("Invalid prompt fraction range or prompt dropout")
+        self.pairing, self.layout = pairing, layout
+        self.prompt_fraction, self.prompt_dropout = tuple(prompt_fraction), prompt_dropout
         self.directory = Path(directory).resolve()
         self.db_path = self.directory / "index.sqlite"
         self.meta = json.loads((self.directory / "metadata.json").read_text())
@@ -112,15 +132,18 @@ class LatentDataset(Dataset):
                 self.group_start[start:count], self.group_end[start:count] = start, count
         if total == 0:
             raise ValueError(f"Empty {split} split; need enough speakers or explicit split assignments")
-        if np.any(self.group_end - self.group_start < 2):
-            raise ValueError(
-                f"{split}: every speaker needs at least two utterances; run merge to filter singletons"
-            )
-        self.max_ref_lengths = np.empty(total, dtype=np.int32)
-        for start in np.flatnonzero(self.group_start == np.arange(total)):
-            end = self.group_end[start]
-            self.max_ref_lengths[start:end] = self.lengths[start:end].max()
-        self.costs = self.lengths + self.max_ref_lengths
+        if pairing == "within":
+            self.costs = self.lengths.copy()  # the prompt is part of the utterance: exact cost
+        else:
+            if np.any(self.group_end - self.group_start < 2):
+                raise ValueError(
+                    f"{split}: every speaker needs at least two utterances; run merge to filter singletons"
+                )
+            self.max_ref_lengths = np.empty(total, dtype=np.int32)
+            for start in np.flatnonzero(self.group_start == np.arange(total)):
+                end = self.group_end[start]
+                self.max_ref_lengths[start:end] = self.lengths[start:end].max()
+            self.costs = self.lengths + self.max_ref_lengths
         self._pid, self._db, self._maps = None, None, OrderedDict()
 
     def __len__(self):
@@ -171,6 +194,29 @@ class LatentDataset(Dataset):
         # Epoch travels through the sampler index so persistent workers see it.
         epoch, index = index if isinstance(index, tuple) else (self.epoch, index)
         rng = random.Random(self.seed + epoch * len(self) + index)
+        if self.pairing == "within":
+            row = self.row(index)
+            frames = len(row["latents"])
+            # Prompt dropout trains prompt-free synthesis of the whole utterance from its text.
+            cut = (
+                0
+                if rng.random() < self.prompt_dropout
+                else round(frames * rng.uniform(*self.prompt_fraction))
+            )
+            cut = max(min(cut, frames - 1), 0)  # always keep at least one target frame
+            return {
+                "target": row["latents"][cut:],
+                "reference": row["latents"][:cut],
+                "text": row["text"],
+                "reference_text": "",
+                "text_bytes": row["text_bytes"],
+                "reference_text_bytes": b"" if row["text_bytes"] is not None else None,
+                "uid": row["uid"],
+                "reference_uid": row["uid"],
+                "speaker": row["speaker"],
+                "text_normalization": self.meta.get("text_normalization", "unicode-v1"),
+                "layout": self.layout,
+            }
         start, end = int(self.group_start[index]), int(self.group_end[index])
         ref_index = rng.randrange(start, end - 1)
         ref_index += ref_index >= index
@@ -186,6 +232,7 @@ class LatentDataset(Dataset):
             "reference_uid": ref["uid"],
             "speaker": target["speaker"],
             "text_normalization": self.meta.get("text_normalization", "unicode-v1"),
+            "layout": self.layout,
         }
 
 
@@ -195,11 +242,14 @@ def collate(items):
     latents, prompts, masks, tokens, segments, lengths = [], [], [], [], [], []
     for item in items:
         ref, target = item["reference"], item["target"]
+        layout = item.get("layout", "segments")
+        # A joined-layout item may come without a prompt; the segment layout always has a reference.
         if (
             ref.ndim != 2
             or target.ndim != 2
             or ref.size(1) != target.size(1)
-            or min(len(ref), len(target)) < 1
+            or len(target) < 1
+            or (len(ref) < 1 and layout != "joined")
         ):
             raise ValueError("Each item requires nonempty [Lref,C] reference and [Ltgt,C] target")
         if not torch.isfinite(ref).all() or not torch.isfinite(target).all():
@@ -207,10 +257,10 @@ def collate(items):
         z = torch.cat([ref, target])
         mask = torch.arange(len(z)) < len(ref)
         if item.get("text_bytes") is not None and item.get("reference_text_bytes") is not None:
-            tok, seg = tokenize_bytes(item["reference_text_bytes"], item["text_bytes"])
+            tok, seg = tokenize_bytes(item["reference_text_bytes"], item["text_bytes"], layout)
         else:
             tok, seg = tokenize(
-                item["reference_text"], item["text"], item.get("text_normalization", "unicode-v1")
+                item["reference_text"], item["text"], item.get("text_normalization", "unicode-v1"), layout
             )
         latents.append(z)
         prompts.append(z * mask[:, None])

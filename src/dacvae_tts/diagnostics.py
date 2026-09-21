@@ -9,6 +9,9 @@ def gradient_contributions(model, flow, duration):
     params = [p for p in model.parameters() if p.requires_grad]
     result = {}
     for name, loss in (("flow", flow), ("weighted_duration", duration)):
+        if not loss.requires_grad:  # e.g. rule-based duration: no learned head, no gradient
+            result[f"{name}_gradient_norm"] = 0.0
+            continue
         grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
         norm = sum(g.detach().float().square().sum() for g in grads if g is not None).sqrt()
         result[f"{name}_gradient_norm"] = float(norm)

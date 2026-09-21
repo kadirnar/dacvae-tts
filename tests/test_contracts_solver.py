@@ -95,7 +95,9 @@ class Field(nn.Module):
 
     def forward(self, x, t, prompt, prompt_mask, valid, tokens, segments, cached=None):
         self.calls += 1
-        return torch.full_like(x, self.conditioned if cached[0].any() else self.null)
+        # Guided sampling evaluates the conditioned and null branches in one batch.
+        conditioned = cached[0].flatten(1).any(1)[:, None, None]
+        return torch.where(conditioned, torch.full_like(x, self.conditioned), torch.full_like(x, self.null))
 
 
 @pytest.mark.parametrize("value", [0.0, 2.0])
@@ -133,7 +135,7 @@ def test_guidance_equation_and_work_count():
     )
     mask = batch["valid"] & ~batch["prompt_mask"]
     assert torch.allclose(result[mask], torch.full_like(result[mask], 4.0))
-    assert field.calls == stats["forward_calls"] == 4
+    assert field.calls == stats["forward_calls"] == 2 and stats["branch_evaluations"] == 4
 
 
 @pytest.mark.parametrize(

@@ -60,7 +60,7 @@ def test_audio_only_api_no_speaker_id(monkeypatch, cache, tmp_path):
     )
     assert calls == ["reference.wav"]
     assert result.metadata["reference_transcript_source"].startswith("asr:")
-    assert result.metadata["branch_evaluations"] == result.metadata["forward_calls"] == 4
+    assert result.metadata["branch_evaluations"] == 4 and result.metadata["forward_calls"] == 2
     assert (tmp_path / "out.wav").exists()
     prepared = tts.prepare_reference("reference.wav", reference_text="Exact transcript.")
     tts.synthesize("New words.", reference=prepared, seconds=0.5, steps=1, guidance=1)

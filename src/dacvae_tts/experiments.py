@@ -110,7 +110,9 @@ def codec_reconstruct(args):
     root = Path(args.cache)
     meta = json.loads((root / "metadata.json").read_text())
     stats = load_stats(root)
-    codec = Codec(meta["checkpoint"], args.device, **backend_options(args))
+    codec = Codec(
+        meta["checkpoint"], args.device, loudness=meta.get("loudness_lufs"), **backend_options(args)
+    )
     check_compatibility(codec.metadata, meta)
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -124,7 +126,7 @@ def codec_reconstruct(args):
                 break
             path = Path(row["audio"])
             path = path if path.is_absolute() else source_root / path
-            audio = read_audio(path, codec.sample_rate)
+            audio = read_audio(path, codec.sample_rate, codec.loudness)
             decoded, diagnostics = codec.reconstruct(audio, stats["mean"], stats["std"], args.cache_precision)
             orig_path, recon_path = output / f"{index:06d}-original.wav", output / f"{index:06d}-codec.wav"
             sf.write(orig_path, audio.numpy(), codec.sample_rate, subtype="FLOAT")

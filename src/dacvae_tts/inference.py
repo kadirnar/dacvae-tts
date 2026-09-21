@@ -10,7 +10,7 @@ import torch
 from .codec import Codec, backend_options, check_compatibility, read_audio
 from .contracts import normalization_stats, target_mask
 from .model import sample
-from .text import BYTE_OFFSET, tokenize
+from .text import BYTE_OFFSET, normalize, tokenize
 from .training import autocast, load_model
 
 
@@ -45,7 +45,11 @@ class Synthesizer:
         self.device = torch.device(device)
         self.precision = precision
         self.model, self.checkpoint = load_model(checkpoint, device)
-        self.codec = Codec(self.checkpoint["codec"]["checkpoint"], device, **(codec_options or {}))
+        codec_options = dict(codec_options or {})
+        if self.checkpoint["codec"].get("loudness_lufs") is not None:
+            # References must receive the loudness normalization the training cache used.
+            codec_options["loudness"] = self.checkpoint["codec"]["loudness_lufs"]
+        self.codec = Codec(self.checkpoint["codec"]["checkpoint"], device, **codec_options)
         check_compatibility(self.codec.metadata, self.checkpoint["codec"])
         self.mean = self.checkpoint["mean"].to(device)
         self.std = self.checkpoint["std"].to(device)
@@ -154,7 +158,7 @@ class Synthesizer:
         return SynthesisResult(audio, self.codec.sample_rate, metadata)
 
     def reference(self, path):
-        audio = read_audio(path, self.codec.sample_rate)
+        audio = read_audio(path, self.codec.sample_rate, getattr(self.codec, "loudness", None))
         seconds = len(audio) / self.codec.sample_rate
         if not 0.5 <= seconds <= 30:
             raise ValueError("Reference must be a complete .5–30 second utterance with an exact transcript")
@@ -165,11 +169,20 @@ class Synthesizer:
         if not math.isfinite(duration_scale) or duration_scale <= 0:
             raise ValueError("duration_scale must be finite and positive")
         reference = reference.to(self.device)
-        tokens, segments = tokenize(reference_text, text, version=self.text_version)
+        layout = self.model.cfg.text_layout
+        tokens, segments = tokenize(reference_text, text, version=self.text_version, layout=layout)
         tokens, segments = tokens[None].to(self.device), segments[None].to(self.device)
         if tokens.numel() > 2048:
             raise ValueError("Text too long; split into sentences before synthesis")
-        if seconds is None:
+        if seconds is None and self.model.duration is None:
+            # Speaking-rate rule (F5-TTS): the target keeps the prompt's frames per transcript byte.
+            # It also keeps length-normalized text/audio positions consistent across the boundary.
+            version = self.text_version
+            reference_bytes = len(normalize(reference_text, version).encode("utf-8"))
+            target_bytes = len(normalize(text, version).encode("utf-8"))
+            frames = round(len(reference) / max(reference_bytes, 1) * target_bytes * duration_scale)
+            self.duration_profile = {"duration_rule": "reference_frames_per_byte"}
+        elif seconds is None:
             prompt = reference[None]
             mask = torch.ones(prompt.shape[:2], device=self.device, dtype=torch.bool)
             with autocast(self.device, self.precision):

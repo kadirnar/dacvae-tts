@@ -28,16 +28,33 @@ def normalize(text: str, version="unicode-v1", spoken_text=None) -> str:
     return text
 
 
-def tokenize(reference: str, target: str, version="unicode-v1"):
+LAYOUTS = {"segments", "joined"}
+
+
+def tokenize(reference: str, target: str, version="unicode-v1", layout="segments"):
     ref = normalize(reference, version).encode("utf-8") if reference.strip() else b""
     tgt = normalize(target, version).encode("utf-8")
-    return tokenize_bytes(ref, tgt)
+    return tokenize_bytes(ref, tgt, layout)
 
 
-def tokenize_bytes(reference: bytes, target: bytes):
-    """Assemble cached normalized UTF-8 bytes without normalizing every training pair."""
+def tokenize_bytes(reference: bytes, target: bytes, layout="segments"):
+    """Assemble cached normalized UTF-8 bytes without normalizing every training pair.
+
+    `segments` marks reference and target transcripts ([BOS ref SEP target EOS]). `joined` is one
+    sentence stream without a boundary ([BOS ref+" "+target EOS]), the layout a prompt cut from the
+    same utterance needs: nobody knows where its transcript ends.
+    """
     if not target:
         raise ValueError("Empty target transcript bytes")
+    if layout == "joined":
+        joined = reference + b" " + target if reference else target
+        tokens = np.empty(len(joined) + 2, dtype=np.int64)
+        tokens[0], tokens[-1] = BOS, EOS
+        tokens[1:-1] = np.frombuffer(joined, dtype=np.uint8)
+        tokens[1:-1] += BYTE_OFFSET
+        return torch.from_numpy(tokens), torch.ones(len(tokens), dtype=torch.int64)
+    if layout != "segments":
+        raise ValueError(f"Unknown text layout: {layout}")
     nref = len(reference)
     tokens = np.empty(nref + len(target) + 3, dtype=np.int64)
     tokens[0], tokens[nref + 1], tokens[-1] = BOS, SEP, EOS

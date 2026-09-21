@@ -26,22 +26,64 @@ def masked_mean(x, mask):
     return sanitize(x, mask).sum(1) / mask.sum(1, keepdim=True).clamp_min(1)
 
 
+# Length-aware RoPE (arXiv:2509.11084): cross-attention positions are gamma * index / length, so a
+# frame at 40% of the audio starts out looking at the text around 40% of the transcript.
+LENGTH_AWARE_SCALE = 10.0
+
+
+def rope_angles(positions, head_width):
+    """Positions [B,N] on any real scale -> rotation angles [B,1,N,head_width/2]."""
+    half = head_width // 2
+    frequencies = torch.exp(torch.arange(half, device=positions.device).float() * (-math.log(10000) / half))
+    return (positions.float()[..., None] * frequencies)[:, None]
+
+
+def rotate(x, angles):
+    cos, sin = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
+    first, second = x.chunk(2, dim=-1)
+    return torch.cat([first * cos - second * sin, first * sin + second * cos], -1)
+
+
 class Attention(nn.Module):
-    def __init__(self, width, heads):
+    def __init__(self, width, heads, qk_norm=False):
         super().__init__()
         self.heads = heads
         self.q = nn.Linear(width, width)
         self.kv = nn.Linear(width, width * 2)
         self.out = nn.Linear(width, width)
+        self.q_norm = nn.RMSNorm(width // heads) if qk_norm else None
+        self.k_norm = nn.RMSNorm(width // heads) if qk_norm else None
 
-    def forward(self, x, context, valid):
+    def forward(self, x, context, valid, query_angles=None, key_angles=None):
         b, n, d = x.shape
         q = self.q(x).view(b, n, self.heads, d // self.heads).transpose(1, 2)
         k, v = self.kv(context).chunk(2, dim=-1)
         k = k.view(b, -1, self.heads, d // self.heads).transpose(1, 2)
         v = v.view(b, -1, self.heads, d // self.heads).transpose(1, 2)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=valid[:, None, None, :])
+        if self.q_norm is not None:
+            q, k = self.q_norm(q), self.k_norm(k)
+        if query_angles is not None:
+            q, k = rotate(q, query_angles), rotate(k, key_angles)
+        y = F.scaled_dot_product_attention(q.to(v.dtype), k.to(v.dtype), v, attn_mask=valid[:, None, None, :])
         return self.out(y.transpose(1, 2).reshape(b, n, d))
+
+
+class TextBlock(nn.Module):
+    """Bidirectional self-attention over the transcript: global context the convolutions lack."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        d = cfg.width
+        self.norm1, self.norm2 = nn.LayerNorm(d), nn.LayerNorm(d)
+        self.attention = Attention(d, cfg.heads, cfg.qk_norm)
+        self.ff = nn.Sequential(
+            nn.Linear(d, d * cfg.ff_mult), nn.GELU(approximate="tanh"), nn.Linear(d * cfg.ff_mult, d)
+        )
+
+    def forward(self, x, valid, angles):
+        h = self.norm1(x)
+        x = x + self.attention(h, h, valid, angles, angles)
+        return (x + self.ff(self.norm2(x))) * valid[..., None]
 
 
 class TextEncoder(nn.Module):
@@ -57,15 +99,23 @@ class TextEncoder(nn.Module):
                 for _ in range(cfg.text_depth)
             ]
         )
+        self.blocks = nn.ModuleList([TextBlock(cfg) for _ in range(cfg.text_attention)])
+        self.head_width = d // cfg.heads
         self.norm = nn.LayerNorm(d)
 
     def forward(self, tokens, segments):
         valid = tokens.ne(0)
         x = self.embedding(tokens) + self.segment(segments)
-        x = x + sinusoidal(torch.arange(tokens.size(1), device=x.device), x.size(-1)).to(x.dtype)
+        index = torch.arange(tokens.size(1), device=x.device)
+        x = x + sinusoidal(index, x.size(-1)).to(x.dtype)
         for conv, mlp in zip(self.convs, self.mlps):
             x = x * valid[..., None]
             x = x + mlp(conv(x.transpose(1, 2)).transpose(1, 2))
+        if len(self.blocks):
+            angles = rope_angles(index[None], self.head_width)
+            x = x * valid[..., None]
+            for block in self.blocks:
+                x = block(x, valid, angles)
         return self.norm(x) * valid[..., None], valid
 
 
@@ -76,8 +126,8 @@ class Block(nn.Module):
         self.norm1 = nn.LayerNorm(d, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(d, elementwise_affine=False)
         self.norm3 = nn.LayerNorm(d, elementwise_affine=False)
-        self.self_attn = Attention(d, cfg.heads)
-        self.cross_attn = Attention(d, cfg.heads)
+        self.self_attn = Attention(d, cfg.heads, cfg.qk_norm)
+        self.cross_attn = Attention(d, cfg.heads, cfg.qk_norm)
         self.ff = nn.Sequential(
             nn.Linear(d, d * cfg.ff_mult), nn.GELU(approximate="tanh"), nn.Linear(d * cfg.ff_mult, d)
         )
@@ -85,13 +135,13 @@ class Block(nn.Module):
         nn.init.zeros_(self.ada[-1].weight)
         nn.init.zeros_(self.ada[-1].bias)
 
-    def forward(self, x, text, valid, text_valid, cond):
+    def forward(self, x, text, valid, text_valid, cond, self_angles=None, query_angles=None, key_angles=None):
         params = self.ada(cond).unsqueeze(1).chunk(9, dim=-1)
         s1, b1, g1, s2, b2, g2, s3, b3, g3 = params
         h = self.norm1(x) * (1 + s1) + b1
-        x = x + g1 * self.self_attn(h, h, valid)
+        x = x + g1 * self.self_attn(h, h, valid, self_angles, self_angles)
         h = self.norm2(x) * (1 + s2) + b2
-        x = x + g2 * self.cross_attn(h, text, text_valid)
+        x = x + g2 * self.cross_attn(h, text, text_valid, query_angles, key_angles)
         x = x + g3 * self.ff(self.norm3(x) * (1 + s3) + b3)
         return x * valid[..., None]
 
@@ -113,7 +163,15 @@ class FlowTTS(nn.Module):
         nn.init.zeros_(self.output[-1].weight)
         nn.init.zeros_(self.output[-1].bias)
         duration_extra = 3 if cfg.duration_features == "text_stats" else 0
-        self.duration = nn.Sequential(nn.Linear(2 * d + 1 + duration_extra, d), nn.SiLU(), nn.Linear(d, 1))
+        # `rule` derives the length from the prompt's speaking rate instead of a learned head.
+        self.duration = (
+            nn.Sequential(nn.Linear(2 * d + 1 + duration_extra, d), nn.SiLU(), nn.Linear(d, 1))
+            if cfg.duration == "head"
+            else None
+        )
+        # Auxiliary CTC head on intermediate frames (A-DMA, arXiv:2505.19595): training only. It makes
+        # the generator route every transcript byte to its frames early, i.e. learn the alignment.
+        self.ctc = nn.Linear(d, VOCAB_SIZE) if cfg.ctc_layer else None
         self.grad_checkpoint = False
 
     def reference_summary(self, prompt, prompt_mask):
@@ -139,6 +197,8 @@ class FlowTTS(nn.Module):
         return text, text_valid, voice
 
     def predict_duration(self, prompt, prompt_mask, tokens, segments, cached=None):
+        if self.duration is None:
+            raise ValueError("This model has no duration head; its length follows the prompt speaking rate")
         if (
             prompt.ndim != 3
             or prompt.shape[-1] != self.cfg.latent_dim
@@ -165,7 +225,9 @@ class FlowTTS(nn.Module):
             features.append(torch.stack([characters.log(), punct_fraction, words.log()], -1))
         return self.duration(torch.cat(features, -1)).squeeze(-1)
 
-    def forward(self, x, time, prompt, prompt_mask, valid, tokens, segments, drop=None, cached=None):
+    def forward(
+        self, x, time, prompt, prompt_mask, valid, tokens, segments, drop=None, cached=None, return_ctc=False
+    ):
         audio_shapes(x, prompt, prompt_mask, valid, self.cfg.latent_dim)
         text_shapes(tokens, segments, x.size(0), x.device)
         if time.shape != (x.size(0),) or time.device != x.device or not time.is_floating_point():
@@ -204,24 +266,41 @@ class FlowTTS(nn.Module):
         if self.input.in_features != p * (2 * channels + 1) or self.output[-1].out_features != p * channels:
             raise ValueError("Invalid packing projections: expected P(2C+1) input and PC output")
         h = self.input(features.reshape(b, -1, features.size(-1) * p))
-        h = h + sinusoidal(torch.arange(h.size(1), device=x.device), h.size(-1)).to(h.dtype)
+        index = torch.arange(h.size(1), device=x.device)
+        angles = (None, None, None)
+        if self.cfg.positions == "rope":
+            head_width = self.cfg.width // self.cfg.heads
+            audio_length = packed_valid.sum(1, keepdim=True).clamp_min(1)
+            text_length = text_valid.sum(1, keepdim=True).clamp_min(1)
+            text_index = torch.arange(text.size(1), device=x.device)
+            angles = (
+                rope_angles(index[None], head_width),
+                rope_angles(LENGTH_AWARE_SCALE * index[None] / audio_length, head_width),
+                rope_angles(LENGTH_AWARE_SCALE * text_index[None] / text_length, head_width),
+            )
+        else:
+            h = h + sinusoidal(index, h.size(-1)).to(h.dtype)
         time_embedding = self.time(sinusoidal(time * 1000, self.cfg.width).to(h.dtype))
         if time_embedding.shape != voice.shape:
             raise ValueError("Time embedding and reference summary must both be [B,D]")
         cond = time_embedding + voice
-        for block in self.blocks:
-            args = (h, text, packed_valid, text_valid, cond)
+        ctc_logits = None
+        for number, block in enumerate(self.blocks, 1):
+            args = (h, text, packed_valid, text_valid, cond, *angles)
             h = (
                 checkpoint(block, *args, use_reentrant=False)
                 if self.grad_checkpoint and self.training
                 else block(*args)
             )
+            if return_ctc and number == self.cfg.ctc_layer:
+                ctc_logits = self.ctc(h)
         output = self.output(h)
         expected_packs = (length + pad) // p
         if output.shape != (b, expected_packs, channels * p):
             raise ValueError("Velocity projection returned an unexpected packed length or width")
         # Remove only the explicitly added packing padding, then mask at frame resolution.
-        return sanitize(output.reshape(b, length + pad, channels)[:, :length], valid)
+        velocity = sanitize(output.reshape(b, length + pad, channels)[:, :length], valid)
+        return (velocity, ctc_logits, packed_valid) if return_ctc else velocity
 
 
 def per_example_mse(prediction, target, mask):
@@ -246,13 +325,46 @@ def reduce_flow(losses, counts, reduction="utterance"):
     raise ValueError("reduction must be utterance or frame")
 
 
-def flow_loss(model, batch, dropout=0.1, time=None, noise=None, return_details=False):
+def prediction_kind(model):
+    return getattr(getattr(model, "cfg", None), "prediction", "velocity")
+
+
+def to_velocity(model, output, x, time):
+    """EDM-style preconditioning (unit-variance data, linear path): the network output F has unit
+    variance at every t, x1_hat = c_skip x + c_out F, and the 1/(1-t) factor cancels analytically."""
+    if prediction_kind(model) != "edm":
+        return output
+    t = time[:, None, None].to(x.dtype)
+    scale = t.square() + (1 - t).square()
+    return ((2 * t - 1) / scale) * x + output / scale.sqrt()
+
+
+def sample_time(count, device, mode="uniform"):
+    if mode == "uniform":
+        return torch.rand(count, device=device)
+    if mode != "logit_normal":
+        raise ValueError("time sampling must be uniform or logit_normal")
+    # Stratified logit-normal(0,1): one draw per equal-probability slice of the batch.
+    uniform = (torch.randperm(count, device=device) + torch.rand(count, device=device)) / count
+    return torch.sigmoid(torch.special.ndtri(uniform.clamp(1e-4, 1 - 1e-4))).clamp(1e-3, 1 - 1e-3)
+
+
+def flow_loss(
+    model,
+    batch,
+    dropout=0.1,
+    time=None,
+    noise=None,
+    return_details=False,
+    cached=None,
+    time_sampling="uniform",
+):
     if not 0 <= dropout <= 1:
         raise ValueError("dropout must lie in [0,1]")
     mask = mask_values(batch["valid"], batch["prompt_mask"])
     x1 = sanitize(batch["latents"], batch["valid"])
     b = x1.size(0)
-    time = torch.rand(b, device=x1.device) if time is None else time
+    time = sample_time(b, x1.device, time_sampling) if time is None else time
     noise = torch.randn_like(x1) if noise is None else noise
     if time.shape != (b,) or noise.shape != x1.shape or time.device != x1.device or noise.device != x1.device:
         raise ValueError("Noise must match [B,L,C]; time must match [B], on the audio device")
@@ -265,6 +377,7 @@ def flow_loss(model, batch, dropout=0.1, time=None, noise=None, return_details=F
     drop = torch.rand(b, device=x1.device) < dropout
     # Remove reference from the state too, otherwise CFG's null branch leaks the voice.
     xt = xt.masked_fill((drop[:, None] & batch["prompt_mask"])[..., None], 0)
+    with_ctc = return_details and getattr(model, "ctc", None) is not None and model.training
     pred = model(
         xt,
         time,
@@ -274,13 +387,47 @@ def flow_loss(model, batch, dropout=0.1, time=None, noise=None, return_details=F
         batch["tokens"],
         batch["segments"],
         drop=drop,
+        **({} if cached is None else {"cached": cached}),
+        **({"return_ctc": True} if with_ctc else {}),
     )
-    losses = per_example_mse(pred, x1 - noise, mask)
+    ctc = None
+    if with_ctc:
+        pred, logits, token_valid = pred
+        ctc = ctc_alignment_loss(logits, token_valid, batch["tokens"], drop)
+    target = x1 - noise
+    if prediction_kind(model) == "edm":
+        t = time[:, None, None]
+        target = ((1 - t) * x1 - t * noise) / (t.square() + (1 - t).square()).sqrt()
+    losses = per_example_mse(pred, target, mask)
     if return_details:
         counts = mask.sum(1)
         rms = (sanitize(pred.float(), mask).square().sum((1, 2)) / (counts * pred.size(-1))).sqrt()
-        return {"flow": losses, "times": time, "frames": counts, "prediction_rms": rms}
+        details = {"flow": losses, "times": time, "frames": counts, "prediction_rms": rms}
+        if ctc is not None:
+            details["ctc"] = ctc
+        return details
     return losses
+
+
+def ctc_alignment_loss(logits, token_valid, tokens, drop):
+    """Per-example CTC between generator frames and transcript bytes; PAD (0) is the blank.
+
+    Examples whose text was dropped for classifier-free guidance cannot be aligned and get zero.
+    """
+    from .text import BYTE_OFFSET
+
+    targets = [row[row >= BYTE_OFFSET] for row in tokens]
+    lengths = torch.tensor([len(row) for row in targets], device=logits.device)
+    loss = F.ctc_loss(
+        logits.float().log_softmax(-1).transpose(0, 1),
+        torch.cat(targets),
+        token_valid.sum(1),
+        lengths,
+        blank=0,
+        reduction="none",
+        zero_infinity=True,
+    )
+    return (loss / lengths.clamp_min(1)).masked_fill(drop, 0)
 
 
 def time_grid(steps, sway, device, times=None):
@@ -344,24 +491,32 @@ def sample(
         if condition_cache is None
         else condition_cache
     )
-    # Joint dropout's null features are exactly zero; do not redundantly encode the text.
-    null = (torch.zeros_like(cond[0]), cond[1], torch.zeros_like(cond[2])) if guidance != 1 else None
+    if guidance != 1:
+        # Conditioned and null branches share one forward pass. Joint dropout's null features are
+        # exactly zero, so the text is not encoded a second time.
+        zeros = torch.zeros_like
+        pair = dict(
+            prompt=torch.cat([prompt, zeros(prompt)]),
+            prompt_mask=torch.cat([prompt_mask, zeros(prompt_mask)]),
+            valid=valid.repeat(2, 1),
+            tokens=tokens.repeat(2, 1),
+            segments=segments.repeat(2, 1),
+            cached=(
+                torch.cat([cond[0], zeros(cond[0])]),
+                cond[1].repeat(2, 1),
+                torch.cat([cond[2], zeros(cond[2])]),
+            ),
+        )
     trajectory = [x.clone()] if return_trajectory else None
     for t0, t1 in zip(times[:-1], times[1:]):
         t = t0.expand(x.size(0))
-        v = model(x, t, prompt, prompt_mask, valid, tokens, segments, cached=cond)
-        if guidance != 1:
-            null_x = x.masked_fill(prompt_mask[..., None], 0)
-            u = model(
-                null_x,
-                t,
-                torch.zeros_like(prompt),
-                torch.zeros_like(prompt_mask),
-                valid,
-                tokens,
-                segments,
-                cached=null,
+        if guidance == 1:
+            v = to_velocity(
+                model, model(x, t, prompt, prompt_mask, valid, tokens, segments, cached=cond), x, t
             )
+        else:
+            both = torch.cat([x, x.masked_fill(prompt_mask[..., None], 0)])
+            v, u = to_velocity(model, model(both, t.repeat(2), **pair), both, t.repeat(2)).chunk(2)
             v = u + guidance * (v - u)
         x = x + (t1 - t0) * sanitize(v, mask)
         x = sanitize(torch.where(prompt_mask[..., None], prompt, x), valid)
@@ -369,7 +524,7 @@ def sample(
             trajectory.append(x.clone())
     if stats is not None:
         stats.update(
-            forward_calls=steps * (1 if guidance == 1 else 2),
+            forward_calls=steps,
             branch_evaluations=steps * (1 if guidance == 1 else 2),
             time_grid=times.cpu().tolist(),
             solver="euler",

@@ -133,6 +133,14 @@ def prepare_record(row, args, root, sample_rate):
         raise ValueError(f"Missing required dataset columns: {sorted(missing)}")
     uid = str(row["id"])
     try:
+        # Cheap metadata filters run before any audio is decoded.
+        quality_column = getattr(args, "quality_column", None)
+        if quality_column and getattr(args, "min_quality", None) is not None:
+            quality = row.get(quality_column)
+            if quality is None or quality < args.min_quality:
+                raise ValueError(f"Quality {quality} below {args.min_quality}")
+        if getattr(args, "reject_digits", False) and any(c.isdigit() for c in row[args.text_column] or ""):
+            raise ValueError("Transcript contains digits")
         text = normalize(
             row[args.text_column], getattr(args, "text_normalization", "unicode-v1"), row.get("spoken_text")
         )
@@ -151,7 +159,7 @@ def prepare_record(row, args, root, sample_rate):
         if isinstance(source, (str, Path)):
             source = Path(source)
             source = source if source.is_absolute() else root / source
-        audio = read_audio(source, sample_rate)
+        audio = read_audio(source, sample_rate, getattr(args, "loudness", None))
         duration = len(audio) / sample_rate
         if not args.min_seconds <= duration <= args.max_seconds:
             raise ValueError(f"Duration {duration:.3f}s outside accepted range")
@@ -241,7 +249,14 @@ def prepare(args):
     options = backend_options(args)
     if options.get("backend") == "fast" and not fold:
         raise ValueError("Fast codec requires folded weight normalization")
-    codec = Codec(args.codec, args.device, encoder_only=True, fold_weight_norm=fold, **options)
+    codec = Codec(
+        args.codec,
+        args.device,
+        encoder_only=True,
+        fold_weight_norm=fold,
+        loudness=getattr(args, "loudness", None),
+        **options,
+    )
     if precision == "bf16" and (codec.device.type != "cuda" or not torch.cuda.is_bf16_supported()):
         raise ValueError("BF16 cache encoding requires a BF16-capable CUDA device")
     setup_seconds = time.perf_counter() - started
@@ -366,6 +381,9 @@ def prepare(args):
             "min_seconds": args.min_seconds,
             "max_seconds": args.max_seconds,
             "silence_rms_min": 1e-5,
+            "min_quality": getattr(args, "min_quality", None),
+            "quality_column": getattr(args, "quality_column", None),
+            "reject_digits": getattr(args, "reject_digits", False),
         },
         "preparation": {
             "workers": workers,
@@ -403,7 +421,7 @@ def merge(args):
         raise ValueError("Merged output already exists")
     db = sqlite3.connect(out / "index.sqlite")
     db.executescript(SCHEMA)
-    meta, duplicates, rejected = None, 0, 0
+    meta, duplicates, rejected, conflicts = None, 0, 0, 0
     partitions = {}
     preparation_partitions = []
     fields = "uid,speaker,text,audio,shard,offset,frames,split,samples,digest"
@@ -443,6 +461,10 @@ def merge(args):
                         "SELECT speaker,text,split FROM samples WHERE digest=?", (row[-1],)
                     ).fetchone()
                     if duplicate and duplicate != (row[1], row[2], row[7]):
+                        if getattr(args, "drop_conflicting_duplicates", False):
+                            # Web-scale corpora repeat jingles/adverts under different labels: keep the first.
+                            conflicts += 1
+                            continue
                         raise ValueError(
                             f"Duplicate audio has inconsistent speaker/transcript/split labels: {row[0]}"
                         )
@@ -471,9 +493,12 @@ def merge(args):
         if leakage:
             raise ValueError(f"Speaker appears across splits: {leakage[0]}")
         before = db.total_changes
-        db.execute(
-            "DELETE FROM samples WHERE speaker IN (SELECT speaker FROM samples GROUP BY speaker HAVING count(*)<2)"
-        )
+        if not getattr(args, "keep_singletons", False):
+            # Cross-utterance pairing needs a second recording; within-utterance prompting does not.
+            db.execute(
+                "DELETE FROM samples WHERE speaker IN "
+                "(SELECT speaker FROM samples GROUP BY speaker HAVING count(*)<2)"
+            )
         singletons = db.total_changes - before
         db.execute("DELETE FROM provenance WHERE uid NOT IN (SELECT uid FROM samples)")
         db.execute("DELETE FROM text_tokens WHERE uid NOT IN (SELECT uid FROM samples)")
@@ -505,7 +530,9 @@ def merge(args):
                 "accepted": sum(splits.values()),
                 "rejected": rejected,
                 "duplicates_removed": duplicates,
+                "conflicting_duplicates_dropped": conflicts,
                 "singleton_rows_removed": singletons,
+                "singletons_kept": bool(getattr(args, "keep_singletons", False)),
                 "inputs": [str(Path(p).resolve()) for p in args.inputs],
                 "index_sha256": file_digest(out / "index.sqlite"),
                 "preparation_partitions": preparation_partitions,

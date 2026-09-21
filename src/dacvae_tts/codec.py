@@ -54,7 +54,26 @@ def check_compatibility(left, right):
             )
 
 
-def read_audio(path, sample_rate):
+def preprocessing_tag(loudness=None):
+    """Identity of the waveform preprocessing; caches and checkpoints must agree on it."""
+    return PREPROCESSING if loudness is None else f"mono-mean_scipy-resample-poly_lufs{loudness:g}_no-trim_v2"
+
+
+def normalize_loudness(audio, sample_rate, loudness):
+    """BS.1770 integrated loudness, then peak protection: DACVAE's own `compress()` convention."""
+    import pyloudnorm
+
+    if len(audio) < int(0.4 * sample_rate):
+        return audio  # shorter than one gating block: loudness is undefined
+    measured = pyloudnorm.Meter(sample_rate).integrated_loudness(audio.astype(np.float64))
+    if not np.isfinite(measured):
+        return audio  # digital silence or fully gated; the RMS filter rejects it later
+    audio = audio * np.float32(10.0 ** ((loudness - measured) / 20.0))
+    peak = float(np.abs(audio).max())
+    return audio / np.float32(peak) if peak > 1.0 else audio
+
+
+def read_audio(path, sample_rate, loudness=None):
     audio, sr = sf.read(path, dtype="float32", always_2d=True)
     audio = audio.mean(axis=1)
     if not len(audio) or not np.isfinite(audio).all():
@@ -62,6 +81,8 @@ def read_audio(path, sample_rate):
     if sr != sample_rate:
         factor = math.gcd(sr, sample_rate)
         audio = resample_poly(audio, sample_rate // factor, sr // factor).astype(np.float32)
+    if loudness is not None:
+        audio = normalize_loudness(audio, sample_rate, loudness)
     return torch.from_numpy(audio.copy())
 
 
@@ -81,8 +102,11 @@ class Codec:
         graph_max_shapes=4,
         graph_warmup=3,
         layout="native",
+        loudness=None,
     ):
         from dacvae import DACVAE
+
+        self.loudness = loudness
 
         self.device = torch.device(device)
         if backend not in {"reference", "fast"}:
@@ -137,7 +161,8 @@ class Codec:
 
     @property
     def metadata(self):
-        return {
+        loudness = getattr(self, "loudness", None)
+        result = {
             "checkpoint": self.checkpoint,
             "sample_rate": self.sample_rate,
             "hop_length": self.hop_length,
@@ -145,9 +170,12 @@ class Codec:
             "posterior": "mean",
             "format_version": 1,
             "weights_sha256": self.weights_sha256,
-            "preprocessing": PREPROCESSING,
+            "preprocessing": preprocessing_tag(loudness),
             "codec_runtime": self.runtime,
         }
+        if loudness is not None:
+            result["loudness_lufs"] = loudness
+        return result
 
     def _posterior_mean(self, audio, precision="fp32"):
         # Use the same explicit math for cache preparation and inference references.

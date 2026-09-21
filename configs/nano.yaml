@@ -1,0 +1,45 @@
+# Nano recipe (22 September 2026): every change is motivated in docs/iyilestirme-yol-haritasi.md.
+# Prompts are cut from the start of the target utterance, so no speaker labels are required.
+model:
+  width: 384
+  depth: 12
+  heads: 6
+  text_depth: 4
+  text_attention: 4        # bidirectional self-attention after the byte convolutions
+  patch_size: 1            # DACVAE latents are temporally white: packing only hurts
+  latent_dim: 128
+  positions: rope          # RoPE in self-attention, length-aware RoPE in text cross-attention
+  qk_norm: true
+  prediction: edm          # unit-variance preconditioned target
+  text_layout: joined
+  duration: rule           # prompt speaking rate; a separate predictor can be trained later
+  cond_dropout: 0.2        # F5-TTS: drop text+prompt 20%, prompt alone 30% (train.prompt_dropout)
+  ctc_layer: 8
+train:
+  steps: 300000
+  batch_size: 96           # cap; the frame budget decides the real micro-batch
+  accumulation: 1
+  learning_rate: 0.0006
+  warmup: 2000
+  weight_decay: 0.01
+  optimizer: muon
+  muon_momentum: 0.95
+  ema_decay: 0.9999
+  precision: bf16
+  workers: 6
+  prefetch_factor: 4
+  checkpoint_every: 1000
+  keep_every: 10000
+  validate_every: 1000
+  log_every: 100
+  grad_checkpoint: false
+  compile: false
+  seed: 42
+  flow_reduction: frame
+  pairing: within
+  prompt_fraction_min: 0.1
+  prompt_fraction_max: 0.6
+  prompt_dropout: 0.3
+  time_sampling: logit_normal
+  batch_expansion: 2
+  ctc_weight: 0.1

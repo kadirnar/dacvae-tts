@@ -30,6 +30,14 @@ def main():
     p.add_argument("--min-seconds", type=float, default=1.0)
     p.add_argument("--max-seconds", type=float, default=15.0)
     p.add_argument(
+        "--loudness",
+        type=float,
+        help="Normalize every waveform to this integrated loudness in LUFS (DACVAE's own API uses -16)",
+    )
+    p.add_argument("--quality-column", help="Numeric per-row quality column used by --min-quality")
+    p.add_argument("--min-quality", type=float, help="Reject rows whose quality column is below this value")
+    p.add_argument("--reject-digits", action="store_true", help="Reject transcripts that contain digits")
+    p.add_argument(
         "--workers", type=int, default=4, help="CPU audio-loading workers per codec process; 0 is serial"
     )
     p.add_argument("--worker-backend", choices=["thread", "process"], default="thread")
@@ -66,6 +74,16 @@ def main():
     p = sub.add_parser("merge", help="Merge partitions, deduplicate, check splits and calculate statistics")
     p.add_argument("--inputs", nargs="+", required=True)
     p.add_argument("--output", required=True)
+    p.add_argument(
+        "--drop-conflicting-duplicates",
+        action="store_true",
+        help="Drop (instead of failing on) identical audio that reappears with different labels",
+    )
+    p.add_argument(
+        "--keep-singletons",
+        action="store_true",
+        help="Keep speakers with one recording (usable only with within-utterance pairing)",
+    )
 
     p = sub.add_parser("train", help="Pretrain from scratch; launch with torchrun for DDP")
     p.add_argument("--config", required=True)
