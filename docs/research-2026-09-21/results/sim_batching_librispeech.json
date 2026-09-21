@@ -1,0 +1,23 @@
+[
+ {
+  "policy": "current (pessimistic cost, 16)",
+  "rows": 3416,
+  "batches": 214,
+  "padding_waste": 0.23030040377988714,
+  "supervised_fraction": 0.3840818764137581
+ },
+ {
+  "policy": "exact epoch cost, 16",
+  "rows": 3416,
+  "batches": 214,
+  "padding_waste": 0.0033423484583041674,
+  "supervised_fraction": 0.49733447026103716
+ },
+ {
+  "policy": "exact cost, frame budget 8000, cap 64",
+  "rows": 3416,
+  "batches": 190,
+  "padding_waste": 0.004771257105291582,
+  "supervised_fraction": 0.4966214415456085
+ }
+]

@@ -1,0 +1,50 @@
+[
+ {
+  "policy": "current: pessimistic cost, 16 fixed",
+  "batches": 20054,
+  "mean_batch_size": 15.999451481001296,
+  "padding_waste": 0.3555765033240249,
+  "supervised_fraction_of_padded_compute": 0.32196843075494286,
+  "padded_frames_per_batch_mean": 7986.0791861972675,
+  "padded_frames_per_batch_p5_p95": [
+   5200.0,
+   11520.0
+  ]
+ },
+ {
+  "policy": "exact epoch cost, 16 fixed",
+  "batches": 20054,
+  "mean_batch_size": 15.999451481001296,
+  "padding_waste": 0.0039844194762915786,
+  "supervised_fraction_of_padded_compute": 0.49763172063531524,
+  "padded_frames_per_batch_mean": 5167.004587613444,
+  "padded_frames_per_batch_p5_p95": [
+   1978.4000000000015,
+   9120.0
+  ]
+ },
+ {
+  "policy": "exact cost, frame budget 6000, cap 64",
+  "batches": 17886,
+  "mean_batch_size": 17.938778933243878,
+  "padding_waste": 0.005138275046400187,
+  "supervised_fraction_of_padded_compute": 0.49705522851617,
+  "padded_frames_per_batch_mean": 5800.027339818853,
+  "padded_frames_per_batch_p5_p95": [
+   5544.0,
+   5985.0
+  ]
+ },
+ {
+  "policy": "pessimistic cost, frame budget 6000, cap 64",
+  "batches": 28669,
+  "mean_batch_size": 11.191635564547072,
+  "padding_waste": 0.33778270218605744,
+  "supervised_fraction_of_padded_compute": 0.33085861284654583,
+  "padded_frames_per_batch_mean": 5436.16868394433,
+  "padded_frames_per_batch_p5_p95": [
+   4338.0,
+   5984.0
+  ]
+ }
+]
