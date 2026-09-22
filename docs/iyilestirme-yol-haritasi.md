@@ -533,6 +533,14 @@ Pilot 2'de **hizalama oturmaya başladı** (görülmemiş 32 konuşmacı, Whispe
 **Bellek sızıntısı (07:30):** tek süreçte 150 shard encode ettikten sonra encoder 16,6 GB'ı swap'a atmıştı (shard başına ~100 MB; mp3 çözme/yeniden örnekleme tarafında kaynak belirlenmedi). Her shard artık ayrı `spawn` alt sürecinde encode ediliyor; bitmiş bölümler korunuyor.
 
 **Stage 2 (09:35):** ilk 200 shard birleştirildi (401k satır, **901 saat** eğitim), `configs/nano.yaml` (200k adım, LR 8e-4, 2k ısınma, `compile: model`, frame bütçesi 12000) pilot 2'nin `last.pt` ağırlıklarından `--init-from` ile başlatıldı. Encode bittiğinde tam cache ile nihai koşu bu koşunun son snapshot'ından aynı şekilde başlatılacak.
+
+**Kaydedilen model (10:34):** `checkpoints/nano-v2-40k.pt` — pilot 2 (30k) + stage 2 (10k), toplam 40k güncelleme, 901 saat benzersiz ses. Kullanıcı isteğiyle eğitim durduruldu ve dinleme testleri yapıldı:
+- Rastgele metin testi (Common Voice prompt, Whisper-large-v3, guidance 3,5): 8 doğal cümlede WER **%11,1**, 6 rastgele-kelime listesinde **%5,6**; DNSMOS OVRL 2,69 (prompt'un kendisi 2,76); SIM 0,95 (geliştirme modeli). Guidance taraması: 1,5 → 3,5 arasında WER düzenli düşüyor (g=1,5: %19 / g=3,5: %11); süre ölçeği 0,9 zarar veriyor.
+- 13 referans × 6 duygu yüklü cümle (ElevenLabs "Liam" 6 duygu, 4 görülmemiş podcast konuşmacısı, 3 Common Voice): WER **%21,8**, CER %18,7, DNSMOS OVRL 3,08 (referanslar 3,32), SIM 0,94; 78'de 7 hatasız. Sentetik stüdyo seslerinde WER gerçek seslerden yüksek (dağılım dışı). Baskın hatalar: tek kelime tekrarı ("take, take, take") ve tek kelime yutma.
+- Seed-TTS test-en (1.088 cümle, g=2,0): WER %23,5. (Kullanıcı bu benchmark'ı istemedi; g=3,5 koşusu yapılmadı.)
+
+**v3 tarifi (13:00, 4M satırlık koşu için):** gözlenen tekrar/yutma hatalarını hedefleyen iki değişiklik — (1) skip/repeat kontrastif negatifler (`contrastive_weight 0.2`, göreli marj 0,1): aynı ses/gürültü/zamanla bir kelimesi silinmiş ya da tekrarlanmış transkript puanlanır, doğru transkript marjla kazanmalı; (2) düşük-rank paylaşımlı AdaLN (`adaln_rank 64`): boşalan 12M parametre ile genişlik 384→448, toplam 51,4M. Yerel maliyet: 0,52 s/adım (+%20), 10,4 GB (bütçe 8000). Derleyici hatasında artık eager + aktivasyon checkpointing'e düşülüyor (eager'da bellek 16 GB'ı aşmıştı). Çok-GPU encode için `scripts/prepare_hf_8gpu.sh`.
+<!-- V3-AB -->
 <!-- NANO-RUN-LOG -->
 
 ---
