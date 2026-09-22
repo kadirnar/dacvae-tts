@@ -518,13 +518,21 @@ Pilot 2'de **hizalama oturmaya başladı** (görülmemiş 32 konuşmacı, Whispe
 | Adım | val flow | metin kazancı | WER | CER | SIM (codec-decoded) |
 |---:|---:|---:|---:|---:|---:|
 | 5.000 | 0,691 | 0,0046 | 1,21 | 0,86 | 0,85 |
-| 10.000 | 0,670 | 0,0131 | **0,87** | **0,63** | 0,88 |
-| 12.000 | 0,666 | 0,0146 | – | – | – |
-<!-- PILOT2-TABLE -->
+| 10.000 | 0,670 | 0,0131 | 0,87 | 0,63 | 0,88 |
+| 15.000 | 0,662 | 0,0160 | 0,68 | 0,48 | 0,90 |
+| 20.000 | 0,657 | 0,0175 | 0,57 | 0,42 | 0,91 |
+| 25.000 | 0,655 | 0,0183 | 0,53 | 0,39 | 0,91 |
+| 30.000 | 0,653 | 0,0187 | **0,485** | **0,355** | 0,92 |
+
+Üretilen/gerçek süre oranı sabit 1,12: konuşma-hızı kuralı kenar sessizliği kırpılmamış prompt'larla ~%12 uzun tahmin ediyor; nihai modelde `duration_scale` taraması yapılacak (LARoPE makalesinde WER ×0,85–1,0 aralığında en iyi).
 
 "Metin kazancı" = doğrulamada transkriptler örnekler arasında karıştırıldığında flow kaybındaki artış (aynı gürültü ve *t*); sıfırsa model metni kullanmıyor. Pilot 1'de 12k adımda ~0,001 ve WER ≈ 1,0 iken burada 10k adımda hedef metnin parçaları duyulur hale geldi. F5-small'un 100k+ güncellemede (adım başına ~10× daha fazla ses) hizalandığı düşünülürse, LARoPE + CTC + P=1 kombinasyonu bu ölçekte belirgin biçimde daha hızlı öğreniyor; kontrollü ablation yapılmadığı için hangi bileşenin ne kadar katkı verdiği ayrıştırılmadı.
 
 `torch.compile` (tüm objective) 1.100. adımda Inductor'da dinamik-şekil hatasıyla çöktü; yalnız üreticiyi derleyen `compile: model` (0,38–0,44 s/adım, tepe 9,2 GB) + derleyici hatasında eager'a düşme koruması ile devam edildi.
+
+**Bellek sızıntısı (07:30):** tek süreçte 150 shard encode ettikten sonra encoder 16,6 GB'ı swap'a atmıştı (shard başına ~100 MB; mp3 çözme/yeniden örnekleme tarafında kaynak belirlenmedi). Her shard artık ayrı `spawn` alt sürecinde encode ediliyor; bitmiş bölümler korunuyor.
+
+**Stage 2 (09:35):** ilk 200 shard birleştirildi (401k satır, **901 saat** eğitim), `configs/nano.yaml` (200k adım, LR 8e-4, 2k ısınma, `compile: model`, frame bütçesi 12000) pilot 2'nin `last.pt` ağırlıklarından `--init-from` ile başlatıldı. Encode bittiğinde tam cache ile nihai koşu bu koşunun son snapshot'ından aynı şekilde başlatılacak.
 <!-- NANO-RUN-LOG -->
 
 ---
