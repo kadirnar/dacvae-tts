@@ -160,6 +160,44 @@ plus metadata and the original corpus. Actual requirements depend on clip durati
 Merge references absolute binary-shard paths without copying the audio latents;
 keep the partition directories and mount them at the same paths on every node.
 
+## Nano recipe (`configs/nano.yaml`)
+
+`configs/nano.yaml` is a 49.9M-parameter configuration that turns on the changes motivated in
+[the improvement roadmap](docs/iyilestirme-yol-haritasi.md); every option is off in the Tiny/Small
+configs, so the earlier baselines are untouched.
+
+- **No speaker labels needed.** `train.pairing: within` cuts the voice prompt from the start of the
+  target recording (10–60% of its frames); `train.prompt_dropout` trains prompt-free synthesis.
+  Merge with `--keep-singletons` to keep speakers that have one recording. The `joined` text layout
+  feeds the transcript as one stream without a prompt/target boundary token; at inference the prompt
+  transcript and the target text are joined with a space.
+- **Alignment.** Rotary positions in self-attention, length-aware rotary positions in the text
+  cross-attention (a frame 40% into the audio starts out attending near 40% of the transcript),
+  QK-norm, self-attention blocks in the byte text encoder, and an auxiliary CTC head on intermediate
+  generator frames (training only). Output length follows the prompt's speaking rate
+  (`model.duration: rule`), which also keeps the length-normalized positions consistent.
+- **Objective.** Single-frame tokens (`patch_size: 1`), an EDM-style unit-variance target
+  (`prediction: edm`), stratified logit-normal time sampling, frame-weighted loss, context-sharing
+  batch expansion (each utterance gets several time/noise draws per step), Muon, EMA warm-up and
+  permanent `step-N.pt` snapshots every `keep_every` updates.
+- **Data.** `prepare --loudness -16` normalizes every recording to −16 LUFS (DACVAE's own API
+  convention) and records it in the cache, so inference prompts receive the same treatment.
+  `--quality-column/--min-quality` and `--reject-digits` filter rows before decoding audio.
+
+```bash
+HF_TOKEN=... python scripts/prepare_hf_shards.py --repo ORG/DATASET --total 324 --shards 0-323 \
+  --output data/corpus --speaker-column speaker --quality-column quality_score --min-quality 55 \
+  --reject-digits --loudness -16 --max-seconds 20
+dacvae-tts merge --inputs data/corpus/parts/part-* --output data/corpus/merged \
+  --keep-singletons --drop-conflicting-duplicates
+dacvae-tts train --config configs/nano.yaml --cache data/corpus/merged --output runs/nano --frame-budget 8000
+python scripts/monitor.py --run runs/nano --cache data/corpus/merged --cases 48   # WER/SIM per snapshot
+```
+
+The shard script streams one Parquet file at a time (download, encode, delete), so the raw corpus
+never has to fit on disk, and it is restartable. Speech-quality results for this recipe are reported
+in the roadmap document as they become available; nothing here is a quality claim.
+
 ## Eight-GPU pretraining
 
 ```bash

@@ -12,3 +12,4 @@ outputs/
 *.onnx
 build/
 dist/
+configs/local/

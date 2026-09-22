@@ -77,6 +77,10 @@ def main():
     parser.add_argument("--once", action="store_true", help="Score the checkpoints present now, then exit")
     parser.add_argument("--checkpoint", help="Score one checkpoint file instead of watching the run")
     parser.add_argument("--poll", type=int, default=120)
+    parser.add_argument(
+        "--prompt-audio",
+        help="Directory of original prompt WAVs from export_case_audio.py; scores become SIM-o",
+    )
     args = parser.parse_args()
 
     run = Path(args.run)
@@ -132,6 +136,12 @@ def main():
                     rows.append({**case, "error": str(error)})
                     continue
                 prompt_wav = monitor / f"prompt-{case['uid'].replace('/', '_').replace(':', '_')}.wav"
+                if args.prompt_audio:
+                    original = Path(args.prompt_audio) / (
+                        case["prompt_uid"].replace("/", "_").replace(":", "_") + ".wav"
+                    )
+                    if original.exists():
+                        prompt_wav = original
                 score = evaluator.score(output, case["text"], prompt_wav)
                 rows.append(
                     {
@@ -156,6 +166,7 @@ def main():
                 "duration_ratio_mean": float(np.mean([r["duration_ratio"] for r in good])) if good else None,
                 "rtf": summary.get("rtf"),
                 "asr_model": args.asr_model,
+                "similarity_reference": "original" if args.prompt_audio else "codec_decoded",
                 "guidance": args.guidance,
                 "sampler_steps": args.steps,
                 "seconds": time.time() - started,
