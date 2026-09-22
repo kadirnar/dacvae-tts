@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--guidance", type=float, default=3.5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--language", default="en", help="Whisper language code")
     parser.add_argument("--asr", default="openai/whisper-large-v3")
     parser.add_argument("--speaker-model", default="microsoft/wavlm-base-plus-sv")
     args = parser.parse_args()
@@ -104,9 +105,9 @@ def main():
         if "error" in row:
             continue
         audio = read_audio(row["file"], 16000)
-        row["hypothesis"] = asr(audio.numpy(), generate_kwargs={"language": "en", "task": "transcribe"})[
-            "text"
-        ].strip()
+        row["hypothesis"] = asr(
+            audio.numpy(), generate_kwargs={"language": args.language, "task": "transcribe"}
+        )["text"].strip()
         row.update(error_counts(row["text"], row["hypothesis"]))
         if row["prompt_audio"] not in prompt_cache:
             prompt_wave = read_audio(row["prompt_audio"], 16000)

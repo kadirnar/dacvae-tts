@@ -40,7 +40,9 @@ class Synthesizer:
         asr_device="cpu",
         profile=False,
         codec_options=None,
+        asr_language="en",
     ):
+        self.asr_language = asr_language
         started = time.perf_counter()
         self.device = torch.device(device)
         self.precision = precision
@@ -93,7 +95,11 @@ class Synthesizer:
             )
         audio = read_audio(path, 16000)
         segments, _ = self._asr.transcribe(
-            audio.numpy(), language="en", beam_size=5, vad_filter=False, condition_on_previous_text=False
+            audio.numpy(),
+            language=self.asr_language,
+            beam_size=5,
+            vad_filter=False,
+            condition_on_previous_text=False,
         )
         transcript = " ".join(segment.text.strip() for segment in segments).strip()
         if not transcript:
@@ -289,6 +295,7 @@ def infer(args):
         args.asr_device,
         args.profile,
         codec_options=backend_options(args),
+        asr_language=getattr(args, "asr_language", "en"),
     )
     result = tts.synthesize(
         args.text,

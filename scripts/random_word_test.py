@@ -57,6 +57,7 @@ def main():
     parser.add_argument("--duration-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--language", default="en", help="Whisper language code")
     parser.add_argument("--asr", default="openai/whisper-large-v3")
     args = parser.parse_args()
 
@@ -104,9 +105,9 @@ def main():
     )
     for row in rows:
         audio = read_audio(output / row["file"], 16000)
-        row["hypothesis"] = asr(audio.numpy(), generate_kwargs={"language": "en", "task": "transcribe"})[
-            "text"
-        ].strip()
+        row["hypothesis"] = asr(
+            audio.numpy(), generate_kwargs={"language": args.language, "task": "transcribe"}
+        )["text"].strip()
         reference, hypothesis = normalize(row["text"]).split(), normalize(row["hypothesis"]).split()
         row["word_errors"], row["words"] = word_edit_counts(reference, hypothesis)[0], len(reference)
         row["wer"] = round(row["word_errors"] / len(reference), 3)

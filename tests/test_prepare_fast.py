@@ -187,16 +187,23 @@ def test_prepare_merge_cached_text_and_legacy_equivalence(tmp_path, monkeypatch)
     items = [dataset[0], dataset[1]]
     cached = collate(items)
     assert items[0]["text_bytes"] == "José's café.".encode()
+    assert items[0]["token_ids"][0] == 1 and items[0]["token_ids"][-1] == 3  # BOS ... EOS, prepared once
+    for item in items:
+        item.pop("token_ids")
+        item.pop("reference_token_ids")
+    bytes_fallback = collate(items)
     for item in items:
         item.pop("text_bytes")
         item.pop("reference_text_bytes")
     fallback = collate(items)
     for key in cached:
         torch.testing.assert_close(cached[key], fallback[key])
+        torch.testing.assert_close(cached[key], bytes_fallback[key])
     with sqlite3.connect(merged / "index.sqlite") as db:
         db.execute("DROP TABLE text_tokens")
+        db.execute("DROP TABLE token_ids")
     legacy = LatentDataset(merged)
-    assert legacy.row(0)["text_bytes"] is None
+    assert legacy.row(0)["text_bytes"] is None and legacy.row(0)["token_ids"] is None
     torch.testing.assert_close(collate([legacy[0]])["tokens"], cached["tokens"][:1])
 
 

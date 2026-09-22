@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 PAD, BOS, SEP, EOS, BYTE_OFFSET = 0, 1, 2, 3, 4
+SPACE = 32 + BYTE_OFFSET
 VOCAB_SIZE = 260
 TEXT_VERSIONS = {"unicode-v1", "english-explicit-v2"}
 
@@ -35,9 +36,6 @@ def tokenize(reference: str, target: str, version="unicode-v1", layout="segments
     ref = normalize(reference, version).encode("utf-8") if reference.strip() else b""
     tgt = normalize(target, version).encode("utf-8")
     return tokenize_bytes(ref, tgt, layout)
-
-
-SPACE = 32 + BYTE_OFFSET
 
 
 def corrupt_transcript(tokens, segments, rng):
@@ -78,31 +76,62 @@ def corrupt_transcript(tokens, segments, rng):
     return torch.tensor(new_tokens, dtype=torch.int64), torch.tensor(new_segments, dtype=torch.int64)
 
 
-def tokenize_bytes(reference: bytes, target: bytes, layout="segments"):
-    """Assemble cached normalized UTF-8 bytes without normalizing every training pair.
+ID_DTYPE = np.uint16  # vocabulary 260 fits; this is the on-disk token format of the cache
+
+
+def encode_ids(utf8: bytes):
+    """Tokenize one normalized transcript once, at preparation time: [BOS] byte+4 ... [EOS]."""
+    if not utf8:
+        raise ValueError("Empty transcript bytes")
+    ids = np.empty(len(utf8) + 2, dtype=ID_DTYPE)
+    ids[0], ids[-1] = BOS, EOS
+    ids[1:-1] = np.frombuffer(utf8, dtype=np.uint8).astype(ID_DTYPE) + BYTE_OFFSET
+    return ids
+
+
+def decode_ids(blob):
+    return np.frombuffer(blob, dtype=ID_DTYPE) if blob is not None else None
+
+
+def assemble(reference_ids, target_ids, layout="segments"):
+    """Combine cached per-utterance token ids into one model input; no tokenization happens here.
 
     `segments` marks reference and target transcripts ([BOS ref SEP target EOS]). `joined` is one
     sentence stream without a boundary ([BOS ref+" "+target EOS]), the layout a prompt cut from the
     same utterance needs: nobody knows where its transcript ends.
     """
-    if not target:
-        raise ValueError("Empty target transcript bytes")
+    target_ids = np.asarray(target_ids, dtype=np.int64)
+    if len(target_ids) < 3:
+        raise ValueError("Empty target transcript ids")
+    body = target_ids[1:-1]
+    reference_body = np.asarray(reference_ids, dtype=np.int64)[1:-1] if reference_ids is not None else None
     if layout == "joined":
-        joined = reference + b" " + target if reference else target
-        tokens = np.empty(len(joined) + 2, dtype=np.int64)
-        tokens[0], tokens[-1] = BOS, EOS
-        tokens[1:-1] = np.frombuffer(joined, dtype=np.uint8)
-        tokens[1:-1] += BYTE_OFFSET
+        parts = (
+            [reference_body, np.array([SPACE], dtype=np.int64), body]
+            if reference_body is not None
+            else [body]
+        )
+        tokens = np.concatenate([np.array([BOS], dtype=np.int64), *parts, np.array([EOS], dtype=np.int64)])
         return torch.from_numpy(tokens), torch.ones(len(tokens), dtype=torch.int64)
     if layout != "segments":
         raise ValueError(f"Unknown text layout: {layout}")
-    nref = len(reference)
-    tokens = np.empty(nref + len(target) + 3, dtype=np.int64)
-    tokens[0], tokens[nref + 1], tokens[-1] = BOS, SEP, EOS
-    tokens[1 : nref + 1] = np.frombuffer(reference, dtype=np.uint8)
-    tokens[nref + 2 : -1] = np.frombuffer(target, dtype=np.uint8)
-    tokens[1 : nref + 1] += BYTE_OFFSET
-    tokens[nref + 2 : -1] += BYTE_OFFSET
+    reference_body = reference_body if reference_body is not None else np.empty(0, dtype=np.int64)
+    tokens = np.concatenate(
+        [
+            np.array([BOS], dtype=np.int64),
+            reference_body,
+            np.array([SEP], dtype=np.int64),
+            body,
+            np.array([EOS], dtype=np.int64),
+        ]
+    )
     segments = np.zeros(len(tokens), dtype=np.int64)
-    segments[nref + 2 :] = 1
+    segments[len(reference_body) + 2 :] = 1
     return torch.from_numpy(tokens), torch.from_numpy(segments)
+
+
+def tokenize_bytes(reference: bytes, target: bytes, layout="segments"):
+    """Legacy path for caches that stored normalized UTF-8 bytes instead of token ids."""
+    if not target:
+        raise ValueError("Empty target transcript bytes")
+    return assemble(encode_ids(reference) if reference else None, encode_ids(target), layout)

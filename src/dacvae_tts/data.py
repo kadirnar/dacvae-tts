@@ -14,7 +14,7 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, Sampler
 
 from .contracts import normalization_stats
-from .text import tokenize, tokenize_bytes
+from .text import assemble, decode_ids, tokenize, tokenize_bytes
 
 SCHEMA = """
 CREATE TABLE samples (
@@ -27,6 +27,7 @@ CREATE INDEX speaker_split ON samples(split, speaker, id);
 CREATE TABLE provenance (uid TEXT PRIMARY KEY, original_text TEXT, normalized_text TEXT,
  session TEXT, source_recording TEXT, start_seconds REAL, end_seconds REAL);
 CREATE TABLE text_tokens (uid TEXT PRIMARY KEY, utf8 BLOB NOT NULL);
+CREATE TABLE token_ids (uid TEXT PRIMARY KEY, ids BLOB NOT NULL);
 """
 
 
@@ -159,21 +160,25 @@ class LatentDataset(Dataset):
         if self._pid != os.getpid():
             self._db = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
             self._pid, self._maps = os.getpid(), OrderedDict()
-            self._has_text_tokens = bool(
-                self._db.execute("SELECT 1 FROM sqlite_master WHERE name='text_tokens'").fetchone()
-            )
+            tables = {
+                name for (name,) in self._db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            self._has_text_tokens = "text_tokens" in tables
+            self._has_token_ids = "token_ids" in tables
         return self._db
 
     def row(self, index):
         connection = self._connection()
-        query = (
-            "SELECT s.uid,s.text,s.shard,s.offset,s.frames,s.speaker,t.utf8 "
-            "FROM samples s LEFT JOIN text_tokens t ON t.uid=s.uid WHERE s.id=?"
-            if self._has_text_tokens
-            else "SELECT uid,text,shard,offset,frames,speaker,NULL FROM samples WHERE id=?"
+        # Preferred: token ids written at preparation time. Older caches fall back to cached
+        # normalized bytes, and the oldest to the raw transcript.
+        utf8 = "t.utf8" if self._has_text_tokens else "NULL"
+        ids = "k.ids" if self._has_token_ids else "NULL"
+        joins = (" LEFT JOIN text_tokens t ON t.uid=s.uid" if self._has_text_tokens else "") + (
+            " LEFT JOIN token_ids k ON k.uid=s.uid" if self._has_token_ids else ""
         )
+        query = f"SELECT s.uid,s.text,s.shard,s.offset,s.frames,s.speaker,{utf8},{ids} FROM samples s{joins} WHERE s.id=?"
         row = connection.execute(query, (int(self.ids[index]),)).fetchone()
-        uid, text, shard, offset, frames, speaker, text_bytes = row
+        uid, text, shard, offset, frames, speaker, text_bytes, ids = row
         if shard not in self._maps:
             self._maps[shard] = np.memmap(shard, dtype="<f2", mode="r").reshape(-1, self.channels)
             if len(self._maps) > 32:
@@ -186,6 +191,7 @@ class LatentDataset(Dataset):
             "uid": uid,
             "text": text,
             "text_bytes": text_bytes,
+            "token_ids": decode_ids(ids),
             "speaker": speaker,
             "latents": (z - self.mean) / self.std,
         }
@@ -211,6 +217,8 @@ class LatentDataset(Dataset):
                 "reference_text": "",
                 "text_bytes": row["text_bytes"],
                 "reference_text_bytes": b"" if row["text_bytes"] is not None else None,
+                "token_ids": row["token_ids"],
+                "reference_token_ids": None,
                 "uid": row["uid"],
                 "reference_uid": row["uid"],
                 "speaker": row["speaker"],
@@ -228,6 +236,8 @@ class LatentDataset(Dataset):
             "reference_text": ref["text"],
             "text_bytes": target["text_bytes"],
             "reference_text_bytes": ref["text_bytes"],
+            "token_ids": target["token_ids"],
+            "reference_token_ids": ref["token_ids"],
             "uid": target["uid"],
             "reference_uid": ref["uid"],
             "speaker": target["speaker"],
@@ -256,7 +266,11 @@ def collate(items):
             raise ValueError("Reference and target latents must be finite")
         z = torch.cat([ref, target])
         mask = torch.arange(len(z)) < len(ref)
-        if item.get("text_bytes") is not None and item.get("reference_text_bytes") is not None:
+        if item.get("token_ids") is not None and (
+            item.get("reference_token_ids") is not None or item.get("reference_text", "") == ""
+        ):
+            tok, seg = assemble(item.get("reference_token_ids"), item["token_ids"], layout)
+        elif item.get("text_bytes") is not None and item.get("reference_text_bytes") is not None:
             tok, seg = tokenize_bytes(item["reference_text_bytes"], item["text_bytes"], layout)
         else:
             tok, seg = tokenize(

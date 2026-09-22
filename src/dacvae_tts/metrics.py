@@ -123,7 +123,9 @@ class Evaluator:
         speaker_model="microsoft/wavlm-base-plus-sv",
         device="cpu",
         metric_normalization="english-unicode-v2",
+        language="en",
     ):
+        self.language = language
         from faster_whisper import WhisperModel
 
         self.asr = WhisperModel(
@@ -148,6 +150,7 @@ class Evaluator:
             "speaker_revision": getattr(getattr(self.speaker, "config", None), "_commit_hash", None),
             "dnsmos_sha256": file_digest(dnsmos_model) if dnsmos_model else None,
             "metric_normalization": metric_normalization,
+            "language": language,
         }
 
     @torch.inference_mode()
@@ -159,7 +162,11 @@ class Evaluator:
     def score(self, audio_path, text, reference_path=None):
         audio = read_audio(audio_path, 16000)
         segments, _ = self.asr.transcribe(
-            audio.numpy(), language="en", beam_size=5, vad_filter=False, condition_on_previous_text=False
+            audio.numpy(),
+            language=self.language,
+            beam_size=5,
+            vad_filter=False,
+            condition_on_previous_text=False,
         )
         hypothesis = " ".join(segment.text for segment in segments)
         result = {
@@ -198,6 +205,7 @@ def evaluate(args):
         None if args.no_speaker else args.speaker_model,
         args.device,
         getattr(args, "metric_normalization", "english-unicode-v2"),
+        getattr(args, "language", "en"),
     )
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)

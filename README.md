@@ -183,6 +183,14 @@ configs, so the earlier baselines are untouched.
 - **Data.** `prepare --loudness -16` normalizes every recording to −16 LUFS (DACVAE's own API
   convention) and records it in the cache, so inference prompts receive the same treatment.
   `--quality-column/--min-quality` and `--reject-digits` filter rows before decoding audio.
+- **Tokenization happens in `prepare`, not in training.** Each transcript is normalized once and
+  stored as ready token ids (`[BOS] byte+4 … [EOS]`, uint16) in the cache's `token_ids` table; the
+  training loader only concatenates cached id arrays (prompt ids + target ids for cross-utterance
+  pairs). Older caches without the table fall back to cached bytes or raw text.
+- **Other languages.** The tokenizer is UTF-8 bytes, so Turkish or any other script needs no
+  vocabulary change; pass `--languages tr` (comma-separated tags, or `any`) to `prepare`, since the
+  default accepts only English tags, and `--language tr` / `--asr-language tr` to the evaluation and
+  ASR-frontend commands so Whisper transcribes the right language.
 
 ```bash
 HF_TOKEN=... python scripts/prepare_hf_shards.py --repo ORG/DATASET --total 324 --shards 0-323 \

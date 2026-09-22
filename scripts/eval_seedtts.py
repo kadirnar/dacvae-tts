@@ -43,6 +43,7 @@ def main():
     parser.add_argument("--guidance", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--language", default="en", help="Whisper language code")
     parser.add_argument("--asr", default="openai/whisper-large-v3")
     parser.add_argument("--asr-device", default="cuda")
     parser.add_argument("--speaker-model", default="microsoft/wavlm-base-plus-sv")
@@ -115,7 +116,9 @@ def main():
             rows.append({**case, "error": case.get("error", "missing audio")})
             continue
         audio = read_audio(target, 16000)
-        hypothesis = asr(audio.numpy(), generate_kwargs={"language": "en", "task": "transcribe"})["text"]
+        hypothesis = asr(audio.numpy(), generate_kwargs={"language": args.language, "task": "transcribe"})[
+            "text"
+        ]
         reference, predicted = seed_normalize(case["text"]).split(), seed_normalize(hypothesis).split()
         distance = word_edit_counts(reference, predicted)[0]
         edits += distance

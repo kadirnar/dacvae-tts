@@ -208,3 +208,29 @@ def test_contrastive_and_low_rank_adaln():
     # No contrastive term outside training or when disabled.
     assert "contrastive" not in Objective(model, contrastive_weight=0.2).eval()(batch)
     assert "contrastive" not in Objective(model).train()(batch)
+
+
+def test_training_uses_prepared_token_ids_without_tokenizing(cache, monkeypatch):
+    """A cache with token ids never touches the normalizer or the byte tokenizer during training."""
+    import sqlite3
+
+    from dacvae_tts import data as data_module
+    from dacvae_tts import text as text_module
+    from dacvae_tts.text import encode_ids
+
+    with sqlite3.connect(cache / "index.sqlite") as db:
+        rows = db.execute("SELECT uid, text FROM samples").fetchall()
+        db.executemany(
+            "INSERT OR REPLACE INTO token_ids VALUES (?,?)",
+            [(uid, encode_ids(text.encode()).tobytes()) for uid, text in rows],
+        )
+    for name in ("tokenize", "tokenize_bytes"):
+        monkeypatch.setattr(data_module, name, lambda *a, **k: (_ for _ in ()).throw(AssertionError(name)))
+    monkeypatch.setattr(
+        text_module, "normalize", lambda *a, **k: (_ for _ in ()).throw(AssertionError("normalize"))
+    )
+    for pairing, layout in (("cross", "segments"), ("cross", "joined"), ("within", "joined")):
+        dataset = LatentDataset(cache, "train", pairing=pairing, layout=layout)
+        batch = collate([dataset[(0, i)] for i in range(3)])
+        assert batch["tokens"].dtype == torch.int64 and (batch["tokens"][:, 0] == BOS).all()
+        assert (batch["segments"] >= 0).all()

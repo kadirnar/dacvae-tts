@@ -71,6 +71,7 @@ def main():
     parser.add_argument("--steps", type=int, default=16)
     parser.add_argument("--guidance", type=float, default=2.0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--language", default="en", help="Whisper language code")
     parser.add_argument("--asr-model", default="small.en")
     parser.add_argument("--asr-device", default="cpu")
     parser.add_argument("--speaker-model", default="microsoft/wavlm-base-plus-sv")
@@ -89,7 +90,7 @@ def main():
     data, cases = select_cases(args.cache, args.cases, args.seed)
     (monitor / "cases.json").write_text(json.dumps(cases, indent=1))
     print(f"{len(cases)} cases from {len({c['speaker'] for c in cases})} held-out speakers", flush=True)
-    evaluator = Evaluator(args.asr_model, None, args.speaker_model, args.asr_device)
+    evaluator = Evaluator(args.asr_model, None, args.speaker_model, args.asr_device, language=args.language)
     scored = set()
     log = run / "monitor.jsonl"
     if log.exists():

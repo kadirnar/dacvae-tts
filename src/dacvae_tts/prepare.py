@@ -19,7 +19,9 @@ from tqdm import tqdm
 from .codec import Codec, backend_options, check_compatibility, file_digest, read_audio
 from .data import SCHEMA, ShardWriter, save_stats, speaker_split
 from .parallel import initialize_worker
-from .text import normalize
+from .text import encode_ids, normalize
+
+ENGLISH_TAGS = {"en", "eng", "English", "english", "en-US", "en-GB"}
 
 
 def source_manifest_digest(path):
@@ -147,9 +149,10 @@ def prepare_record(row, args, root, sample_rate):
         speaker = str(row[args.speaker_column]).strip()
         if not speaker or row[args.speaker_column] is None:
             raise ValueError("Missing speaker identity")
-        language = row.get("language", "en")
-        if language not in {"en", "eng", "English", "english", "en-US", "en-GB"}:
-            raise ValueError(f"Non-English language tag: {language}")
+        accepted = getattr(args, "languages", None) or ENGLISH_TAGS
+        language = row.get("language", next(iter(accepted)))
+        if accepted != {"any"} and language not in accepted:
+            raise ValueError(f"Language tag not accepted: {language}")
         split = row.get("split") or speaker_split(speaker, args.seed)
         if split not in {"train", "val", "test"}:
             raise ValueError("split must be train, val or test")
@@ -171,6 +174,7 @@ def prepare_record(row, args, root, sample_rate):
             uid=uid,
             text=text,
             text_bytes=text.encode("utf-8"),
+            token_ids=encode_ids(text.encode("utf-8")).tobytes(),
             speaker=speaker,
             split=split,
             audio=audio,
@@ -333,6 +337,7 @@ def prepare(args):
                         ),
                     )
                     db.execute("INSERT INTO text_tokens VALUES (?,?)", (uid, record["text_bytes"]))
+                    db.execute("INSERT INTO token_ids VALUES (?,?)", (uid, record["token_ids"]))
                     db.execute(
                         "INSERT INTO provenance VALUES (?,?,?,?,?,?,?)",
                         record["provenance"],
@@ -373,6 +378,8 @@ def prepare(args):
         "complete": True,
         "text_normalization": getattr(args, "text_normalization", "unicode-v1"),
         "text_tokenizer": "utf8-bytes-v1",
+        "token_ids": "bos-bytes+4-eos-uint16-v1",
+        "languages": sorted(getattr(args, "languages", None) or ENGLISH_TAGS),
         "encoder_precision": precision,
         "source_inventory_sha256": source_manifest_digest(args.manifest),
         "pairing_version": "distinct_utterance_same_speaker_v1",
@@ -479,11 +486,12 @@ def merge(args):
                         "INSERT OR IGNORE INTO provenance VALUES (?,?,?,?,?,?,?)",
                         source.execute("SELECT * FROM provenance"),
                     )
-                if source.execute("SELECT 1 FROM sqlite_master WHERE name='text_tokens'").fetchone():
-                    db.executemany(
-                        "INSERT OR IGNORE INTO text_tokens VALUES (?,?)",
-                        source.execute("SELECT * FROM text_tokens"),
-                    )
+                for table in ("text_tokens", "token_ids"):
+                    if source.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone():
+                        db.executemany(
+                            f"INSERT OR IGNORE INTO {table} VALUES (?,?)",
+                            source.execute(f"SELECT * FROM {table}"),
+                        )
             db.commit()
         for (source, expected), observed in partitions.items():
             if observed != set(range(expected)):
@@ -505,6 +513,7 @@ def merge(args):
         singletons = db.total_changes - before
         db.execute("DELETE FROM provenance WHERE uid NOT IN (SELECT uid FROM samples)")
         db.execute("DELETE FROM text_tokens WHERE uid NOT IN (SELECT uid FROM samples)")
+        db.execute("DELETE FROM token_ids WHERE uid NOT IN (SELECT uid FROM samples)")
         db.commit()
         channels = meta["latent_dim"]
         sums = torch.zeros(channels, dtype=torch.float64)

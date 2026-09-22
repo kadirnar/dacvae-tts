@@ -38,6 +38,11 @@ def main():
     p.add_argument("--min-quality", type=float, help="Reject rows whose quality column is below this value")
     p.add_argument("--reject-digits", action="store_true", help="Reject transcripts that contain digits")
     p.add_argument(
+        "--languages",
+        default="en",
+        help="Comma-separated accepted `language` tags (default English variants), or `any`",
+    )
+    p.add_argument(
         "--workers", type=int, default=4, help="CPU audio-loading workers per codec process; 0 is serial"
     )
     p.add_argument("--worker-backend", choices=["thread", "process"], default="thread")
@@ -127,6 +132,7 @@ def main():
     )
     p.add_argument("--asr-model", default="small.en")
     p.add_argument("--asr-device", choices=["cpu", "cuda"], default="cpu")
+    p.add_argument("--asr-language", default="en", help="Whisper language code of the reference audio")
     p.add_argument("--profile", action="store_true")
     p.add_argument("--text", required=True)
     p.add_argument("--seconds", type=float)
@@ -182,6 +188,7 @@ def main():
     p.add_argument("--output", required=True)
     p.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     p.add_argument("--asr-model", default="large-v3")
+    p.add_argument("--language", default="en", help="Whisper language code for scoring")
     p.add_argument("--dnsmos-model", help="Path to official non-personalized sig_bak_ovr.onnx")
     p.add_argument("--speaker-model", default="microsoft/wavlm-base-plus-sv")
     p.add_argument("--no-speaker", action="store_true")
@@ -243,6 +250,10 @@ def main():
     p.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
+    if getattr(args, "languages", None) is not None:
+        from .prepare import ENGLISH_TAGS
+
+        args.languages = ENGLISH_TAGS if args.languages == "en" else set(args.languages.split(","))
     if hasattr(args, "num_shards") and not 0 <= args.shard_index < args.num_shards:
         parser.error("shard-index must be between zero and num-shards - 1")
     if args.command == "inspect":
