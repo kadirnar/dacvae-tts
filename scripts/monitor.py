@@ -107,7 +107,7 @@ def main():
             tts = Synthesizer(str(checkpoint), device=args.device)
             step = tts.checkpoint.get("step")
             folder = monitor / checkpoint.stem
-            folder.mkdir(exist_ok=True)
+            folder.mkdir(parents=True, exist_ok=True)
             if not prompts_written:
                 for case in cases:  # decoded once: the same prompt audio for every checkpoint
                     latents = data.row(case["prompt_index"])["latents"].to(tts.device)

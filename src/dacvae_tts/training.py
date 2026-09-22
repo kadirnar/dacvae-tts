@@ -260,6 +260,14 @@ def train(args):
             start_step, epoch, batch_offset = saved["step"], saved["epoch"], saved["batch_offset"]
             restore_rng(saved["rng"][rank], device)
         else:
+            if getattr(args, "init_from", None):
+                # Warm start: weights only. Schedule, optimizer state and data order start fresh, so
+                # a run can continue on a larger cache than the one that produced the checkpoint.
+                warm = torch.load(args.init_from, map_location="cpu", weights_only=True)
+                if Config.from_dict(warm["config"]).model != cfg.model:
+                    raise ValueError("--init-from requires an identical model configuration")
+                model.load_state_dict(warm["model"])
+                ema.load_state_dict(warm["ema"])
             torch.manual_seed(cfg.train.seed + rank)
             random.seed(cfg.train.seed + rank)
         objective = Objective(
@@ -414,6 +422,9 @@ def train(args):
                         "elapsed_seconds": time.monotonic() - last_time,
                         "valid_target_frames": int(frame_denominator),
                         "gradient_norm_before_clip": float(norm),
+                        "peak_cuda_gb": torch.cuda.max_memory_allocated(device) / 2**30
+                        if device.type == "cuda"
+                        else 0.0,
                         "flow_reduction": cfg.train.flow_reduction,
                         "time_and_length_buckets_sum_count": buckets.cpu().tolist(),
                         "diagnostics_rank0": diagnostics,
@@ -464,6 +475,7 @@ def train(args):
                         "mean": data.mean,
                         "std": data.std,
                         "stage": "pretrain",
+                        "init_from": getattr(args, "init_from", None),
                     }
                     atomic_save(saved, out / "last.pt")
                     if keeping:

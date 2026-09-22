@@ -91,3 +91,17 @@ def test_two_rank_ddp_smoke(cache, tmp_path, reduction):
     assert saved["world_size"] == len(saved["rng"]) == 2
     assert saved["step"] == 4
     assert len([json.loads(line) for line in (output / "train.jsonl").read_text().splitlines()]) == 4
+
+
+def test_warm_start_loads_weights_and_restarts_schedule(cache, tmp_path):
+    config = config_file(tmp_path)
+    base = ["-m", "dacvae_tts", "train", "--config", str(config), "--cache", str(cache), "--device", "cpu"]
+    first, second = tmp_path / "first", tmp_path / "second"
+    run([*base, "--output", str(first)])
+    run([*base, "--output", str(second), "--init-from", str(first / "last.pt"), "--stop-after", "1"])
+    _, a = load_model(first / "last.pt")
+    _, b = load_model(second / "last.pt")
+    assert b["step"] == 1 and b["init_from"] == str(first / "last.pt")
+    # One update moved the warm-started weights away from the source checkpoint.
+    assert any(not torch.equal(a["model"][key], b["model"][key]) for key in a["model"])
+    assert all(torch.isfinite(b["model"][key]).all() for key in b["model"])

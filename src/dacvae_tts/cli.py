@@ -90,6 +90,7 @@ def main():
     p.add_argument("--cache", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--resume")
+    p.add_argument("--init-from", help="Warm-start model/EMA weights from a checkpoint (fresh schedule)")
     p.add_argument("--device", default="auto", choices=["auto", "cpu"])
     p.add_argument("--steps", type=positive_int)
     p.add_argument("--batch-size", type=positive_int)
