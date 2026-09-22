@@ -130,25 +130,44 @@ def restore_rng(state, device):
         torch.cuda.set_rng_state(state["cuda"], device)
 
 
+def shuffled_conditions(batch):
+    """The same batch with every example's transcript taken from another example.
+
+    The flow loss under wrong text minus the loss under the right text measures how much the
+    model relies on the text, a text-alignment signal that needs no ASR. Zero means the text is
+    ignored, which is what an untrained or babbling model does.
+    """
+    return {**batch, "tokens": batch["tokens"].roll(1, 0), "segments": batch["segments"].roll(1, 0)}
+
+
 def validate(model, loader, device, precision, max_batches=20, reduction="utterance", duration_weight=0.1):
     objective = Objective(model, duration_weight).eval()
-    totals = torch.zeros(4, device=device)
+    totals = torch.zeros(5, device=device)
     devices = [device.index] if device.type == "cuda" else []
     with torch.no_grad(), torch.random.fork_rng(devices=devices):
-        torch.manual_seed(12345)
         for i, batch in enumerate(loader):
             if i >= max_batches:
                 break
-            with autocast(device, precision):
-                losses = objective(move_batch(batch, device))
-            weights = losses["frames"] if reduction == "frame" else torch.ones_like(losses["flow"])
-            totals[0] += (losses["flow"] * weights).sum()
+            batch = move_batch(batch, device)
+            weights = None
+            for column, variant in ((0, batch), (4, shuffled_conditions(batch))):
+                torch.manual_seed(12345 + i)  # identical noise and flow times for both variants
+                with autocast(device, precision):
+                    losses = objective(variant)
+                if weights is None:
+                    weights = losses["frames"] if reduction == "frame" else torch.ones_like(losses["flow"])
+                totals[column] += (losses["flow"] * weights).sum()
             totals[1] += weights.sum()
             totals[2] += losses["duration"].sum()
             totals[3] += losses["duration"].numel()
     if dist.is_initialized():
         dist.all_reduce(totals)
-    return (totals[0] / totals[1].clamp_min(1) + duration_weight * totals[2] / totals[3].clamp_min(1)).item()
+    flow = totals[0] / totals[1].clamp_min(1)
+    return {
+        "validation_loss": (flow + duration_weight * totals[2] / totals[3].clamp_min(1)).item(),
+        "validation_flow": flow.item(),
+        "validation_text_gain": (totals[4] / totals[1].clamp_min(1) - flow).item(),
+    }
 
 
 def train(args):
@@ -434,7 +453,7 @@ def train(args):
                         stream.write(json.dumps(record) + "\n")
                 last_time = time.monotonic()
             if validation is not None and (step + 1) % cfg.train.validate_every == 0:
-                val_loss = validate(
+                val = validate(
                     ema,
                     validation,
                     device,
@@ -443,7 +462,10 @@ def train(args):
                     duration_weight=cfg.train.duration_weight,
                 )
                 if rank == 0:
-                    print(json.dumps({"step": step + 1, "validation_loss": val_loss}), flush=True)
+                    record = {"step": step + 1, **val}
+                    print(json.dumps(record), flush=True)
+                    with open(out / "train.jsonl", "a") as stream:
+                        stream.write(json.dumps(record) + "\n")
             stopping = args.stop_after is not None and step + 1 >= args.stop_after
             keeping = cfg.train.keep_every and (step + 1) % cfg.train.keep_every == 0
             if (

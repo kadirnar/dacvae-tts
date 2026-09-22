@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import subprocess
 import sys
@@ -90,7 +91,11 @@ def test_two_rank_ddp_smoke(cache, tmp_path, reduction):
     saved = torch.load(output / "last.pt", weights_only=True)
     assert saved["world_size"] == len(saved["rng"]) == 2
     assert saved["step"] == 4
-    assert len([json.loads(line) for line in (output / "train.jsonl").read_text().splitlines()]) == 4
+    records = [json.loads(line) for line in (output / "train.jsonl").read_text().splitlines()]
+    assert len([r for r in records if "flow" in r]) == 4
+    validations = [r for r in records if "validation_loss" in r]
+    assert [r["step"] for r in validations] == [2, 4]
+    assert all(math.isfinite(r["validation_text_gain"]) for r in validations)
 
 
 def test_warm_start_loads_weights_and_restarts_schedule(cache, tmp_path):
