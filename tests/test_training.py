@@ -3,6 +3,7 @@ import math
 import os
 import subprocess
 import sys
+import types
 
 import pytest
 import torch
@@ -110,3 +111,54 @@ def test_warm_start_loads_weights_and_restarts_schedule(cache, tmp_path):
     # One update moved the warm-started weights away from the source checkpoint.
     assert any(not torch.equal(a["model"][key], b["model"][key]) for key in a["model"])
     assert all(torch.isfinite(b["model"][key]).all() for key in b["model"])
+
+
+def test_compiler_failure_falls_back_to_eager(cache, tmp_path, monkeypatch):
+    import torch._inductor.exc as inductor
+
+    from dacvae_tts import training
+    from dacvae_tts.config import Config
+
+    calls = {"count": 0}
+
+    def fake_compile(function, dynamic=True):
+        def wrapped(*args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 2:  # the second forward hits a "rare shape"
+                raise inductor.InductorError(AssertionError("synthetic"), None)
+            return function(*args, **kwargs)
+
+        return wrapped
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    config = config_file(tmp_path)
+    cfg = yaml.safe_load(config.read_text())
+    cfg["train"]["compile"] = "model"
+    config.write_text(yaml.safe_dump(cfg))
+    args = types.SimpleNamespace(
+        config=str(config),
+        cache=str(cache),
+        output=str(tmp_path / "fallback"),
+        resume=None,
+        init_from=None,
+        device="cpu",
+        steps=None,
+        batch_size=None,
+        accumulation=None,
+        workers=None,
+        precision=None,
+        learning_rate=None,
+        optimizer=None,
+        worker_threads=None,
+        prefetch_factor=None,
+        loader_start_method=None,
+        cuda_prefetch=None,
+        frame_budget=0,
+        compile=None,
+        no_validation=True,
+        stop_after=None,
+    )
+    training.train(args)
+    _, saved = load_model(tmp_path / "fallback" / "last.pt")
+    assert saved["step"] == 4 and calls["count"] == 2  # compiled path abandoned after the failure
+    assert Config.from_dict(saved["config"]).train.compile is False

@@ -193,7 +193,7 @@ def train(args):
             if value is not None:
                 setattr(cfg.train, key, value)
         if args.compile:
-            cfg.train.compile = True
+            cfg.train.compile = True if args.compile == "objective" else args.compile
         cfg.train.__post_init__()
         if device.type == "cuda" and cfg.train.precision == "bf16" and not torch.cuda.is_bf16_supported():
             raise ValueError("This GPU does not support BF16; pass --precision fp32")
@@ -297,8 +297,42 @@ def train(args):
             cfg.train.ctc_weight,
         ).train()
         raw_objective = objective  # compile/DDP wrap the module; helper methods stay reachable here
-        if cfg.train.compile:
+        eager_forward = model.forward
+        if cfg.train.compile == "model":
+            # Only the generator: the loss, CTC and batch expansion stay eager, which avoids
+            # dynamic-shape failures in the compiler while keeping most of the speed-up.
+            model.forward = torch.compile(model.forward, dynamic=True)
+        elif cfg.train.compile:
             objective = torch.compile(objective, dynamic=True)
+
+        def compute(module, batch, step):
+            """Run the objective; a compiler failure on some rare shape falls back to eager for good."""
+            nonlocal objective
+            try:
+                return module(batch)
+            except Exception as error:
+                origin = type(error).__module__
+                if (
+                    world > 1
+                    or not cfg.train.compile
+                    or not origin.startswith(("torch._dynamo", "torch._inductor"))
+                ):
+                    raise
+                model.forward = eager_forward
+                objective = raw_objective
+                cfg.train.compile = False
+                print(
+                    json.dumps(
+                        {
+                            "step": step + 1,
+                            "warning": "compiler failed; continuing eager",
+                            "error": str(error)[:300],
+                        }
+                    ),
+                    flush=True,
+                )
+                return raw_objective(batch)
+
         if world > 1:
             objective = DDP(
                 objective,
@@ -366,7 +400,7 @@ def train(args):
                 with sync:
                     probe = ActivationProbe(model) if diagnose and micro == 0 else None
                     with autocast(device, cfg.train.precision):
-                        losses = objective(batch)
+                        losses = compute(objective, batch, step)
                         flow_weights = (
                             losses["frames"]
                             if cfg.train.flow_reduction == "frame"

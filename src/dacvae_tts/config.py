@@ -78,7 +78,7 @@ class TrainConfig:
     validate_every: int = 1000
     log_every: int = 50
     grad_checkpoint: bool = False
-    compile: bool = False
+    compile: object = False  # False, True (whole objective) or "model" (generator only)
     seed: int = 42
     flow_reduction: str = "utterance"
     duration_weight: float = 0.1
@@ -127,6 +127,8 @@ class TrainConfig:
             or not 0 <= self.prompt_dropout <= 1
         ):
             raise ValueError("Invalid prompt fraction range or prompt dropout")
+        if self.compile not in {False, True, "model"}:
+            raise ValueError("compile must be false, true or model")
         if self.batch_expansion < 1 or self.keep_every < 0 or self.ctc_weight < 0:
             raise ValueError("batch_expansion must be positive and keep_every nonnegative")
 

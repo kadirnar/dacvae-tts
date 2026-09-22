@@ -107,7 +107,13 @@ def main():
         default=0,
         help="Maximum padded prompt+target frames per rank/microbatch; 0 disables",
     )
-    p.add_argument("--compile", action="store_true")
+    p.add_argument(
+        "--compile",
+        nargs="?",
+        const="objective",
+        choices=["objective", "model"],
+        help="Compile the whole objective, or only the generator with --compile model",
+    )
     p.add_argument("--no-validation", action="store_true", help="For smoke tests only")
     p.add_argument(
         "--stop-after", type=positive_int, help="Gracefully checkpoint early without changing LR schedule"
