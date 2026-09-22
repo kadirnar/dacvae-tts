@@ -349,6 +349,7 @@ def train(args):
         ).train()
         raw_objective = objective  # compile/DDP wrap the module; helper methods stay reachable here
         eager_forward = model.forward
+        compiled = bool(cfg.train.compile)
         if cfg.train.compile == "model":
             # Only the generator: the loss, CTC and batch expansion stay eager, which avoids
             # dynamic-shape failures in the compiler while keeping most of the speed-up.
@@ -359,19 +360,22 @@ def train(args):
         def compute(module, batch, step):
             """Run the objective; a compiler failure on some rare shape falls back to eager for good."""
             nonlocal objective
+            nonlocal compiled
             try:
                 return module(batch)
             except Exception as error:
                 origin = type(error).__module__
+                # Under DDP only the generator-only mode can be swapped (the objective is wrapped).
+                swappable = cfg.train.compile == "model" or world == 1
                 if (
-                    world > 1
-                    or not cfg.train.compile
+                    not compiled
+                    or not swappable
                     or not origin.startswith(("torch._dynamo", "torch._inductor"))
                 ):
                     raise
                 model.forward = eager_forward
                 objective = raw_objective
-                cfg.train.compile = False
+                compiled = False
                 # Eager activations need roughly twice the memory of the compiled graph; recompute
                 # them instead so a run sized for the compiled path survives the switch.
                 model.grad_checkpoint = True
@@ -379,6 +383,7 @@ def train(args):
                     json.dumps(
                         {
                             "step": step + 1,
+                            "rank": rank,
                             "warning": "compiler failed; continuing eager with activation checkpointing",
                             "error": str(error)[:300],
                         }

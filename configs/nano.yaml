@@ -34,7 +34,7 @@ train:
   validate_every: 1000
   log_every: 100
   grad_checkpoint: false
-  compile: model          # generator only; falls back to eager on a compiler failure
+  compile: false           # `model` compiles the generator (about 1.6x) but torch 2.8 hits a dynamic-shape bug within a few thousand steps; the run then falls back to eager + activation checkpointing
   seed: 42
   flow_reduction: frame
   pairing: within

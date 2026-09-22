@@ -540,6 +540,16 @@ Pilot 2'de **hizalama oturmaya başladı** (görülmemiş 32 konuşmacı, Whispe
 - Seed-TTS test-en (1.088 cümle, g=2,0): WER %23,5. (Kullanıcı bu benchmark'ı istemedi; g=3,5 koşusu yapılmadı.)
 
 **v3 tarifi (13:00, 4M satırlık koşu için):** gözlenen tekrar/yutma hatalarını hedefleyen iki değişiklik — (1) skip/repeat kontrastif negatifler (`contrastive_weight 0.2`, göreli marj 0,1): aynı ses/gürültü/zamanla bir kelimesi silinmiş ya da tekrarlanmış transkript puanlanır, doğru transkript marjla kazanmalı; (2) düşük-rank paylaşımlı AdaLN (`adaln_rank 64`): boşalan 12M parametre ile genişlik 384→448, toplam 51,4M. Yerel maliyet: 0,52 s/adım (+%20), 10,4 GB (bütçe 8000). Derleyici hatasında artık eager + aktivasyon checkpointing'e düşülüyor (eager'da bellek 16 GB'ı aşmıştı). Çok-GPU encode için `scripts/prepare_hf_8gpu.sh`.
+
+**v3 A/B (380 saat, sıfırdan, LR 8e-4; v3 frame bütçesi 8000 = adım başına ~1/3 daha az ses):**
+
+| Adım | Eski tarif: val / metin kazancı / WER | v3: val / metin kazancı / WER |
+|---:|---|---|
+| 5.000 | 0,691 / 0,0046 / 1,21 | ~0,690 / 0,0037 / 1,30 |
+| 10.000 | 0,670 / 0,0131 / 0,87 | 0,669 / 0,0112 / 1,01 |
+| 12.000 | 0,666 / 0,0146 / – | 0,664 / 0,0135 / – |
+
+Adım başına daha az sesle aynı yerde, val kaybı hafif daha iyi: **zarar yok, kanıtlanmış üstünlük de yok**; kontrastif terimin hedeflediği tekrar/yutma hataları bu erken evrede ölçülemedi. `compile: model` yine ~3.000. adımda Inductor hatası verdi (deterministik); nano tarifinde compile kapatıldı, açıldığında düşüş korumalı.
 <!-- V3-AB -->
 <!-- NANO-RUN-LOG -->
 

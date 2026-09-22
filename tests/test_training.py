@@ -161,5 +161,5 @@ def test_compiler_failure_falls_back_to_eager(cache, tmp_path, monkeypatch, caps
     training.train(args)
     _, saved = load_model(tmp_path / "fallback" / "last.pt")
     assert saved["step"] == 4 and calls["count"] == 2  # compiled path abandoned after the failure
-    assert Config.from_dict(saved["config"]).train.compile is False
+    assert Config.from_dict(saved["config"]).train.compile == "model"  # resume must still match the YAML
     assert any("activation checkpointing" in line for line in capsys.readouterr().out.splitlines())
