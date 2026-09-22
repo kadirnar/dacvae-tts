@@ -16,6 +16,7 @@ eval = ["faster-whisper>=1.1", "onnxruntime>=1.19", "transformers>=4.46,<5", "pr
 dev = ["pytest>=8", "ruff>=0.9"]
 data = ["pyarrow>=18"]
 asr = ["faster-whisper>=1.1"]
+tracking = ["wandb>=0.18"]
 
 [project.scripts]
 dacvae-tts = "dacvae_tts.cli:main"

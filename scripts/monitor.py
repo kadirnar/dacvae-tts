@@ -82,6 +82,9 @@ def main():
         "--prompt-audio",
         help="Directory of original prompt WAVs from export_case_audio.py; scores become SIM-o",
     )
+    parser.add_argument("--wandb-project", help="Log scores and a few audio samples to this W&B project")
+    parser.add_argument("--wandb-id", help="W&B run id to attach to (default: the run directory name)")
+    parser.add_argument("--wandb-audio", type=int, default=4, help="Samples per checkpoint uploaded as audio")
     args = parser.parse_args()
 
     run = Path(args.run)
@@ -96,6 +99,9 @@ def main():
     if log.exists():
         scored = {json.loads(line)["checkpoint"] for line in log.read_text().splitlines() if line.strip()}
     prompts_written = False
+    from dacvae_tts.tracking import Tracker
+
+    tracker = Tracker(bool(args.wandb_project), args.wandb_project, run.name, {}, resume_id=args.wandb_id)
 
     while True:
         if args.checkpoint:
@@ -174,6 +180,17 @@ def main():
             }
             with open(log, "a") as stream:
                 stream.write(json.dumps(record) + "\n")
+            tracker.log(record, step=step, prefix="monitor/")
+            for index, row in enumerate(rows[: args.wandb_audio]):
+                if "error" in row:
+                    continue
+                tracker.audio(
+                    f"monitor/audio/{index:03d}",
+                    folder / f"{index:03d}.wav",
+                    f"step {step} | WER {row['wer']:.2f} | {row['text'][:80]}",
+                    48000,
+                    step=step,
+                )
             scored.add(str(checkpoint))
             print(json.dumps(record), flush=True)
             del tts

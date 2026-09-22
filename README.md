@@ -38,6 +38,11 @@ bash scripts/train_8gpu.sh configs/nano.yaml data/corpus/merged runs/nano --fram
 python scripts/monitor.py --run runs/nano --cache data/corpus/merged --cases 48   # WER/SIM per snapshot
 ```
 
+Add `--wandb-project NAME` (or `train.wandb_project` in the YAML; `pip install wandb` and
+`wandb login` first) to mirror the training/validation curves to Weights & Biases; the same flag
+on `monitor.py` adds WER/SIM per snapshot and a few audio samples to the same run. The JSONL logs
+in the run directory are always written.
+
 `--frame-budget` is the padded latent frames per GPU and step (8000 fits 16 GB, 16000 about 20 GB).
 Snapshots land in `runs/nano/step-*.pt` every `keep_every` updates; `last.pt` resumes exactly with
 `--resume`, and `--init-from` warm-starts a new run from any snapshot.

@@ -23,6 +23,7 @@ from .model import FlowTTS, flow_loss, reduce_flow
 from .optim import build_optimizer
 from .parallel import device_batches, loader_options
 from .text import BYTE_OFFSET, corrupt_transcript
+from .tracking import Tracker
 
 
 class Objective(nn.Module):
@@ -237,6 +238,7 @@ def train(args):
             "prefetch_factor",
             "loader_start_method",
             "cuda_prefetch",
+            "wandb_project",
         ):
             value = getattr(args, key, None)
             if value is not None:
@@ -400,6 +402,21 @@ def train(args):
                 gradient_as_bucket_view=True,
             )
         out = Path(args.output)
+        tracker = Tracker(
+            bool(cfg.train.wandb_project) and rank == 0,
+            cfg.train.wandb_project,
+            out.name,
+            {
+                **cfg.to_dict(),
+                "frame_budget": args.frame_budget,
+                "cache": str(Path(args.cache).resolve()),
+                "init_from": getattr(args, "init_from", None),
+                "world_size": world,
+                "parameters": sum(p.numel() for p in model.parameters()),
+            },
+            group=getattr(args, "wandb_group", None),
+            resume_id=getattr(args, "wandb_id", None),
+        )
         if rank == 0:
             out.mkdir(parents=True, exist_ok=True)
             (out / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2))
@@ -548,6 +565,7 @@ def train(args):
                     print(json.dumps(record), flush=True)
                     with open(out / "train.jsonl", "a") as stream:
                         stream.write(json.dumps(record) + "\n")
+                    tracker.log(record, step=step + 1, prefix="train/")
                 last_time = time.monotonic()
             if validation is not None and (step + 1) % cfg.train.validate_every == 0:
                 val = validate(
@@ -563,6 +581,7 @@ def train(args):
                     print(json.dumps(record), flush=True)
                     with open(out / "train.jsonl", "a") as stream:
                         stream.write(json.dumps(record) + "\n")
+                    tracker.log(val, step=step + 1, prefix="val/")
             stopping = args.stop_after is not None and step + 1 >= args.stop_after
             keeping = cfg.train.keep_every and (step + 1) % cfg.train.keep_every == 0
             if (
@@ -606,5 +625,7 @@ def train(args):
             if stopping:
                 break
     finally:
+        if "tracker" in locals():
+            tracker.finish()
         if dist.is_initialized():
             dist.destroy_process_group()

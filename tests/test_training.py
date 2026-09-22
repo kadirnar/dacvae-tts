@@ -163,3 +163,61 @@ def test_compiler_failure_falls_back_to_eager(cache, tmp_path, monkeypatch, caps
     assert saved["step"] == 4 and calls["count"] == 2  # compiled path abandoned after the failure
     assert Config.from_dict(saved["config"]).train.compile == "model"  # resume must still match the YAML
     assert any("activation checkpointing" in line for line in capsys.readouterr().out.splitlines())
+
+
+def test_wandb_tracking_mirrors_logs(cache, tmp_path, monkeypatch):
+    """With a project set, train/val records reach wandb.log with step numbers; nothing else changes."""
+    import sys
+    import types
+
+    from dacvae_tts import training
+
+    calls = {"init": [], "log": [], "finish": 0}
+
+    class FakeRun:
+        def log(self, payload, step=None):
+            calls["log"].append((step, payload))
+
+        def finish(self):
+            calls["finish"] += 1
+
+    fake = types.ModuleType("wandb")
+    fake.init = lambda **kwargs: calls["init"].append(kwargs) or FakeRun()
+    monkeypatch.setitem(sys.modules, "wandb", fake)
+    config = config_file(tmp_path)
+    args = types.SimpleNamespace(
+        config=str(config),
+        cache=str(cache),
+        output=str(tmp_path / "tracked"),
+        resume=None,
+        init_from=None,
+        device="cpu",
+        steps=None,
+        batch_size=None,
+        accumulation=None,
+        workers=None,
+        precision=None,
+        learning_rate=None,
+        optimizer=None,
+        worker_threads=None,
+        prefetch_factor=None,
+        loader_start_method=None,
+        cuda_prefetch=None,
+        frame_budget=0,
+        compile=None,
+        no_validation=False,
+        stop_after=None,
+        wandb_project="unit-test",
+        wandb_group="g",
+        wandb_id=None,
+    )
+    training.train(args)
+    assert calls["init"][0]["project"] == "unit-test" and calls["init"][0]["name"] == "tracked"
+    assert calls["init"][0]["config"]["train"]["wandb_project"] == "unit-test"
+    steps = sorted({step for step, _ in calls["log"]})
+    assert steps == [1, 2, 3, 4]
+    keys = {key for _, payload in calls["log"] for key in payload}
+    assert {"train/flow", "train/lr", "val/validation_flow", "val/validation_text_gain"} <= keys
+    assert not any(isinstance(v, (list, dict, str)) for _, p in calls["log"] for v in p.values())
+    assert calls["finish"] == 1
+    assert (tmp_path / "tracked" / "train.jsonl").exists()
