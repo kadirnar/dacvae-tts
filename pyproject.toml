@@ -7,16 +7,32 @@ name = "dacvae-tts"
 version = "0.1.0"
 description = "Compact English reference-conditioned flow TTS in DACVAE latent space"
 requires-python = ">=3.10,<3.13"
-dependencies = ["torch>=2.5,<3", "torchaudio>=2.5,<3", "numpy>=1.26", "soundfile>=0.12", "scipy>=1.12", "PyYAML>=6", "tqdm>=4.66"]
+dependencies = [
+    "torch>=2.5,<3",
+    "torchaudio>=2.5,<3",
+    "numpy>=1.26",
+    "soundfile>=0.12",
+    "scipy>=1.12",
+    "PyYAML>=6",
+    "tqdm>=4.66",
+    "pyarrow>=18",
+    "pyloudnorm>=0.1",
+    "huggingface_hub>=0.25",
+    "dacvae @ git+https://github.com/facebookresearch/dacvae.git@414c20785fc3a28373073ea8ef7a1316eeeaca6e",
+    "faster-whisper>=1.1",
+    "onnxruntime>=1.19",
+    "transformers>=4.46,<5",
+    "wandb>=0.18",
+]
 
 [project.optional-dependencies]
-codec = ["dacvae @ git+https://github.com/facebookresearch/dacvae.git@414c20785fc3a28373073ea8ef7a1316eeeaca6e"]
-# Keep the evaluator environment compatible with descript-audiotools (DACVAE).
-eval = ["faster-whisper>=1.1", "onnxruntime>=1.19", "transformers>=4.46,<5", "protobuf>=3.9.2,<3.20"]
 dev = ["pytest>=8", "ruff>=0.9"]
-data = ["pyarrow>=18"]
-asr = ["faster-whisper>=1.1"]
-tracking = ["wandb>=0.18"]
+# Kept as aliases for older commands in the docs; everything is already in `dependencies`.
+codec = []
+eval = []
+data = []
+asr = []
+tracking = []
 
 [project.scripts]
 dacvae-tts = "dacvae_tts.cli:main"

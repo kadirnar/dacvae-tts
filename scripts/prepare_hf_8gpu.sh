@@ -15,7 +15,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 mkdir -p "$output"
 pids=()
 for ((gpu = 0; gpu < gpus; gpu++)); do
-  CUDA_VISIBLE_DEVICES=$gpu python scripts/prepare_hf_shards.py --repo "$repo" --total "$total" \
+  CUDA_VISIBLE_DEVICES=$gpu "$(dirname "${BASH_SOURCE[0]}")/../.venv/bin/python" scripts/prepare_hf_shards.py --repo "$repo" --total "$total" \
     --shards "0-$((total - 1))" --every "$gpus" --offset "$gpu" --output "$output" --workers "${PREPARE_WORKERS:-6}" "$@" \
     > "$output/prepare-gpu$gpu.log" 2>&1 &
   pids+=("$!")
@@ -23,4 +23,4 @@ done
 for pid in "${pids[@]}"; do
   wait "$pid" || { echo "an encoder failed; see $output/prepare-gpu*.log" >&2; exit 1; }
 done
-dacvae-tts merge --inputs "$output"/parts/part-* --output "$output/merged" --keep-singletons --drop-conflicting-duplicates
+"$(dirname "${BASH_SOURCE[0]}")/../.venv/bin/dacvae-tts" merge --inputs "$output"/parts/part-* --output "$output/merged" --keep-singletons --drop-conflicting-duplicates

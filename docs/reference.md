@@ -231,7 +231,7 @@ available; nothing here is a quality claim.
 
 ## Experiment tracking (Weights & Biases)
 
-`pip install -e '.[tracking]'` (or `pip install wandb`) and `wandb login`, then pass
+`wandb login` once (the package is installed by `scripts/setup.sh`), then pass
 `--wandb-project NAME` to `train` (or set `train.wandb_project` in the YAML). Rank 0 mirrors every
 `train.jsonl` record (`train/flow`, `train/ctc`, `train/contrastive`, `train/lr`, gradient norm,
 throughput) and every validation record (`val/validation_flow`, `val/validation_text_gain`) to a run

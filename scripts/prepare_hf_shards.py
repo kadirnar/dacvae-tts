@@ -60,6 +60,13 @@ def main():
     parser.add_argument("--min-seconds", type=float, default=1.0)
     parser.add_argument("--max-seconds", type=float, default=15.0)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument(
+        "--codec-backend",
+        choices=["reference", "fast"],
+        default="reference",
+        help="`fast` is the exact fast-dacvae adaptation; add --codec-compile for its speed-up",
+    )
+    parser.add_argument("--codec-compile", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -140,6 +147,8 @@ def main():
             shard_index=0,
             num_shards=1,
             seed=args.seed,
+            codec_backend=args.codec_backend,
+            codec_compile=args.codec_compile,
         )
         worker = context.Process(target=encode_shard, args=(options,))
         worker.start()

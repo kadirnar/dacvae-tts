@@ -10,11 +10,12 @@ The recommended configuration is `configs/nano.yaml` (51M parameters). Everythin
 ## Install
 
 ```bash
-uv venv --python 3.12 && source .venv/bin/activate
-uv pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install -e '.[codec,data,dev]'      # + '.[eval]' for WER/SIM scoring, '.[asr]' for audio-only prompts
-pytest -q
+bash scripts/setup.sh        # creates .venv with PyTorch (CUDA 12.8) and every dependency; CUDA=cu126 or CUDA=cpu to change
+source .venv/bin/activate
 ```
+
+Nothing else to install: the codec, Whisper/DNSMOS/speaker scoring and Weights & Biases are all
+declared dependencies. `bash scripts/setup.sh --dev` adds pytest/ruff (`pytest -q`).
 
 ## 1. Prepare the data (tokenization and codec encoding happen here, once)
 
@@ -38,8 +39,7 @@ bash scripts/train_8gpu.sh configs/nano.yaml data/corpus/merged runs/nano --fram
 python scripts/monitor.py --run runs/nano --cache data/corpus/merged --cases 48   # WER/SIM per snapshot
 ```
 
-Add `--wandb-project NAME` (or `train.wandb_project` in the YAML; `pip install wandb` and
-`wandb login` first) to mirror the training/validation curves to Weights & Biases; the same flag
+Add `--wandb-project NAME` (or `train.wandb_project` in the YAML; run `wandb login` once) to mirror the training/validation curves to Weights & Biases; the same flag
 on `monitor.py` adds WER/SIM per snapshot and a few audio samples to the same run. The JSONL logs
 in the run directory are always written.
 
