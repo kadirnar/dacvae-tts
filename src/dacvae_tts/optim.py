@@ -19,7 +19,7 @@ from torch import nn
 
 NEWTON_SCHULZ = (3.4445, -4.7750, 2.0315)
 # Row-wise concatenations of independent square-ish maps: orthogonalize every part separately.
-FUSED_ROWS = {".kv.weight": 2, ".ada.1.weight": 9}
+FUSED_ROWS = {".kv.weight": 2, ".ada.1.weight": 9, ".ada_up.weight": 9, "ada_shared.1.weight": 9}
 # Boundary layers (raw latents in, velocities / log-rate out) follow the AdamW convention.
 BOUNDARY = {
     "input.weight",

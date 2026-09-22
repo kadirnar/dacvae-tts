@@ -420,6 +420,9 @@ def merge(args):
     if (out / "index.sqlite").exists():
         raise ValueError("Merged output already exists")
     db = sqlite3.connect(out / "index.sqlite")
+    # Millions of rows go through three indexed lookups each; durability is not needed while merging.
+    db.execute("PRAGMA journal_mode=MEMORY")
+    db.execute("PRAGMA synchronous=OFF")
     db.executescript(SCHEMA)
     meta, duplicates, rejected, conflicts = None, 0, 0, 0
     partitions = {}

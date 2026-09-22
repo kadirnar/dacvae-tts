@@ -46,6 +46,8 @@ def main():
     parser.add_argument("--pattern", default="data/train-{index:05d}-of-{total:05d}.parquet")
     parser.add_argument("--total", type=int, required=True, help="Number of shards in the repository")
     parser.add_argument("--shards", required=True, help="For example 0-99 or 0-9,50,60-69")
+    parser.add_argument("--every", type=int, default=1, help="Take every N-th shard of the list ...")
+    parser.add_argument("--offset", type=int, default=0, help="... starting at this position (one GPU each)")
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--text-column", default="text")
@@ -79,10 +81,13 @@ def main():
                 print(f"download retry {attempt + 1} for shard {index}: {error}", flush=True)
                 time.sleep(10 * (attempt + 1))
 
+    if not 0 <= args.offset < args.every:
+        raise ValueError("--offset must be smaller than --every")
     pending = [
         i
-        for i in shard_list(args.shards)
-        if not (root / "parts" / f"part-{i:05d}" / "metadata.json").exists()
+        for position, i in enumerate(shard_list(args.shards))
+        if position % args.every == args.offset
+        and not (root / "parts" / f"part-{i:05d}" / "metadata.json").exists()
     ]
     print(f"{len(pending)} shards to process", flush=True)
     downloads = {}
@@ -152,7 +157,7 @@ def main():
             "x_realtime": meta["preparation"]["audio_seconds_per_wall_second"],
         }
         print(json.dumps(record), flush=True)
-        with open(root / "progress.jsonl", "a") as stream:
+        with open(root / f"progress-{args.offset}.jsonl", "a") as stream:
             stream.write(json.dumps(record) + "\n")
 
 

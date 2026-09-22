@@ -25,6 +25,7 @@ class ModelConfig:
     text_layout: str = "segments"
     duration: str = "head"
     ctc_layer: int = 0
+    adaln_rank: int = 0  # 0: one D->9D modulation per block; r>0: shared modulation + rank-r per block
 
     def __post_init__(self):
         if min(self.latent_dim, self.width, self.depth, self.heads, self.patch_size) < 1:
@@ -51,6 +52,8 @@ class ModelConfig:
             raise ValueError("Rotary positions need an even attention head width")
         if self.text_layout not in {"segments", "joined"} or self.duration not in {"head", "rule"}:
             raise ValueError("text_layout must be segments or joined; duration must be head or rule")
+        if self.adaln_rank < 0:
+            raise ValueError("adaln_rank must be nonnegative")
         if not 0 <= self.ctc_layer <= self.depth:
             raise ValueError("ctc_layer must be 0 (off) or the index of a generator block")
         if self.text_layout == "joined" and self.duration == "head":
@@ -92,6 +95,8 @@ class TrainConfig:
     batch_expansion: int = 1
     keep_every: int = 0
     ctc_weight: float = 0.0
+    contrastive_weight: float = 0.0  # skip/repeat text negatives (RobustSpeechFlow-style hinge)
+    contrastive_margin: float = 0.1  # required loss gap, relative to the positive loss
 
     def __post_init__(self):
         if self.worker_threads < 1 or self.prefetch_factor < 1:
@@ -129,6 +134,8 @@ class TrainConfig:
             raise ValueError("Invalid prompt fraction range or prompt dropout")
         if self.compile not in {False, True, "model"}:
             raise ValueError("compile must be false, true or model")
+        if self.contrastive_weight < 0 or self.contrastive_margin < 0:
+            raise ValueError("contrastive settings must be nonnegative")
         if self.batch_expansion < 1 or self.keep_every < 0 or self.ctc_weight < 0:
             raise ValueError("batch_expansion must be positive and keep_every nonnegative")
 

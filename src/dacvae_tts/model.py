@@ -131,12 +131,36 @@ class Block(nn.Module):
         self.ff = nn.Sequential(
             nn.Linear(d, d * cfg.ff_mult), nn.GELU(approximate="tanh"), nn.Linear(d * cfg.ff_mult, d)
         )
-        self.ada = nn.Sequential(nn.SiLU(), nn.Linear(d, d * 9))
-        nn.init.zeros_(self.ada[-1].weight)
-        nn.init.zeros_(self.ada[-1].bias)
+        if cfg.adaln_rank:
+            # Low-rank per-block correction on top of a modulation shared by every block
+            # (PixArt-alpha / EzAudio SOLA / Echo-TTS style); the up projection starts at zero.
+            self.ada_down = nn.Linear(d, cfg.adaln_rank)
+            self.ada_up = nn.Linear(cfg.adaln_rank, d * 9)
+            nn.init.zeros_(self.ada_up.weight)
+            nn.init.zeros_(self.ada_up.bias)
+        else:
+            self.ada = nn.Sequential(nn.SiLU(), nn.Linear(d, d * 9))
+            nn.init.zeros_(self.ada[-1].weight)
+            nn.init.zeros_(self.ada[-1].bias)
 
-    def forward(self, x, text, valid, text_valid, cond, self_angles=None, query_angles=None, key_angles=None):
-        params = self.ada(cond).unsqueeze(1).chunk(9, dim=-1)
+    def modulation(self, cond, shared):
+        if shared is None:
+            return self.ada(cond)
+        return shared + self.ada_up(F.silu(self.ada_down(cond)))
+
+    def forward(
+        self,
+        x,
+        text,
+        valid,
+        text_valid,
+        cond,
+        self_angles=None,
+        query_angles=None,
+        key_angles=None,
+        shared=None,
+    ):
+        params = self.modulation(cond, shared).unsqueeze(1).chunk(9, dim=-1)
         s1, b1, g1, s2, b2, g2, s3, b3, g3 = params
         h = self.norm1(x) * (1 + s1) + b1
         x = x + g1 * self.self_attn(h, h, valid, self_angles, self_angles)
@@ -159,6 +183,11 @@ class FlowTTS(nn.Module):
         self.time = nn.Sequential(nn.Linear(d, d), nn.SiLU(), nn.Linear(d, d))
         self.input = nn.Linear((2 * c + 1) * p, d)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.depth)])
+        self.ada_shared = None
+        if cfg.adaln_rank:
+            self.ada_shared = nn.Sequential(nn.SiLU(), nn.Linear(d, d * 9))
+            nn.init.zeros_(self.ada_shared[-1].weight)
+            nn.init.zeros_(self.ada_shared[-1].bias)
         self.output = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, c * p))
         nn.init.zeros_(self.output[-1].weight)
         nn.init.zeros_(self.output[-1].bias)
@@ -284,9 +313,10 @@ class FlowTTS(nn.Module):
         if time_embedding.shape != voice.shape:
             raise ValueError("Time embedding and reference summary must both be [B,D]")
         cond = time_embedding + voice
+        shared = self.ada_shared(cond) if self.ada_shared is not None else None
         ctc_logits = None
         for number, block in enumerate(self.blocks, 1):
-            args = (h, text, packed_valid, text_valid, cond, *angles)
+            args = (h, text, packed_valid, text_valid, cond, *angles, shared)
             h = (
                 checkpoint(block, *args, use_reentrant=False)
                 if self.grad_checkpoint and self.training
@@ -402,7 +432,14 @@ def flow_loss(
     if return_details:
         counts = mask.sum(1)
         rms = (sanitize(pred.float(), mask).square().sum((1, 2)) / (counts * pred.size(-1))).sqrt()
-        details = {"flow": losses, "times": time, "frames": counts, "prediction_rms": rms}
+        details = {
+            "flow": losses,
+            "times": time,
+            "frames": counts,
+            "prediction_rms": rms,
+            "noise": noise,
+            "drop": drop,
+        }
         if ctc is not None:
             details["ctc"] = ctc
         return details

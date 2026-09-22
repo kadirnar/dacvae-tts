@@ -22,7 +22,7 @@ from .diagnostics import ActivationProbe, gradient_contributions, gradient_group
 from .model import FlowTTS, flow_loss, reduce_flow
 from .optim import build_optimizer
 from .parallel import device_batches, loader_options
-from .text import BYTE_OFFSET
+from .text import BYTE_OFFSET, corrupt_transcript
 
 
 class Objective(nn.Module):
@@ -33,11 +33,38 @@ class Objective(nn.Module):
     Flow entries are then [B * expansion] while duration entries stay [B].
     """
 
-    def __init__(self, model, duration_weight=0.1, time_sampling="uniform", expansion=1, ctc_weight=0.0):
+    def __init__(
+        self,
+        model,
+        duration_weight=0.1,
+        time_sampling="uniform",
+        expansion=1,
+        ctc_weight=0.0,
+        contrastive_weight=0.0,
+        contrastive_margin=0.1,
+    ):
         super().__init__()
         self.model = model
         self.duration_weight, self.ctc_weight = duration_weight, ctc_weight
+        self.contrastive_weight, self.contrastive_margin = contrastive_weight, contrastive_margin
         self.time_sampling, self.expansion = time_sampling, expansion
+        self.rng = random.Random(0)
+
+    def negatives(self, batch):
+        """Corrupted transcripts [B,S'] plus a mask of the examples that could be corrupted."""
+        tokens, segments = batch["tokens"].cpu(), batch["segments"].cpu()
+        rows, usable = [], []
+        for row_tokens, row_segments in zip(tokens, segments):
+            corrupted = corrupt_transcript(row_tokens, row_segments, self.rng)
+            usable.append(corrupted is not None)
+            rows.append(corrupted if corrupted is not None else (row_tokens, row_segments))
+        width = max(len(t) for t, _ in rows)
+        padded_tokens = torch.zeros(len(rows), width, dtype=torch.int64)
+        padded_segments = torch.zeros(len(rows), width, dtype=torch.int64)
+        for i, (t, s) in enumerate(rows):
+            padded_tokens[i, : len(t)], padded_segments[i, : len(s)] = t, s
+        device = batch["tokens"].device
+        return padded_tokens.to(device), padded_segments.to(device), torch.tensor(usable, device=device)
 
     def forward(self, batch):
         cached = self.model.conditions(
@@ -67,12 +94,34 @@ class Objective(nn.Module):
             )
             duration_loss = F.smooth_l1_loss(duration.float(), log_rate, reduction="none")
         copies = flow.numel() // duration_loss.numel()
+        if self.contrastive_weight > 0 and self.training:
+            # Same audio, noise and time as each utterance's first draw, wrong transcript by one word:
+            # the true transcript must explain the audio better by a margin.
+            tokens, segments, usable = self.negatives(batch)
+            wrong = {**batch, "tokens": tokens, "segments": segments}
+            negative = flow_loss(
+                self.model,
+                wrong,
+                0,
+                details["times"][::copies],
+                details["noise"][::copies],
+                cached=self.model.conditions(batch["prompt"], batch["prompt_mask"], tokens, segments),
+            )
+            positive = flow[::copies]
+            hinge = F.relu(positive + self.contrastive_margin * positive.detach() - negative)
+            hinge = hinge.masked_fill(details["drop"][::copies] | ~usable, 0)
+            details["contrastive"] = hinge.repeat_interleave(copies) / copies
         total = flow + self.duration_weight * duration_loss.repeat_interleave(copies)
         return {"loss": total, "duration": duration_loss, **details}
 
     def auxiliary(self, losses):
         """Weighted auxiliary terms [B * expansion] that join the flow term in the optimized loss."""
-        return self.ctc_weight * losses["ctc"] if "ctc" in losses else None
+        terms = []
+        if "ctc" in losses:
+            terms.append(self.ctc_weight * losses["ctc"])
+        if "contrastive" in losses:
+            terms.append(self.contrastive_weight * losses["contrastive"])
+        return sum(terms) if terms else None
 
 
 def distributed_device(requested="auto"):
@@ -295,6 +344,8 @@ def train(args):
             cfg.train.time_sampling,
             cfg.train.batch_expansion,
             cfg.train.ctc_weight,
+            cfg.train.contrastive_weight,
+            cfg.train.contrastive_margin,
         ).train()
         raw_objective = objective  # compile/DDP wrap the module; helper methods stay reachable here
         eager_forward = model.forward
@@ -391,7 +442,7 @@ def train(args):
             for group in optimizer.param_groups:
                 group["lr"] = learning_rate
             optimizer.zero_grad(set_to_none=True)
-            metrics = torch.zeros(4, device=device)
+            metrics = torch.zeros(5, device=device)
             buckets = torch.zeros(9, 2, device=device)
             diagnostics = {}
             diagnose = cfg.train.diagnostics_every > 0 and step % cfg.train.diagnostics_every == 0
@@ -441,6 +492,9 @@ def train(args):
                         (losses["flow"].detach() * flow_weights).sum(),
                         losses["duration"].detach().sum(),
                         losses["ctc"].detach().sum() if "ctc" in losses else losses["flow"].new_zeros(()),
+                        losses["contrastive"].detach().sum()
+                        if "contrastive" in losses
+                        else losses["flow"].new_zeros(()),
                     ]
                 )
             norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -472,6 +526,7 @@ def train(args):
                         "flow": (metrics[1] / flow_denominator).item(),
                         "duration": (metrics[2] / denominator).item(),
                         "ctc": (metrics[3] / flow_examples).item(),
+                        "contrastive": (metrics[4] / flow_examples).item(),
                         "elapsed_seconds": time.monotonic() - last_time,
                         "valid_target_frames": int(frame_denominator),
                         "gradient_norm_before_clip": float(norm),

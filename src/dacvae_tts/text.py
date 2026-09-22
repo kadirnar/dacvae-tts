@@ -37,6 +37,47 @@ def tokenize(reference: str, target: str, version="unicode-v1", layout="segments
     return tokenize_bytes(ref, tgt, layout)
 
 
+SPACE = 32 + BYTE_OFFSET
+
+
+def corrupt_transcript(tokens, segments, rng):
+    """Return (tokens, segments) with one target word skipped or repeated, or None if impossible.
+
+    Skip/repeat negatives (RobustSpeechFlow, arXiv:2605.22083) give the model a transcript that is
+    wrong by exactly one word; it must then prefer the true transcript on the same audio.
+    """
+    tokens, segments = tokens.tolist(), segments.tolist()
+    target = [i for i, (t, s) in enumerate(zip(tokens, segments)) if s == 1 and t >= BYTE_OFFSET]
+    if not target:
+        return None
+    words, current = [], []
+    for i in target:
+        if tokens[i] == SPACE:
+            if current:
+                words.append(current)
+            current = []
+        else:
+            current.append(i)
+    if current:
+        words.append(current)
+    if len(words) < 2:
+        return None
+    word = rng.randrange(len(words))
+    first, last = words[word][0], words[word][-1]
+    if rng.random() < 0.5:  # skip: drop the word and one adjacent space
+        cut_start = first - 1 if first > 0 and tokens[first - 1] == SPACE else first
+        cut_end = (
+            last + 1 if cut_start == first and last + 1 < len(tokens) and tokens[last + 1] == SPACE else last
+        )
+        keep = [i for i in range(len(tokens)) if not cut_start <= i <= cut_end]
+        new_tokens = [tokens[i] for i in keep]
+        new_segments = [segments[i] for i in keep]
+    else:  # repeat: "the the"
+        new_tokens = tokens[: last + 1] + [SPACE] + tokens[first : last + 1] + tokens[last + 1 :]
+        new_segments = segments[: last + 1] + [1] + segments[first : last + 1] + segments[last + 1 :]
+    return torch.tensor(new_tokens, dtype=torch.int64), torch.tensor(new_segments, dtype=torch.int64)
+
+
 def tokenize_bytes(reference: bytes, target: bytes, layout="segments"):
     """Assemble cached normalized UTF-8 bytes without normalizing every training pair.
 

@@ -195,8 +195,31 @@ python scripts/monitor.py --run runs/nano --cache data/corpus/merged --cases 48 
 ```
 
 The shard script streams one Parquet file at a time (download, encode, delete), so the raw corpus
-never has to fit on disk, and it is restartable. Speech-quality results for this recipe are reported
-in the roadmap document as they become available; nothing here is a quality claim.
+never has to fit on disk, and it is restartable. For a multi-million-row corpus on an eight-GPU
+machine, `scripts/prepare_hf_8gpu.sh` runs one encoder per GPU (shards are dealt round-robin) and
+merges at the end; each shard is encoded in a fresh process, so memory stays flat over thousands of
+shards:
+
+```bash
+HF_TOKEN=... bash scripts/prepare_hf_8gpu.sh ORG/DATASET 1500 data/corpus \
+  --speaker-column speaker --quality-column quality_score --min-quality 55 --reject-digits \
+  --loudness -16 --max-seconds 20
+bash scripts/train_8gpu.sh configs/nano.yaml data/corpus/merged runs/nano --frame-budget 16000
+```
+
+Budget one encoder at roughly 200x real time per GPU (about 4.7 hours of audio per 85 seconds), so
+2,000 hours take about 1.3 hours on eight GPUs. `--frame-budget` sets the padded frames per rank and
+micro-batch: 8,000 fits 16 GB with the contrastive term, 16,000 needs about 20 GB.
+
+Two further changes were added on 22 September after the first 40k-update checkpoint (whose
+transcripts mostly failed by repeating or dropping a single word): `model.adaln_rank` replaces the
+per-block D→9D modulation with one shared modulation plus a rank-64 correction per block (the freed
+parameters bought width 384→448 at the same 51M budget), and `train.contrastive_weight` adds
+skip/repeat transcript negatives (arXiv:2605.22083): the same audio, noise and time are scored with a
+transcript that is wrong by one word, and the true transcript must win by a margin.
+
+Speech-quality results for this recipe are reported in the roadmap document as they become
+available; nothing here is a quality claim.
 
 ## Eight-GPU pretraining
 

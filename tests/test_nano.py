@@ -45,7 +45,10 @@ def nano_batch(prompts=(3, 0), frames=9):
 
 def randomized(model):
     for block in model.blocks:
-        torch.nn.init.normal_(block.ada[-1].weight, std=0.05)
+        last = block.ada_up if hasattr(block, "ada_up") else block.ada[-1]
+        torch.nn.init.normal_(last.weight, std=0.05)
+    if getattr(model, "ada_shared", None) is not None:
+        torch.nn.init.normal_(model.ada_shared[-1].weight, std=0.05)
     torch.nn.init.normal_(model.output[-1].weight, std=0.05)
     return model
 
@@ -164,3 +167,44 @@ def test_ctc_excludes_examples_without_text():
     assert not details["ctc"].any()  # every example lost its text: nothing to align
     details = flow_loss(model, batch, dropout=0.0, return_details=True)
     assert (details["ctc"] > 0).all()
+
+
+def test_corrupt_transcript_skips_or_repeats_one_word():
+    import random
+
+    from dacvae_tts.text import SPACE, corrupt_transcript
+
+    tokens, segments = tokenize_bytes(b"", b"one two three", "joined")
+    words = lambda t: bytes(int(v) - BYTE_OFFSET for v in t[1:-1]).decode()  # noqa: E731
+    seen = set()
+    for seed in range(40):
+        corrupted = corrupt_transcript(tokens, segments, random.Random(seed))
+        assert corrupted is not None
+        new_tokens, new_segments = corrupted
+        assert new_tokens.shape == new_segments.shape and (new_segments == 1).all()
+        assert new_tokens[0] == BOS and new_tokens[-1] == EOS
+        text = words(new_tokens)
+        assert text != "one two three" and "  " not in text and SPACE not in (new_tokens[1], new_tokens[-2])
+        seen.add(text)
+    assert {"two three", "one three", "one two"} & seen and {"one one two three", "one two two three"} & seen
+    assert corrupt_transcript(*tokenize_bytes(b"", b"single", "joined"), random.Random(0)) is None
+    # Segment layout: only the target transcript changes.
+    tokens, segments = tokenize_bytes(b"ref words", b"aa bb")
+    new_tokens, new_segments = corrupt_transcript(tokens, segments, random.Random(1))
+    assert torch.equal(new_tokens[: int((segments == 0).sum())], tokens[: int((segments == 0).sum())])
+
+
+def test_contrastive_and_low_rank_adaln():
+    model = randomized(FlowTTS(ModelConfig(**NANO, adaln_rank=8))).train()
+    assert model.ada_shared is not None and not hasattr(model.blocks[0], "ada")
+    batch = nano_batch(frames=64)
+    objective = Objective(model, expansion=2, ctc_weight=0.1, contrastive_weight=0.2).train()
+    losses = objective(batch)
+    assert losses["contrastive"].shape == (4,) and (losses["contrastive"] >= 0).all()
+    auxiliary = objective.auxiliary(losses)
+    (losses["loss"].mean() + auxiliary.mean()).backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+    assert model.ada_shared[-1].weight.grad.abs().sum() > 0
+    # No contrastive term outside training or when disabled.
+    assert "contrastive" not in Objective(model, contrastive_weight=0.2).eval()(batch)
+    assert "contrastive" not in Objective(model).train()(batch)

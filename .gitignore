@@ -13,3 +13,4 @@ outputs/
 build/
 dist/
 configs/local/
+checkpoints/
