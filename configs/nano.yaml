@@ -16,10 +16,10 @@ model:
   cond_dropout: 0.2        # F5-TTS: drop text+prompt 20%, prompt alone 30% (train.prompt_dropout)
   ctc_layer: 8
 train:
-  steps: 300000
+  steps: 200000
   batch_size: 96           # cap; the frame budget decides the real micro-batch
   accumulation: 1
-  learning_rate: 0.0006
+  learning_rate: 0.0008
   warmup: 2000
   weight_decay: 0.01
   optimizer: muon
@@ -33,7 +33,7 @@ train:
   validate_every: 1000
   log_every: 100
   grad_checkpoint: false
-  compile: false
+  compile: model          # generator only; falls back to eager on a compiler failure
   seed: 42
   flow_reduction: frame
   pairing: within
