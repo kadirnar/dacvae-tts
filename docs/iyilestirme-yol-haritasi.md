@@ -497,6 +497,25 @@ Okuma: Muon ilk ~1000 adımda geride başlıyor, P=1 ayarlarında 2000. adımdan
 
 ---
 
+## Ek C — 22 Eylül 2026: `Vyvo/en-dataset-3` üzerinde nano eğitim günlüğü
+
+Kullanıcının isteğiyle gerçek bir eğitim başlatıldı. Bu ek, koşu ilerledikçe güncellenir; buradaki sayılar **tek RTX 5070 Ti** üzerindeki ölçümlerdir.
+
+**Veri.** 876.668 podcast segmenti, 1.999,8 saat, 22,05 kHz stereo MP3, 28.047 konuşmacı etiketi (bölüm başına diarizasyon; %9'u tek kayıtlı), kalite puanı 50–100. Filtre: kalite ≥ 55, transkriptte rakam yok, ≤ 20 s → satırların %75,6'sı, **≈ 1.498 saat**. Metin ham; sayılar okunuş biçimine çevrilmediği için rakam içeren satırlar (%9) atıldı. Ses −16 LUFS'a normalize edilerek encode ediliyor (E1 uygulandı). Encode hızı: shard başına ~85 s (4,7 saat ses; ~200× gerçek zaman); 324 shard ≈ 7,7 saat.
+
+**Tarif (`configs/nano.yaml`, 49,9M parametre)** — bu belgedeki A1, A4, A5, B1, B2, B3, B5, C3, C6, C7, D1, E1, E6 maddeleri uygulandı: P=1; self-attention'da RoPE, cross-attention'da uzunluk-normalize RoPE (γ=10); QK-norm; text encoder'da 4 self-attention bloğu; EDM ön-koşullandırma; stratified logit-normal *t*; birleşik metin düzeni ve **aynı-cümle-içi prompt** (konuşmacı etiketi gerekmiyor; prompt = cümlenin ilk %10–60'ı, %30 prompt-dropout, %20 ortak dropout); süre = prompt konuşma hızı kuralı; 8. katmanda CTC başlığı (λ=0,1); Muon (LR 6–8e-4); batch expansion ×2; frame-ağırlıklı kayıp; EMA 0,9999 (ısınmalı); `keep_every` kalıcı snapshot'lar; CFG dalları tek forward'da.
+
+**Uygulanmayanlar:** A2 (Base boyutu — tek 16 GB GPU), A3 (düşük-rank AdaLN), A6 (referans encoder), B4 (ayrı metin/konuşmacı dropout — F5 tarzı ortak+prompt dropout tercih edildi), E3 (bant genişliği etiketi), E5 (metin normalizasyonu — rakamlı satırlar atıldı), F1'in SIM-o kısmı (standart WavLM-large SV modeli s3prl'ye bağımlı; SIM geliştirme modeliyle raporlanıyor).
+
+**Pilot 1** — 9 shard (43 saat), 12k adım, eager, frame bütçesi 8000 (×2 draw), encoder ile paylaşımlı GPU: 0,42 s/adım, tepe 9,4 GB. Kayıp: train flow 0,95→0,58, **val 0,84→0,659** (hâlâ düşüyor); CTC 6,5→0,00; gradyan normu 0,08–0,3. Görülmemiş 24 konuşmacıda WER (Whisper small.en) 1,31 / 1,12 / 1,04 / 1,06 (3k/6k/9k/12k), CER 0,91→0,78, SIM (codec-decoded prompt) 0,80→0,87. Yorum: akıcı, konuşmacıya benzer ama metinden bağımsız konuşma — **hizalama henüz oturmadı**; bu veri ve adım sayısında literatürle uyumlu. CTC kaybının sıfıra inmesi tek başına hizalama demek değil: LARoPE'lu cross-attention metni orantılı konumdan kopyalayarak da CTC'yi doyuruyor.
+
+**`torch.compile`:** 0,42 → 0,27 s/adım ve tepe bellek 9,4 → 5,6 GB (derleme 155 s). Bu sayede frame bütçesi 12000'e çıkarıldı.
+
+**Pilot 2** — 80 shard (~380 saat), 30k adım, compile, frame bütçesi 12000 (adım başına ~18k hedef frame ×2), LR 8e-4, 0,42 s/adım. Tam koşu, 324 shard bittiğinde bu checkpoint'ten `--init-from` ile sıcak başlatılacak.
+<!-- NANO-RUN-LOG -->
+
+---
+
 ## 5. Kaynaklar
 
 Yerel: [`model.py`](../src/dacvae_tts/model.py), [`training.py`](../src/dacvae_tts/training.py), [`data.py`](../src/dacvae_tts/data.py), [`inference.py`](../src/dacvae_tts/inference.py), [`posttrain.py`](../src/dacvae_tts/posttrain.py), [`metrics.py`](../src/dacvae_tts/metrics.py), [`codec.py`](../src/dacvae_tts/codec.py), [`prepare.py`](../src/dacvae_tts/prepare.py).
