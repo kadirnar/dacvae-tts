@@ -11,6 +11,7 @@ partitions are skipped, which makes the job restartable; merge the partitions af
 
 import argparse
 import json
+import multiprocessing
 import os
 import shutil
 import threading
@@ -20,7 +21,13 @@ from types import SimpleNamespace
 
 from huggingface_hub import hf_hub_download
 
-import dacvae_tts.prepare as prepare_module
+
+def encode_shard(options):
+    """Runs in a fresh process per shard: audio decoding leaked ~100 MB per shard when one
+    long-lived process handled the whole corpus, and a spawned process returns it all."""
+    import dacvae_tts.prepare as prepare_module
+
+    prepare_module.prepare(options)
 
 
 def shard_list(spec):
@@ -57,15 +64,7 @@ def main():
     root = Path(args.output).resolve()
     (root / "parts").mkdir(parents=True, exist_ok=True)
     token = os.environ.get("HF_TOKEN")
-    codec_class, codecs = prepare_module.Codec, {}
-
-    def cached_codec(*positional, **keywords):
-        key = json.dumps([positional, keywords], sort_keys=True, default=str)
-        if key not in codecs:
-            codecs[key] = codec_class(*positional, **keywords)
-        return codecs[key]
-
-    prepare_module.Codec = cached_codec  # one frozen encoder for the whole job
+    context = multiprocessing.get_context("spawn")
 
     def fetch(index):
         folder = root / "raw" / f"shard-{index:05d}"
@@ -109,36 +108,39 @@ def main():
         if part.exists():
             shutil.rmtree(part)  # an interrupted partition has no metadata.json and cannot be resumed
         started = time.time()
-        prepare_module.prepare(
-            SimpleNamespace(
-                manifest=str(folder),
-                output=str(part),
-                codec="facebook/dacvae-watermarked",
-                device=args.device,
-                text_column=args.text_column,
-                audio_column=args.audio_column,
-                speaker_column=args.speaker_column,
-                quality_column=args.quality_column,
-                min_quality=args.min_quality,
-                reject_digits=args.reject_digits,
-                loudness=args.loudness,
-                text_normalization="unicode-v1",
-                min_seconds=args.min_seconds,
-                max_seconds=args.max_seconds,
-                workers=args.workers,
-                worker_backend="thread",
-                worker_threads=1,
-                prefetch=4 * args.workers,
-                batch_size=4,  # batching does not speed this encoder up; keep memory low
-                bucket_size=1024,
-                batch_seconds=48.0,
-                precision="fp32",
-                no_fold_weight_norm=False,
-                shard_index=0,
-                num_shards=1,
-                seed=args.seed,
-            )
+        options = SimpleNamespace(
+            manifest=str(folder),
+            output=str(part),
+            codec="facebook/dacvae-watermarked",
+            device=args.device,
+            text_column=args.text_column,
+            audio_column=args.audio_column,
+            speaker_column=args.speaker_column,
+            quality_column=args.quality_column,
+            min_quality=args.min_quality,
+            reject_digits=args.reject_digits,
+            loudness=args.loudness,
+            text_normalization="unicode-v1",
+            min_seconds=args.min_seconds,
+            max_seconds=args.max_seconds,
+            workers=args.workers,
+            worker_backend="thread",
+            worker_threads=1,
+            prefetch=4 * args.workers,
+            batch_size=4,  # batching does not speed this encoder up; keep memory low
+            bucket_size=1024,
+            batch_seconds=48.0,
+            precision="fp32",
+            no_fold_weight_norm=False,
+            shard_index=0,
+            num_shards=1,
+            seed=args.seed,
         )
+        worker = context.Process(target=encode_shard, args=(options,))
+        worker.start()
+        worker.join()
+        if worker.exitcode != 0:
+            raise RuntimeError(f"shard {index} failed with exit code {worker.exitcode}")
         shutil.rmtree(folder)
         meta = json.loads((part / "metadata.json").read_text())
         record = {
