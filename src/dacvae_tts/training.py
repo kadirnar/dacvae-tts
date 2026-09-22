@@ -372,11 +372,14 @@ def train(args):
                 model.forward = eager_forward
                 objective = raw_objective
                 cfg.train.compile = False
+                # Eager activations need roughly twice the memory of the compiled graph; recompute
+                # them instead so a run sized for the compiled path survives the switch.
+                model.grad_checkpoint = True
                 print(
                     json.dumps(
                         {
                             "step": step + 1,
-                            "warning": "compiler failed; continuing eager",
+                            "warning": "compiler failed; continuing eager with activation checkpointing",
                             "error": str(error)[:300],
                         }
                     ),

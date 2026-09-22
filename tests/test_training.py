@@ -113,7 +113,7 @@ def test_warm_start_loads_weights_and_restarts_schedule(cache, tmp_path):
     assert all(torch.isfinite(b["model"][key]).all() for key in b["model"])
 
 
-def test_compiler_failure_falls_back_to_eager(cache, tmp_path, monkeypatch):
+def test_compiler_failure_falls_back_to_eager(cache, tmp_path, monkeypatch, capsys):
     import torch._inductor.exc as inductor
 
     from dacvae_tts import training
@@ -162,3 +162,4 @@ def test_compiler_failure_falls_back_to_eager(cache, tmp_path, monkeypatch):
     _, saved = load_model(tmp_path / "fallback" / "last.pt")
     assert saved["step"] == 4 and calls["count"] == 2  # compiled path abandoned after the failure
     assert Config.from_dict(saved["config"]).train.compile is False
+    assert any("activation checkpointing" in line for line in capsys.readouterr().out.splitlines())
