@@ -512,6 +512,19 @@ Kullanıcının isteğiyle gerçek bir eğitim başlatıldı. Bu ek, koşu ilerl
 **`torch.compile`:** 0,42 → 0,27 s/adım ve tepe bellek 9,4 → 5,6 GB (derleme 155 s). Bu sayede frame bütçesi 12000'e çıkarıldı.
 
 **Pilot 2** — 80 shard (~380 saat), 30k adım, compile, frame bütçesi 12000 (adım başına ~18k hedef frame ×2), LR 8e-4, 0,42 s/adım. Tam koşu, 324 shard bittiğinde bu checkpoint'ten `--init-from` ile sıcak başlatılacak.
+
+Pilot 2'de **hizalama oturmaya başladı** (görülmemiş 32 konuşmacı, Whisper small.en; prompt = aynı konuşmacının başka kaydı):
+
+| Adım | val flow | metin kazancı | WER | CER | SIM (codec-decoded) |
+|---:|---:|---:|---:|---:|---:|
+| 5.000 | 0,691 | 0,0046 | 1,21 | 0,86 | 0,85 |
+| 10.000 | 0,670 | 0,0131 | **0,87** | **0,63** | 0,88 |
+| 12.000 | 0,666 | 0,0146 | – | – | – |
+<!-- PILOT2-TABLE -->
+
+"Metin kazancı" = doğrulamada transkriptler örnekler arasında karıştırıldığında flow kaybındaki artış (aynı gürültü ve *t*); sıfırsa model metni kullanmıyor. Pilot 1'de 12k adımda ~0,001 ve WER ≈ 1,0 iken burada 10k adımda hedef metnin parçaları duyulur hale geldi. F5-small'un 100k+ güncellemede (adım başına ~10× daha fazla ses) hizalandığı düşünülürse, LARoPE + CTC + P=1 kombinasyonu bu ölçekte belirgin biçimde daha hızlı öğreniyor; kontrollü ablation yapılmadığı için hangi bileşenin ne kadar katkı verdiği ayrıştırılmadı.
+
+`torch.compile` (tüm objective) 1.100. adımda Inductor'da dinamik-şekil hatasıyla çöktü; yalnız üreticiyi derleyen `compile: model` (0,38–0,44 s/adım, tepe 9,2 GB) + derleyici hatasında eager'a düşme koruması ile devam edildi.
 <!-- NANO-RUN-LOG -->
 
 ---
