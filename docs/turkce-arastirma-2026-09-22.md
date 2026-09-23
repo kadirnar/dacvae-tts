@@ -279,3 +279,66 @@ Gerçek konuşmanın codec sonrası tavanı: WER %5,1 / CER %1,6, DNSMOS OVRL 3,
 **Demo Space:** `Vyvo/dacvae-tts-tr-demo` (ZeroGPU; VoiceHub ve kişisel hesapta Gradio Space için PRO gerekti → 402). Uygulama: checkpoint
 menüsü (tüm koşular), özel repo/dosya ile keyfi checkpoint yükleme, Whisper (HF transformers `openai/whisper-large-v3-turbo`; Space imajı CUDA 13 olduğundan faster-whisper/ctranslate2 çalışmadı)
 ile WER/CER doğrulama; uzaktan API testi geçti (yükleme ~3 s, üretim ~1 s, doğrulama WER 0).
+
+## 8. Demo iyileştirmeleri (23 Eylül 2026, öğleden sonra)
+
+Kullanıcı isteği: önceki analizde önerilen tüm demo iyileştirmeleri. Model aynı (`tr-w512-clean` 60k); değişen her şey
+çıkarım (inference) tarafı. Karar ölçütü yine yalnız Freya-TR-Eval (495 cümle, görülmemiş 24 konuşmacı; seed 42 = yayımlanan
+sayıların prompt seti, seed 1000 = ikinci, ayrık bir ses ve gürültü çekilişi → örneklem dışı doğrulama).
+
+**Sunum / altyapı (Space):**
+- Eski uygulama ZeroGPU'da her istekte Synthesizer'ı (DACVAE 431 MB yükleme + SHA-256 + deneme encode) ve Whisper'ı yeniden
+  kuruyordu: ~16 s istek / ~1 s üretim. Yeni `engine.py`: codec (tüm checkpoint'lerle paylaşılır), yayımlanan model, Whisper
+  turbo ve WavLM-SV açılışta `.to("cuda")` ile bir kez kurulur; ZeroGPU bunları paketleyip (2,8 GB, 2 s) worker açılışında
+  GPU'ya taşır. Diğer checkpoint'ler ana süreçte indirilip worker içinde yüklenir ve worker yaşadıkça önbellekte kalır.
+  Ölçülen: istek 3–10 s, GPU süresi 0,9–3 s (25 s'lik 3 parçalı metin + 2 aday: 9 s istek, 2,7 s GPU).
+- `spaces.GPU(duration=180)` yerine istek başına dinamik süre (tek cümle ~25–30 s); indirmeler GPU penceresinin dışında;
+  SSR kapalı (`ssr_mode=False`; loglardaki SSE "404 … response already started" hatası SSR/eski oturum kaynaklıydı).
+- Güvenlik: Space artık token kullanmıyor (tüm modeller public); özel depolar ziyaretçinin kendi OAuth girişiyle okunur,
+  dosya boyutu sınırı 1,6 GB, `torch.load(weights_only=True)`.
+
+**Metin ön işleme (`frontend.py`):** tarih (23.09.2026 → yirmi üç eylül iki bin yirmi altı), saat (09.30'da, 14:05),
+para birimleri (₺ $ € £, TL/USD/EUR + ek uyumu: 15.000 TL'dir → on beş bin liradır), birimler (km/sa → saatte … kilometre),
+kesirler (3/4 → dörtte üç), kısaltmalar (Dr., Prof., vb., vs.), kısaltma harflemesi (ABD'den → a be deden; NATO → nato),
+Roma rakamları, madde numaraları, e-posta/URL, emoji ve yabancı harfler. Freya cümlelerinin hiçbirini değiştirmez. Uzun
+metin cümle parçalarına bölünür (referans + parça ≈ eğitimdeki ≤ 20–25 s) ve parçalar tek toplu `sample()` çağrısında üretilir.
+Whisper doğrulamasında hipotez de aynı katmandan geçer (yazılı "ABD'den" ile okunuş "a be deden" eşleşsin diye).
+
+**Çıktı:** her parça kırpılır, kısa duraklarla birleştirilir; 10/20 ms fade, 120/200 ms boşluk, −16 LUFS (tepe ≤ −1 dBFS),
+16-bit PCM. Ölçüm: CFG arttıkça çıktı yüksek sesli ve decoder'ın tanh tavanına dayanıyor (dosyaların %79/98/100/100'ü g=3/4/5/6'da
+kırpılıyor, −15,8 → −13,0 LUFS; gerçek konuşma %12, −16,7 LUFS).
+
+**Freya-TR-Eval sonuçları (aynı checkpoint, g=5, 32 adım; WER/CER %):**
+
+| Ayar | s42 WER | s42 CER | SIM | DNSMOS | s1000 WER | s1000 CER |
+|---|---:|---:|---:|---:|---:|---:|
+| Prompt hızı kuralı (yayımlanan) | 4,32 | 2,50 | 0,946 | 2,89 | 4,40 | 2,20 |
+| Sabit 15 / 13 kar/s (eski "Sabit hız") | 5,96 / 5,40 | 3,39 / 3,69 | 0,944 / 0,946 | 2,89 / 2,98 | – | – |
+| Süre ×1,15 / ×1,3 (tüm prompt'lar) | 5,09 / 9,54 | 3,27 / 7,95 | 0,948 | 2,93 / 2,96 | – | – |
+| Hece kuralı | 4,76 | 2,39 | 0,946 | 2,90 | – | – |
+| Hızlı prompt sınırı (`clamp`: >17 kar/s → ~16) | 3,61 | 2,03 | 0,947 | 2,91 | 3,73 | 1,99 |
+| Süre tahmincisi (`predictor`) | 4,14 | 2,26 | 0,947 | 2,97 | 3,99 | 2,39 |
+| **`auto`** (<13 kar/s tahminci, >17 sınır; kesin simülasyon) | **3,61** | **1,81** | 0,947 | 2,92 | **3,50** | **1,91** |
+| Best-of-3 (kural süre; Whisper-turbo seçer) | 2,07 | 1,03 | 0,947 | 2,89 | – | – |
+| **`auto` + best-of-3 (demo varsayılanı)** | **1,59** | **0,72** | 0,947 | 2,93 | **1,92** | **0,72** |
+| CFG yalnız t < 0,7 | 4,42 | 2,53 | 0,945 | 2,92 | – | – |
+| CFG-rescale φ 0,7 | 5,16 | 2,70 | 0,950 | 2,92 | – | – |
+| APG η 0,5, momentum −0,3 | 4,96 | 2,68 | 0,949 | 2,96 | – | – |
+| Ayrı guidance metin 5 / konuşmacı 3 | 4,63 | 2,45 | 0,938 | 2,91 | – | – |
+| Ayrı guidance metin 5 / konuşmacı 7 | 5,14 | 2,65 | 0,947 | 2,81 | – | – |
+
+**Dersler**
+1. Süre, çıkarım tarafının en büyük kaldıracı. Prompt hızı kuralı normal (13–17 kar/s) prompt'larda en iyisi; hızlı podcast
+   prompt'ları çıktıyı aceleye getiriyor (hızlı grupta WER %7,5 → sınırla %3,2), yavaş prompt'lar (uzun duraklamalar) fazla
+   uzun hedef veriyor (tahminciyle %4,3 → %3,5, s1000). Tüm prompt'ları yavaşlatmak (×1,15/×1,3) veya sabit hız zararlı:
+   hedefin kare/byte oranı prompt'unkinden uzaklaştıkça LARoPE'nin metin–ses hizalama önvarsayımı sınırda kayıyor.
+   Süre tahmincisi (log-süre ridge regresyonu; hece, kelime, noktalama + prompt hızı) doğrulama çiftlerinde kuraldan çok daha
+   doğru (log-MAE 0,178 → 0,129) ama Freya'da yalnız uç prompt'larda kazandırıyor → `auto` karması. Eşikler (13/17) seed 42
+   verisinden önce belirlendi ve seed 1000'de doğrulandı.
+2. Kalan hataların çoğu gürültü çekilişine bağlı (kelime tekrarı, "bekleniyor muyumuş" gibi bölünmeler): best-of-3 WER'i
+   yarıya indiriyor; SIM/DNSMOS değişmiyor. Seçici (turbo) large-v3'ten damıtıldığı için kazancın bir kısmı ortak ASR
+   tercihlerini yansıtabilir; tek örnekli sayılar yine yayımlanan protokoldür.
+3. Yüksek CFG'nin doygunluğu (yüksek ses, tanh kırpılması) APG/rescale ile gideriliyor (kırpılan dosya %96 → %58/%22,
+   −13,9 → −16,3/−18,4 LUFS) ama WER bedeli var; varsayılan CFG 5 + çıkışta −16 LUFS normalizasyonu, APG seçenek olarak duruyor.
+   Bağımsız konuşmacı guidance'ı (üç dal) bu modelde yardımcı olmadı.
+4. Ham sonuçlar ve cümle bazında transkriptler: `VoiceHub/dacvae-tts-tr-w512-clean` → `demo-experiments/`.
