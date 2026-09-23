@@ -503,6 +503,14 @@ def merge(args):
         ).fetchone()
         if leakage:
             raise ValueError(f"Speaker appears across splits: {leakage[0]}")
+        if getattr(args, "drop_uids", None):
+            # Quality filtering after encoding (ASR CER / DNSMOS tails): a JSON list or one uid per line.
+            text = Path(args.drop_uids).read_text()
+            uids = json.loads(text) if text.lstrip().startswith("[") else [u.strip() for u in text.splitlines() if u.strip()]
+            db.executemany("DELETE FROM samples WHERE uid=?", [(u,) for u in uids])
+            dropped_uids = len(uids)
+        else:
+            dropped_uids = 0
         before = db.total_changes
         if not getattr(args, "keep_singletons", False):
             # Cross-utterance pairing needs a second recording; within-utterance prompting does not.
@@ -544,6 +552,8 @@ def merge(args):
                 "duplicates_removed": duplicates,
                 "conflicting_duplicates_dropped": conflicts,
                 "singleton_rows_removed": singletons,
+                "dropped_uids": dropped_uids,
+                "drop_uids_file": str(Path(args.drop_uids).resolve()) if getattr(args, "drop_uids", None) else None,
                 "singletons_kept": bool(getattr(args, "keep_singletons", False)),
                 "inputs": [str(Path(p).resolve()) for p in args.inputs],
                 "index_sha256": file_digest(out / "index.sqlite"),

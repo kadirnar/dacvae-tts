@@ -25,7 +25,9 @@ def main():
     p.add_argument("--audio-column", default="audio")
     p.add_argument("--speaker-column", default="speaker_id")
     p.add_argument(
-        "--text-normalization", choices=["unicode-v1", "english-explicit-v2"], default="unicode-v1"
+        "--text-normalization",
+        choices=["unicode-v1", "english-explicit-v2", "turkish-v1"],
+        default="unicode-v1",
     )
     p.add_argument("--min-seconds", type=float, default=1.0)
     p.add_argument("--max-seconds", type=float, default=15.0)
@@ -79,6 +81,7 @@ def main():
     p = sub.add_parser("merge", help="Merge partitions, deduplicate, check splits and calculate statistics")
     p.add_argument("--inputs", nargs="+", required=True)
     p.add_argument("--output", required=True)
+    p.add_argument("--drop-uids", help="File with uids (JSON list or one per line) to exclude from the merged cache")
     p.add_argument(
         "--drop-conflicting-duplicates",
         action="store_true",
@@ -140,6 +143,13 @@ def main():
     p.add_argument("--text", required=True)
     p.add_argument("--seconds", type=float)
     p.add_argument("--duration-scale", type=float, default=1.0)
+    p.add_argument(
+        "--duration-mode",
+        choices=["rule", "clamp", "syllable", "predictor", "auto"],
+        default="rule",
+        help="Target length for rule-duration models: prompt rate per byte, the same with fast prompts slowed, "
+        "per syllable, or the fitted duration predictor",
+    )
     p.add_argument("--compile", action="store_true")
     p.add_argument("--seed", type=int, default=42)
 
@@ -197,8 +207,8 @@ def main():
     p.add_argument("--no-speaker", action="store_true")
     p.add_argument(
         "--metric-normalization",
-        choices=["english-unicode-v2", "legacy-ascii-v1"],
-        default="english-unicode-v2",
+        choices=["english-unicode-v2", "legacy-ascii-v1", "turkish-v1"],
+        help="WER/CER text normalization (default: turkish-v1 for --language tr, else english-unicode-v2)",
     )
 
     p = sub.add_parser(
@@ -345,6 +355,18 @@ def add_inference_args(parser, steps=True):
         help="1 disables CFG; use 1 for a distilled model with baked-in guidance",
     )
     parser.add_argument("--sway", type=float, default=-1.0)
+    parser.add_argument(
+        "--guidance-until", type=float, default=1.0, help="Apply CFG only while t < this (t=0 noise); 0.5 = noisy half"
+    )
+    parser.add_argument("--noise-scale", type=float, default=1.0, help="Scale of the initial noise (Echo: 0.8-0.9)")
+    parser.add_argument("--guidance-from", type=float, default=0.0, help="Apply CFG only while t >= this")
+    parser.add_argument("--cfg-rescale", type=float, default=0.0, help="CFG rescale phi in [0,1] (against over-saturation)")
+    parser.add_argument("--apg-eta", type=float, default=1.0, help="APG weight of the parallel guidance component")
+    parser.add_argument("--apg-norm", type=float, default=0.0, help="APG cap on the per-element RMS of the guidance")
+    parser.add_argument("--apg-momentum", type=float, default=0.0, help="APG (reverse) momentum, e.g. -0.3")
+    parser.add_argument(
+        "--speaker-guidance", type=float, help="Independent speaker guidance scale (text guidance = --guidance)"
+    )
 
 
 if __name__ == "__main__":

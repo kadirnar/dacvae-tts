@@ -1,0 +1,116 @@
+{
+  "features": [
+    "bias",
+    "log_syllables",
+    "log_words",
+    "log_bytes",
+    "commas_per_word",
+    "stops_per_word",
+    "log_prompt_frames_per_syllable",
+    "log_prompt_frames_per_byte",
+    "log_prompt_frames"
+  ],
+  "weights": [
+    1.398669414731413,
+    0.3128783003634389,
+    0.12172889847547923,
+    0.40012928089109223,
+    0.3757590119992845,
+    0.0006658898651763806,
+    0.16372589606837432,
+    0.2392054593999452,
+    0.011747165419016364
+  ],
+  "metadata": {
+    "pairs": 64321,
+    "ridge": 0.001,
+    "cache": "/workspace/data/tr55/clean",
+    "train_pairs": 64321,
+    "validation_pairs": 1884,
+    "validation": [
+      {
+        "method": "rule_bytes",
+        "mae_log": 0.17789899997821013,
+        "bias_log": 0.0007866062057672764,
+        "median_relative_error": 0.13680334576018527,
+        "within_10pct": 0.3880042462845011,
+        "within_20pct": 0.6555201698513801,
+        "fast_prompts_mae_log": 0.25206174826622985,
+        "fast_prompts_bias_log": -0.23024606515867702,
+        "normal_prompts_mae_log": 0.13357424862418005,
+        "normal_prompts_bias_log": -0.030347160252772835,
+        "slow_prompts_mae_log": 0.2317895670719422,
+        "slow_prompts_bias_log": 0.1741610651157111
+      },
+      {
+        "method": "rule_syllables",
+        "mae_log": 0.18288153061077944,
+        "bias_log": 0.00045132978166118076,
+        "median_relative_error": 0.14236497388254876,
+        "within_10pct": 0.38057324840764334,
+        "within_20pct": 0.636411889596603,
+        "fast_prompts_mae_log": 0.25282486601414217,
+        "fast_prompts_bias_log": -0.23062721877588324,
+        "normal_prompts_mae_log": 0.14194103033552086,
+        "normal_prompts_bias_log": -0.03325922840125418,
+        "slow_prompts_mae_log": 0.23196676857949658,
+        "slow_prompts_bias_log": 0.17904435811686611
+      },
+      {
+        "method": "rule_bytes_clamp",
+        "mae_log": 0.16636551455560528,
+        "bias_log": 0.018315960984828294,
+        "median_relative_error": 0.1253106941382921,
+        "within_10pct": 0.4134819532908705,
+        "within_20pct": 0.6799363057324841,
+        "fast_prompts_mae_log": 0.16784048262209228,
+        "fast_prompts_bias_log": -0.10224100933018497,
+        "normal_prompts_mae_log": 0.13357424862418005,
+        "normal_prompts_bias_log": -0.030347160252772835,
+        "slow_prompts_mae_log": 0.2317895670719422,
+        "slow_prompts_bias_log": 0.1741610651157111
+      },
+      {
+        "method": "predictor",
+        "mae_log": 0.12926872186683452,
+        "bias_log": -0.011028479428697953,
+        "median_relative_error": 0.10253996037647983,
+        "within_10pct": 0.48991507430997877,
+        "within_20pct": 0.7956475583864119,
+        "fast_prompts_mae_log": 0.15962790998976797,
+        "fast_prompts_bias_log": -0.09826087324645652,
+        "normal_prompts_mae_log": 0.1149199596364969,
+        "normal_prompts_bias_log": -0.01911287609282594,
+        "slow_prompts_mae_log": 0.14367397976787377,
+        "slow_prompts_bias_log": 0.04703032721117001
+      }
+    ],
+    "train_fit": {
+      "method": "predictor_train",
+      "mae_log": 0.12386702494322767,
+      "bias_log": 0.01593737724427615,
+      "median_relative_error": 0.10312271266773093,
+      "within_10pct": 0.48635,
+      "within_20pct": 0.80115,
+      "fast_prompts_mae_log": 0.1167583861134445,
+      "fast_prompts_bias_log": 0.026156376417853382,
+      "normal_prompts_mae_log": 0.12067473726852562,
+      "normal_prompts_bias_log": 0.02070117521366515,
+      "slow_prompts_mae_log": 0.14338566341695894,
+      "slow_prompts_bias_log": -0.012581589201659563
+    },
+    "weights_by_feature": {
+      "bias": 1.398669414731413,
+      "log_syllables": 0.3128783003634389,
+      "log_words": 0.12172889847547923,
+      "log_bytes": 0.40012928089109223,
+      "commas_per_word": 0.3757590119992845,
+      "stops_per_word": 0.0006658898651763806,
+      "log_prompt_frames_per_syllable": 0.16372589606837432,
+      "log_prompt_frames_per_byte": 0.2392054593999452,
+      "log_prompt_frames": 0.011747165419016364
+    },
+    "frame_rate": 25,
+    "note": "log(target frames) ridge regression; see dacvae_tts/duration.py"
+  }
+}

@@ -1,0 +1,147 @@
+"""Re-transcribe every corpus clip with Whisper and score DNSMOS, for transcript/quality-based filtering.
+
+Writes OUTPUT/scores.jsonl with one row per clip: uid (matching the latent cache: "data/train-XXXXX.parquet:<row>"),
+given text, Whisper hypothesis, Turkish-normalized WER/CER, duration, quality_score, DNSMOS SIG/BAK/OVRL.
+Raon-OpenTTS / Emilia practice: cut the worst ~15% CER tail and DNSMOS OVRL < ~2.8-3.0 before the final training stage.
+
+  python scripts/transcribe_corpus.py --raw data/raw/data --output outputs/corpus-scores --device cuda --dnsmos models/sig_bak_ovr.onnx
+"""
+
+import argparse
+import io
+import json
+import multiprocessing as mp
+import time
+from pathlib import Path
+
+import numpy as np
+import pyarrow.parquet as pq
+import soundfile as sf
+from scipy.signal import resample_poly
+
+from dacvae_tts.metrics import DNSMOS, error_counts
+
+
+def decode(item):
+    uid, blob = item
+    try:
+        audio, sr = sf.read(io.BytesIO(blob), dtype="float32", always_2d=True)
+        audio = audio.mean(1)
+        if sr != 16000:
+            import math
+
+            g = math.gcd(sr, 16000)
+            audio = resample_poly(audio, 16000 // g, sr // g).astype(np.float32)
+        return uid, audio, None
+    except Exception as error:  # corrupt mp3 frames etc.
+        return uid, None, str(error)
+
+
+_dnsmos = None
+
+
+def dnsmos_worker(args):
+    global _dnsmos
+    path, uid, audio = args
+    if _dnsmos is None:
+        _dnsmos = DNSMOS(path)
+    try:
+        return uid, _dnsmos(audio)
+    except Exception as error:
+        return uid, {"dnsmos_error": str(error)}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--raw", required=True, help="Directory with train-XXXXX-of-XXXXX.parquet shards")
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--asr-model", default="large-v3")
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--language", default="tr")
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--dnsmos", help="Path to sig_bak_ovr.onnx")
+    parser.add_argument("--workers", type=int, default=16)
+    parser.add_argument("--limit", type=int, default=0, help="Rows per shard (0 = all), for smoke tests")
+    args = parser.parse_args()
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=True)
+    log = out / "scores.jsonl"
+    done = set()
+    if log.exists():
+        done = {json.loads(line)["uid"] for line in log.read_text().splitlines() if line.strip()}
+    import torch
+    from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+    # HF Whisper with true cross-clip batching: every clip is <= 30 s, i.e. exactly one Whisper window, so a batch of
+    # 32 clips is one generate() call. faster-whisper's batched pipeline only batches VAD segments *within* a clip.
+    hf_name = args.asr_model if "/" in args.asr_model else f"openai/whisper-{args.asr_model}"
+    processor = WhisperProcessor.from_pretrained(hf_name)
+    model = WhisperForConditionalGeneration.from_pretrained(hf_name, torch_dtype=torch.float16).to(args.device).eval()
+    pool = mp.get_context("spawn").Pool(args.workers)
+    files = sorted(Path(args.raw).glob("*.parquet"))
+    started = time.time()
+    total = 0
+
+    def transcribe(audios):
+        features = processor(audios, sampling_rate=16000, return_tensors="pt").input_features
+        with torch.inference_mode():
+            ids = model.generate(
+                features.to(args.device, torch.float16), language=args.language, task="transcribe",
+                num_beams=1, max_new_tokens=220,
+            )
+        return processor.batch_decode(ids, skip_special_tokens=True)
+
+    with open(log, "a") as stream:
+        for file in files:
+            name = f"data/{file.name}"
+            table = pq.read_table(file)
+            rows = table.to_pylist()
+            if args.limit:
+                rows = rows[: args.limit]
+            items = [(f"{name}:{i}", r["audio"]["bytes"]) for i, r in enumerate(rows) if f"{name}:{i}" not in done]
+            meta = {f"{name}:{i}": r for i, r in enumerate(rows)}
+            decoded = pool.map(decode, items, chunksize=8)
+            dnsmos_jobs = [(args.dnsmos, uid, audio) for uid, audio, err in decoded if err is None and audio is not None]
+            dnsmos_results = pool.map_async(dnsmos_worker, dnsmos_jobs, chunksize=4) if args.dnsmos else None
+            results = {}
+            usable = [(uid, audio) for uid, audio, err in decoded if err is None and audio is not None and len(audio) >= 1600]
+            for uid, audio, err in decoded:
+                if err is not None or audio is None or len(audio) < 1600:
+                    results[uid] = {"error": err or "too short"}
+            for start in range(0, len(usable), args.batch_size):
+                chunk = usable[start : start + args.batch_size]
+                hypotheses = transcribe([a for _, a in chunk])
+                for (uid, _), hypothesis in zip(chunk, hypotheses):
+                    hypothesis = hypothesis.strip()
+                    try:
+                        counts = error_counts(meta[uid]["text"], hypothesis, "turkish-v1")
+                    except ValueError as error:
+                        counts = {"error": str(error)}
+                    results[uid] = {"hypothesis": hypothesis, **counts}
+                if (start // args.batch_size) % 20 == 0:
+                    print(f"  {file.name}: {start + len(chunk)}/{len(usable)} transcribed, {(time.time() - started) / 60:.1f} min", flush=True)
+            if dnsmos_results is not None:
+                for uid, score in dnsmos_results.get():
+                    results.setdefault(uid, {}).update(score)
+            for uid, _ in items:
+                r = meta[uid]
+                record = {
+                    "uid": uid,
+                    "text": r["text"],
+                    "duration_seconds": r["duration_seconds"],
+                    "quality_score": r["quality_score"],
+                    "speaker": r["speaker"],
+                    **results.get(uid, {}),
+                }
+                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            stream.flush()
+            total += len(items)
+            elapsed = time.time() - started
+            print(f"{file.name}: {len(items)} rows, total {total}, {elapsed/60:.1f} min", flush=True)
+            del table, rows, decoded
+    pool.close()
+    pool.join()
+
+
+if __name__ == "__main__":
+    main()

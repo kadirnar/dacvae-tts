@@ -40,9 +40,23 @@ def select_cases(cache, count, seed, min_frames=75, max_frames=375):
     rng = random.Random(seed)
     rng.shuffle(speakers)
     index = {int(v): i for i, v in enumerate(data.ids)}
-    cases = []
-    for speaker in speakers:
-        prompt, target = rng.sample(by_speaker[speaker], 2)
+    cases, used = [], set()
+    # Round-robin over speakers so a small validation split (few diarized speaker labels) still yields
+    # `count` distinct (prompt, target) pairs; every target recording is used at most once.
+    for _ in range(count):
+        if not speakers:
+            break
+        speaker = speakers[len(cases) % len(speakers)] if speakers else None
+        for _attempt in range(len(speakers)):
+            speaker = speakers[(len(cases) + _attempt) % len(speakers)]
+            free = [r for r in by_speaker[speaker] if r[1] not in used]
+            if len(free) >= 1 and len(by_speaker[speaker]) >= 2:
+                target = rng.choice(free)
+                prompt = rng.choice([r for r in by_speaker[speaker] if r[1] != target[1]])
+                break
+        else:
+            break
+        used.add(target[1])
         cases.append(
             {
                 "speaker": speaker,
@@ -55,8 +69,6 @@ def select_cases(cache, count, seed, min_frames=75, max_frames=375):
                 "ground_truth_seconds": target[4] / 25,
             }
         )
-        if len(cases) >= count:
-            break
     return data, cases
 
 
@@ -70,11 +82,21 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--steps", type=int, default=16)
     parser.add_argument("--guidance", type=float, default=2.0)
+    parser.add_argument("--guidance-until", type=float, default=1.0, help="CFG only while t < this (0.5 = noisy half)")
+    parser.add_argument("--noise-scale", type=float, default=1.0)
+    parser.add_argument("--sway", type=float, default=-1.0)
+    parser.add_argument("--duration-scale", type=float, default=1.0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--language", default="en", help="Whisper language code")
     parser.add_argument("--asr-model", default="small.en")
     parser.add_argument("--asr-device", default="cpu")
+    parser.add_argument(
+        "--metric-normalization",
+        choices=["english-unicode-v2", "legacy-ascii-v1", "turkish-v1"],
+        help="WER/CER normalization (default follows --language: turkish-v1 for tr)",
+    )
     parser.add_argument("--speaker-model", default="microsoft/wavlm-base-plus-sv")
+    parser.add_argument("--dnsmos", help="Path to sig_bak_ovr.onnx; adds DNSMOS SIG/BAK/OVRL per case and to the summary")
     parser.add_argument("--once", action="store_true", help="Score the checkpoints present now, then exit")
     parser.add_argument("--checkpoint", help="Score one checkpoint file instead of watching the run")
     parser.add_argument("--poll", type=int, default=120)
@@ -93,11 +115,21 @@ def main():
     data, cases = select_cases(args.cache, args.cases, args.seed)
     (monitor / "cases.json").write_text(json.dumps(cases, indent=1))
     print(f"{len(cases)} cases from {len({c['speaker'] for c in cases})} held-out speakers", flush=True)
-    evaluator = Evaluator(args.asr_model, None, args.speaker_model, args.asr_device, language=args.language)
+    evaluator = Evaluator(
+        args.asr_model,
+        args.dnsmos,
+        args.speaker_model,
+        args.asr_device,
+        metric_normalization=args.metric_normalization,
+        language=args.language,
+    )
     scored = set()
     log = run / "monitor.jsonl"
     if log.exists():
-        scored = {json.loads(line)["checkpoint"] for line in log.read_text().splitlines() if line.strip()}
+        scored = {
+            (r["checkpoint"], r.get("guidance"), r.get("guidance_until", 1.0), r.get("noise_scale", 1.0), r.get("sway", -1.0), r.get("duration_scale", 1.0), r.get("sampler_steps"))
+            for r in (json.loads(line) for line in log.read_text().splitlines() if line.strip())
+        }
     prompts_written = False
     from dacvae_tts.tracking import Tracker
 
@@ -108,12 +140,14 @@ def main():
             checkpoints = [Path(args.checkpoint)]
         else:
             checkpoints = sorted(run.glob("step-*.pt"))
-        pending = [c for c in checkpoints if str(c) not in scored]
+        key = lambda c: (str(c), args.guidance, args.guidance_until, args.noise_scale, args.sway, args.duration_scale, args.steps)  # noqa: E731
+        pending = [c for c in checkpoints if key(c) not in scored]
         for checkpoint in pending:
             started = time.time()
             tts = Synthesizer(str(checkpoint), device=args.device)
             step = tts.checkpoint.get("step")
-            folder = monitor / checkpoint.stem
+            tag = "" if (args.guidance, args.guidance_until, args.noise_scale, args.sway, args.duration_scale, args.steps) == (2.0, 1.0, 1.0, -1.0, 1.0, 16) else f"-g{args.guidance:g}-u{args.guidance_until:g}-n{args.noise_scale:g}-s{args.sway:g}-d{args.duration_scale:g}-k{args.steps}"
+            folder = monitor / (checkpoint.stem + tag)
             folder.mkdir(parents=True, exist_ok=True)
             if not prompts_written:
                 for case in cases:  # decoded once: the same prompt audio for every checkpoint
@@ -138,6 +172,10 @@ def main():
                         steps=args.steps,
                         guidance=args.guidance,
                         seed=args.seed + number,
+                        sway=args.sway,
+                        guidance_until=args.guidance_until,
+                        noise_scale=args.noise_scale,
+                        duration_scale=args.duration_scale,
                     )
                 except ValueError as error:
                     rows.append({**case, "error": str(error)})
@@ -149,7 +187,11 @@ def main():
                     )
                     if original.exists():
                         prompt_wav = original
-                score = evaluator.score(output, case["text"], prompt_wav)
+                try:
+                    score = evaluator.score(output, case["text"], prompt_wav)
+                except (RuntimeError, ValueError, OSError) as error:  # ASR OOM, empty transcript, bad file
+                    rows.append({**case, "error": f"score: {error}"[:300]})
+                    continue
                 rows.append(
                     {
                         **case,
@@ -170,11 +212,18 @@ def main():
                 "wer": summary.get("wer"),
                 "cer": summary.get("cer"),
                 "speaker_similarity": summary.get("speaker_similarity"),
+                "dnsmos_ovrl": summary.get("dnsmos_ovrl"),
+                "dnsmos_sig": summary.get("dnsmos_sig"),
+                "dnsmos_bak": summary.get("dnsmos_bak"),
                 "duration_ratio_mean": float(np.mean([r["duration_ratio"] for r in good])) if good else None,
                 "rtf": summary.get("rtf"),
                 "asr_model": args.asr_model,
                 "similarity_reference": "original" if args.prompt_audio else "codec_decoded",
                 "guidance": args.guidance,
+                "guidance_until": args.guidance_until,
+                "noise_scale": args.noise_scale,
+                "sway": args.sway,
+                "duration_scale": args.duration_scale,
                 "sampler_steps": args.steps,
                 "seconds": time.time() - started,
             }
@@ -191,7 +240,7 @@ def main():
                     48000,
                     step=step,
                 )
-            scored.add(str(checkpoint))
+            scored.add(key(checkpoint))
             print(json.dumps(record), flush=True)
             del tts
             torch.cuda.empty_cache()
