@@ -342,7 +342,7 @@ veya kendi listeniz) WER/CER/benzerlik/DNSMOS hesaplar ve tüm sesleri zip olara
 ### API
 ```python
 from gradio_client import Client, handle_file
-client = Client("Vyvo/dacvae-tts-tr-demo")
+client = Client("Vyvo/dacvae-tts-tr-demo", token="hf_...")   # token: ZeroGPU kotası hesabınızdan kullanılır
 audio, info, text, metrics, transcript, reference = client.predict(
     handle_file("referans.wav"), "Referans kaydın tam transkripti.", "Söylenecek metin.",
     "Otomatik (önerilen)", 15, 3, 42, True,                       # hız modu, sabit hız, aday sayısı, seed, doğrulama
@@ -363,7 +363,9 @@ with gr.Blocks(title="DACVAE-TTS Türkçe") as demo:
         "3–15 saniyelik temiz bir Türkçe kayıt yükleyin; transkripti otomatik çıkarılır (düzeltebilirsiniz). Metniniz aynı "
         "sesle 48 kHz üretilir; uzun metinler cümlelere bölünür, sayılar ve semboller okunuşa çevrilir. "
         "Model: [VoiceHub/dacvae-tts-tr-w512](https://huggingface.co/VoiceHub/dacvae-tts-tr-w512) · 66,5M · Freya-TR-Eval WER "
-        "%4,3 (tek örnek) → **%1,6 bu demonun varsayılan ayarlarıyla** (otomatik hız + 3 aday; ayrıntı: Hakkında)."
+        "%4,3 (tek örnek) → **%1,6 bu demonun varsayılan ayarlarıyla** (otomatik hız + 3 aday; ayrıntı: Hakkında).\n\n"
+        "ℹ️ GPU kotası (ZeroGPU) Hugging Face hesabına göre verilir: siteye giriş yapmamış ziyaretçiler yalnızca birkaç istek "
+        "yapabilir, giriş yaptığınızda kendi kotanız kullanılır. API'de `Client(\"Vyvo/dacvae-tts-tr-demo\", token=\"hf_...\")` kullanın."
     )
     with gr.Tabs():
         with gr.Tab("🎙️ Sentez"):

@@ -11,7 +11,7 @@ import time
 from huggingface_hub import HfApi
 
 SPACE = "/workspace/release/space"
-IGNORE = ["__pycache__/*", "**/__pycache__/*", "*.pyc", "SPACE.md", "models/*", "flagged/*"]
+IGNORE = ["__pycache__/*", "**/__pycache__/*", "*.pyc", "SPACE.md", "models/*", "flagged/*", ".ruff_cache/*", ".ruff_cache/**"]
 
 
 def main():
