@@ -187,3 +187,12 @@ def test_synthesize_many_duration_modes_and_speaker_guidance(monkeypatch, cache,
     assert guided[0][0]["frames"] == results[0][0]["frames"]
     with pytest.raises(TypeError):
         tts.synthesize_many(texts, voice, unknown_option=1)
+
+
+def test_auto_duration_picks_the_rule_per_prompt_rate():
+    from dacvae_tts.duration import auto_mode
+
+    text = "Normal hızda konuşulmuş bir cümle."  # 34 characters
+    assert auto_mode(25 * 34 / 20, text) == "clamp"  # 20 chars/s
+    assert auto_mode(25 * 34 / 15, text) == "rule"
+    assert auto_mode(25 * 34 / 10, text) == "predictor"

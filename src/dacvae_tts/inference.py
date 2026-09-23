@@ -9,12 +9,12 @@ import torch
 
 from .codec import Codec, backend_options, check_compatibility, normalize_loudness, read_audio
 from .contracts import normalization_stats, target_mask
-from .duration import DurationPredictor, clamp_scale, rule_frames
+from .duration import DurationPredictor, auto_mode, clamp_scale, rule_frames
 from .model import sample, text_only_rows
 from .text import BYTE_OFFSET, normalize, tokenize
 from .training import autocast, load_model
 
-DURATION_MODES = ("rule", "clamp", "syllable", "predictor")
+DURATION_MODES = ("rule", "clamp", "syllable", "predictor", "auto")
 SAMPLER_OPTIONS = ("guidance_until", "guidance_from", "noise_scale", "cfg_rescale", "apg_eta", "apg_norm",
                    "apg_momentum", "speaker_guidance")
 
@@ -233,6 +233,9 @@ class Synthesizer:
         version = self.text_version
         reference_text, text = normalize(reference_text, version), normalize(text, version)
         profile = {"duration_rule": "reference_frames_per_byte", "duration_mode": duration_mode}
+        if duration_mode == "auto":
+            duration_mode = auto_mode(reference_frames, reference_text)
+            profile["duration_auto"] = duration_mode
         if duration_mode == "syllable":
             frames = rule_frames(reference_frames, reference_text, text, "syllables")
         elif duration_mode == "predictor":

@@ -161,7 +161,7 @@ def main():
     parser.add_argument("--duration-scale", type=float, default=1.0)
     parser.add_argument("--chars-per-second", type=float, default=0.0,
                         help="If > 0: fixed speaking rate; output seconds = normalized characters / rate instead of the prompt-rate rule")
-    parser.add_argument("--duration-mode", choices=["rule", "clamp", "syllable", "predictor"], default="rule")
+    parser.add_argument("--duration-mode", choices=["rule", "clamp", "syllable", "predictor", "auto"], default="rule")
     parser.add_argument("--guidance-from", type=float, default=0.0)
     parser.add_argument("--cfg-rescale", type=float, default=0.0)
     parser.add_argument("--apg-eta", type=float, default=1.0)

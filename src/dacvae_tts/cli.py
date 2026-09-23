@@ -145,7 +145,7 @@ def main():
     p.add_argument("--duration-scale", type=float, default=1.0)
     p.add_argument(
         "--duration-mode",
-        choices=["rule", "clamp", "syllable", "predictor"],
+        choices=["rule", "clamp", "syllable", "predictor", "auto"],
         default="rule",
         help="Target length for rule-duration models: prompt rate per byte, the same with fast prompts slowed, "
         "per syllable, or the fitted duration predictor",

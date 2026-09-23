@@ -10,6 +10,8 @@ ways to turn (prompt frames, prompt transcript, target text) into target frames 
 - `predictor`: log-linear regression fitted on same-speaker (prompt, target) pairs of the corpus
   (`scripts/train_duration.py`), using syllables (Turkish vowels), words and punctuation of the target and the
   prompt's speaking rate. It learns how strongly a prompt's rate carries over to a new sentence.
+- `auto`: the rule where it works and a correction where it does not. On Freya-TR-Eval the rule is best for prompts
+  of 13-17 characters/s; slow prompts (long pauses) get the predictor and fast prompts the clamp.
 """
 
 import json
@@ -20,6 +22,7 @@ from pathlib import Path
 
 VOWELS = set("aeıioöuüâîûAEIİOÖUÜÂÎÛ")
 FRAME_RATE = 25.0  # DACVAE latent frames per second
+AUTO_SLOW, AUTO_FAST = 13.0, 17.0  # prompt speaking-rate bounds of `auto` (normalized characters per second)
 
 
 def units(text):
@@ -51,6 +54,12 @@ def clamp_scale(reference_frames, reference_text, threshold=17.0, target=16.0, m
     if rate <= threshold:
         return 1.0
     return min(rate / target, max_scale)
+
+
+def auto_mode(reference_frames, reference_text):
+    """Which rule `auto` applies to this prompt: predictor (slow), rule (normal) or clamp (fast)."""
+    rate = speaking_rate(reference_frames, reference_text)
+    return "predictor" if rate < AUTO_SLOW else ("clamp" if rate > AUTO_FAST else "rule")
 
 
 def features(reference_frames, reference_text, text):

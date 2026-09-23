@@ -89,6 +89,25 @@ The remaining errors are single-word repeats and drops; the contrastive term tar
 not yet been evaluated at scale. Full numbers and the reasoning behind every choice:
 [docs/iyilestirme-yol-haritasi.md](docs/iyilestirme-yol-haritasi.md) (Turkish).
 
+## Turkish model and demo
+
+`configs/nano_tr_w512.yaml` trained on `Vyvo/tr-dataset-12` gives the published Turkish model
+[VoiceHub/dacvae-tts-tr-w512](https://huggingface.co/VoiceHub/dacvae-tts-tr-w512) (66.5M, Freya-TR-Eval WER 4.3% with the
+plain prompt-rate rule) and the demo [Vyvo/dacvae-tts-tr-demo](https://huggingface.co/spaces/Vyvo/dacvae-tts-tr-demo).
+Serving pieces used by the demo, all usable from Python and the CLI:
+
+- `dacvae_tts.frontend.speakable(text)`: free Turkish text to speakable words (dates, clock times, currencies, units,
+  abbreviations, acronyms, symbols, emoji removal) before the `turkish-v1` normalization; `split_sentences` for long text.
+- `--duration-mode rule|clamp|predictor|syllable|auto` (`Synthesizer.synthesize(..., duration_mode=...)`): target length
+  from the prompt rate, with fast prompts slowed (`clamp`), a fitted predictor (`scripts/train_duration.py`) or the
+  prompt-rate-dependent choice of the two (`auto`).
+- Sampler options: `--guidance-from/--guidance-until` (interval CFG), `--cfg-rescale`, `--apg-eta/--apg-norm/--apg-momentum`
+  and `--speaker-guidance` (independent text/speaker guidance with a prompt-free branch).
+- `Synthesizer.synthesize_many(texts, voice, candidates=N)`: sentence chunks and best-of-N candidates in padded batches.
+- `scripts/eval_sentences.py` takes the same options plus `--candidates N` (Whisper-ranked best-of-N).
+
+Results and decisions (Turkish): [docs/turkce-arastirma-2026-09-22.md](docs/turkce-arastirma-2026-09-22.md).
+
 ## More
 
 - [docs/reference.md](docs/reference.md): the detailed reference (all commands, flags, Tiny/Small
