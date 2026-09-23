@@ -15,6 +15,10 @@ from .data import jsonl
 
 
 def metric_text(text, version="english-unicode-v2"):
+    if version == "turkish-v1":
+        from .turkish import metric_text_turkish
+
+        return metric_text_turkish(text)
     text = unicodedata.normalize("NFKC", text).lower().replace("’", "'")
     if version == "legacy-ascii-v1":
         text = re.sub(r"[^a-z0-9'\s]", " ", text)
@@ -85,7 +89,12 @@ class DNSMOS:
     def __init__(self, model_path):
         import onnxruntime as ort
 
-        self.session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        options = ort.SessionOptions()
+        # One thread per session: DNSMOS is run from many worker processes at once; per-process thread pools
+        # sized to every core oversubscribe the CPU and starve concurrent training data loaders.
+        options.intra_op_num_threads = 1
+        options.inter_op_num_threads = 1
+        self.session = ort.InferenceSession(str(model_path), options, providers=["CPUExecutionProvider"])
         self.input_name = self.session.get_inputs()[0].name
 
     def __call__(self, audio):
@@ -122,10 +131,13 @@ class Evaluator:
         dnsmos_model=None,
         speaker_model="microsoft/wavlm-base-plus-sv",
         device="cpu",
-        metric_normalization="english-unicode-v2",
+        metric_normalization=None,
         language="en",
     ):
         self.language = language
+        if metric_normalization is None:
+            # Turkish needs its own case folding (İ/ı) and number spelling; English keeps the old default.
+            metric_normalization = "turkish-v1" if language == "tr" else "english-unicode-v2"
         from faster_whisper import WhisperModel
 
         self.asr = WhisperModel(
@@ -204,7 +216,7 @@ def evaluate(args):
         args.dnsmos_model,
         None if args.no_speaker else args.speaker_model,
         args.device,
-        getattr(args, "metric_normalization", "english-unicode-v2"),
+        getattr(args, "metric_normalization", None),
         getattr(args, "language", "en"),
     )
     out = Path(args.output)

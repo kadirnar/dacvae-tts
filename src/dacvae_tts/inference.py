@@ -136,6 +136,8 @@ class Synthesizer:
         guidance=1.5,
         seed=42,
         sway=-1.0,
+        guidance_until=1.0,
+        noise_scale=1.0,
     ):
         """Use text + ref_audio; no speaker ID, enrollment table, or per-voice fine-tuning."""
         if (ref_audio is None) == (reference is None):
@@ -144,7 +146,7 @@ class Synthesizer:
         reused = reference is not None
         reference = reference or self.prepare_reference(ref_audio, reference_text)
         batch = self.make_batch(reference.latents, reference.transcript, text, seconds, duration_scale)
-        audio, _, metadata = self.generate(batch, steps, guidance, seed, sway)
+        audio, _, metadata = self.generate(batch, steps, guidance, seed, sway, guidance_until, noise_scale)
         self._sync()
         metadata.update(
             request_seconds=time.perf_counter() - started,
@@ -222,7 +224,7 @@ class Synthesizer:
         }
 
     @torch.inference_mode()
-    def generate(self, batch, steps=16, guidance=1.5, seed=0, sway=-1):
+    def generate(self, batch, steps=16, guidance=1.5, seed=0, sway=-1, guidance_until=1.0, noise_scale=1.0):
         if batch["prompt"].size(0) != 1:
             raise ValueError(
                 "Waveform generation currently accepts a single request; sample() supports batches"
@@ -251,6 +253,8 @@ class Synthesizer:
                     sway=sway,
                     stats=sampler_stats,
                     condition_cache=(text, text_valid, voice),
+                    guidance_until=guidance_until,
+                    noise_scale=noise_scale,
                 ),
                 stages,
                 "iterative_generation_seconds",
@@ -308,5 +312,7 @@ def infer(args):
         guidance=args.guidance,
         seed=args.seed,
         sway=args.sway,
+        guidance_until=getattr(args, "guidance_until", 1.0),
+        noise_scale=getattr(args, "noise_scale", 1.0),
     )
     print(json.dumps(result.metadata, indent=2))

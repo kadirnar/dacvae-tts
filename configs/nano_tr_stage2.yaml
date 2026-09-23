@@ -1,0 +1,49 @@
+# Stage 2: warm start (--init-from) from a 40k checkpoint on the clean cache, lower LR, batch expansion 4, frame budget 7000.
+# Same 51M architecture; the schedule is shorter because the corpus is ~10x smaller than the English run.
+model:
+  width: 448
+  depth: 12
+  heads: 7
+  text_depth: 4
+  text_attention: 4
+  patch_size: 1
+  latent_dim: 128
+  positions: rope
+  qk_norm: true
+  prediction: edm
+  text_layout: joined
+  duration: rule
+  cond_dropout: 0.2
+  ctc_layer: 8
+  adaln_rank: 64
+train:
+  steps: 20000
+  batch_size: 96
+  accumulation: 1
+  learning_rate: 0.0004
+  warmup: 500
+  weight_decay: 0.01
+  optimizer: muon
+  muon_momentum: 0.95
+  ema_decay: 0.9999
+  precision: bf16
+  workers: 4
+  prefetch_factor: 4
+  checkpoint_every: 1000
+  keep_every: 2500
+  validate_every: 1000
+  log_every: 100
+  grad_checkpoint: true    # eager on 24 GB needs recomputation at frame budget 12000
+  compile: false           # generator-only compile spent >15 min on the first step here (dynamic-shape recompiles); eager + checkpointing instead
+  seed: 42
+  flow_reduction: frame
+  pairing: within
+  prompt_fraction_min: 0.1
+  prompt_fraction_max: 0.6
+  prompt_dropout: 0.3
+  time_sampling: logit_normal
+  batch_expansion: 4       # run B (Ke=4) led run A (Ke=2) by 0.02-0.04 WER at 25k-30k updates and kept SIM higher
+  ctc_weight: 0.1
+  contrastive_weight: 0.2
+  contrastive_margin: 0.1
+  wandb_project: dacvae-tts-tr

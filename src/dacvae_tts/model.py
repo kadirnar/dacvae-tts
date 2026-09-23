@@ -505,15 +505,26 @@ def sample(
     initial_noise=None,
     stats=None,
     condition_cache=None,
+    guidance_until=1.0,
+    noise_scale=1.0,
 ):
+    """Euler sampler with classifier-free guidance.
+
+    `guidance_until` restricts guidance to flow times t < guidance_until (t=0 is noise): Echo/Irodori apply
+    guidance only on the noisy half of the trajectory (cfg_min_t 0.5 in their reversed convention), which
+    keeps the alignment benefit at roughly half the extra forward passes. `noise_scale` shrinks the initial
+    noise (Echo's 0.8-0.9 "truncation"), an unprincipled but often artifact-reducing knob.
+    """
     if steps < 1 or not -1 <= sway <= 0 or not math.isfinite(guidance) or guidance < 0:
         raise ValueError("Invalid sampler settings")
+    if not 0 < guidance_until <= 1 or not 0 < noise_scale <= 1.5:
+        raise ValueError("guidance_until must lie in (0,1] and noise_scale in (0,1.5]")
     gen = torch.Generator(device=prompt.device).manual_seed(seed)
     audio_shapes(prompt, prompt, prompt_mask, valid, prompt.size(-1))
     mask = mask_values(valid, prompt_mask)
     prompt = sanitize(prompt, prompt_mask)
     x = (
-        torch.randn(prompt.shape, device=prompt.device, dtype=prompt.dtype, generator=gen)
+        torch.randn(prompt.shape, device=prompt.device, dtype=prompt.dtype, generator=gen) * noise_scale
         if initial_noise is None
         else initial_noise.clone()
     )
@@ -545,9 +556,10 @@ def sample(
             ),
         )
     trajectory = [x.clone()] if return_trajectory else None
+    guided_steps = 0
     for t0, t1 in zip(times[:-1], times[1:]):
         t = t0.expand(x.size(0))
-        if guidance == 1:
+        if guidance == 1 or float(t0) >= guidance_until:
             v = to_velocity(
                 model, model(x, t, prompt, prompt_mask, valid, tokens, segments, cached=cond), x, t
             )
@@ -555,6 +567,7 @@ def sample(
             both = torch.cat([x, x.masked_fill(prompt_mask[..., None], 0)])
             v, u = to_velocity(model, model(both, t.repeat(2), **pair), both, t.repeat(2)).chunk(2)
             v = u + guidance * (v - u)
+            guided_steps += 1
         x = x + (t1 - t0) * sanitize(v, mask)
         x = sanitize(torch.where(prompt_mask[..., None], prompt, x), valid)
         if trajectory is not None:
@@ -562,7 +575,9 @@ def sample(
     if stats is not None:
         stats.update(
             forward_calls=steps,
-            branch_evaluations=steps * (1 if guidance == 1 else 2),
+            branch_evaluations=steps + guided_steps,
+            guidance_until=guidance_until,
+            noise_scale=noise_scale,
             time_grid=times.cpu().tolist(),
             solver="euler",
         )

@@ -42,7 +42,12 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--repo", required=True)
+    parser.add_argument("--repo", required=True, help="ORG/DATASET, or anything with --local-dir")
+    parser.add_argument("--local-dir", help="Use already downloaded shards from this directory (not deleted)")
+    parser.add_argument(
+        "--text-normalization", choices=["unicode-v1", "english-explicit-v2", "turkish-v1"], default="unicode-v1"
+    )
+    parser.add_argument("--languages", default="any", help="Comma-separated accepted language tags, or any")
     parser.add_argument("--pattern", default="data/train-{index:05d}-of-{total:05d}.parquet")
     parser.add_argument("--total", type=int, required=True, help="Number of shards in the repository")
     parser.add_argument("--shards", required=True, help="For example 0-99 or 0-9,50,60-69")
@@ -78,6 +83,18 @@ def main():
     def fetch(index):
         folder = root / "raw" / f"shard-{index:05d}"
         name = args.pattern.format(index=index, total=args.total)
+        if args.local_dir:
+            # Mirror the download layout (a folder holding data/train-XXXXX.parquet) with a symlink, so
+            # row ids stay "data/train-XXXXX.parquet:<row>" and remain unique across shards at merge time.
+            source = (Path(args.local_dir) / name).resolve()
+            if not source.exists():
+                raise FileNotFoundError(source)
+            link = folder / name
+            link.parent.mkdir(parents=True, exist_ok=True)
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            link.symlink_to(source)
+            return folder
         for attempt in range(6):
             try:
                 hf_hub_download(args.repo, name, repo_type="dataset", token=token, local_dir=folder)
@@ -132,7 +149,8 @@ def main():
             min_quality=args.min_quality,
             reject_digits=args.reject_digits,
             loudness=args.loudness,
-            text_normalization="unicode-v1",
+            text_normalization=args.text_normalization,
+            languages={"any"} if args.languages == "any" else set(args.languages.split(",")),
             min_seconds=args.min_seconds,
             max_seconds=args.max_seconds,
             workers=args.workers,
@@ -155,7 +173,7 @@ def main():
         worker.join()
         if worker.exitcode != 0:
             raise RuntimeError(f"shard {index} failed with exit code {worker.exitcode}")
-        shutil.rmtree(folder)
+        shutil.rmtree(folder)  # with --local-dir this only removes the symlink folder
         meta = json.loads((part / "metadata.json").read_text())
         record = {
             "shard": index,
