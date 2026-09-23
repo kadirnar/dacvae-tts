@@ -40,6 +40,60 @@ def load_sentences(path, limit=0):
     return rows[:limit] if limit else rows
 
 
+class HFWhisper:
+    """Batched transformers Whisper (fp16) used to rank best-of-N candidates."""
+
+    def __init__(self, name, device, language):
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+        self.processor = WhisperProcessor.from_pretrained(name)
+        self.model = WhisperForConditionalGeneration.from_pretrained(name, dtype=torch.float16).to(device).eval()
+        self.device, self.language = device, language
+
+    @torch.inference_mode()
+    def transcribe(self, audios, sample_rate):
+        from scipy.signal import resample_poly
+
+        clips = [resample_poly(a, 16000 // 1000, sample_rate // 1000).astype(np.float32) for a in audios]
+        features = self.processor(clips, sampling_rate=16000, return_tensors="pt").input_features
+        ids = self.model.generate(features.to(self.device, torch.float16), language=self.language, task="transcribe",
+                                  num_beams=1, max_new_tokens=220)
+        return [t.strip() for t in self.processor.batch_decode(ids, skip_special_tokens=True)]
+
+
+def best_of_n(tts, selector, text, voice, path, seconds, index, args, sampler):
+    """Synthesize N candidates in one batch; keep the lowest selector CER (ties: lowest WER, then first)."""
+    from dacvae_tts.metrics import error_counts
+
+    results, metadata = tts.synthesize_many(
+        [text], voice, candidates=args.candidates, seconds=seconds, duration_scale=args.duration_scale,
+        duration_mode=args.duration_mode, steps=args.steps, guidance=args.guidance, seed=args.seed + index,
+        sway=args.sway, guidance_until=args.guidance_until, noise_scale=args.noise_scale, **sampler,
+    )
+    candidates = results[0]
+    hypotheses = selector.transcribe([c["audio"] for c in candidates], tts.codec.sample_rate)
+    scores = [error_counts(text, h, "turkish-v1") for h in hypotheses]
+    best = min(range(len(candidates)), key=lambda k: (scores[k]["cer"], scores[k]["wer"], k))
+    audio = candidates[best]["audio"]
+    sf.write(path, audio, tts.codec.sample_rate, subtype="FLOAT")
+    meta = {**metadata, "selected": best, "candidate_cer": [s["cer"] for s in scores], "candidate_hypotheses": hypotheses,
+            "audio_seconds": len(audio) / tts.codec.sample_rate}
+    path.with_suffix(".json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+    return {"audio_seconds": meta["audio_seconds"], "rtf": metadata["request_seconds"] / max(meta["audio_seconds"], 1e-6),
+            "selected": best, "candidate_cer": meta["candidate_cer"]}
+
+
+def audio_stats(path):
+    """Full-band level statistics of one synthesis: samples at the decoder's tanh ceiling and integrated loudness."""
+    import pyloudnorm
+
+    audio, rate = sf.read(str(path), dtype="float64", always_2d=True)
+    audio = audio.mean(1)
+    loudness = pyloudnorm.Meter(rate).integrated_loudness(audio) if len(audio) >= 0.4 * rate else float("nan")
+    return {"peak": float(np.abs(audio).max()), "clip_fraction": float(np.mean(np.abs(audio) >= 0.999)),
+            "lufs": float(loudness) if np.isfinite(loudness) else -70.0}
+
+
 def score_hf(rows, out, args):
     """Batched GPU scoring: transformers Whisper (greedy) for WER/CER, WavLM-SV similarity and DNSMOS per clip."""
     from transformers import WhisperForConditionalGeneration, WhisperProcessor
@@ -107,6 +161,16 @@ def main():
     parser.add_argument("--duration-scale", type=float, default=1.0)
     parser.add_argument("--chars-per-second", type=float, default=0.0,
                         help="If > 0: fixed speaking rate; output seconds = normalized characters / rate instead of the prompt-rate rule")
+    parser.add_argument("--duration-mode", choices=["rule", "clamp", "syllable", "predictor"], default="rule")
+    parser.add_argument("--guidance-from", type=float, default=0.0)
+    parser.add_argument("--cfg-rescale", type=float, default=0.0)
+    parser.add_argument("--apg-eta", type=float, default=1.0)
+    parser.add_argument("--apg-norm", type=float, default=0.0)
+    parser.add_argument("--apg-momentum", type=float, default=0.0)
+    parser.add_argument("--speaker-guidance", type=float, default=None)
+    parser.add_argument("--candidates", type=int, default=1,
+                        help="Best-of-N: generate N candidates per sentence and keep the one the selector ASR transcribes best")
+    parser.add_argument("--selector", default="openai/whisper-large-v3-turbo", help="HF Whisper used for best-of-N selection")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--language", default="tr")
     parser.add_argument("--asr-model", default="large-v3")
@@ -125,7 +189,9 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     sentences = load_sentences(args.sentences, args.limit)
     data, cases = select_cases(args.cache, args.prompts, args.seed)
-    tts = None if (args.rescore and (out / "results.jsonl").exists()) else Synthesizer(args.checkpoint, device=args.device)
+    wavs_exist = all((out / f"{s['id']}.wav").exists() for s in sentences)
+    reuse = args.rescore and ((out / "results.jsonl").exists() or wavs_exist)
+    tts = None if reuse else Synthesizer(args.checkpoint, device=args.device)
     prompts = []
     for number, case in enumerate(cases):
         latents = data.row(case["prompt_index"])["latents"]
@@ -135,10 +201,21 @@ def main():
         prompts.append((VoiceReference(latents, case["prompt_text"], "cache", {}), wav, case["speaker"]))
     rows = []
     started = time.time()
-    if tts is None:  # rescore: reuse the synthesis rows (audio paths, prompts, durations) from the previous pass
+    sampler = dict(guidance_from=args.guidance_from, cfg_rescale=args.cfg_rescale, apg_eta=args.apg_eta,
+                   apg_norm=args.apg_norm, apg_momentum=args.apg_momentum, speaker_guidance=args.speaker_guidance)
+    if tts is None and (out / "results.jsonl").exists():  # rescore: reuse the synthesis rows of the previous pass
         previous = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines() if line.strip()]
         rows = [{k: v for k, v in r.items() if k in {"id", "text", "speaker", "prompt", "audio", "audio_seconds", "rtf", "error"}} for r in previous]
         sentences = []
+    elif tts is None:  # rescore an interrupted pass: rebuild the rows from the WAVs and their JSON sidecars
+        for index, sentence in enumerate(sentences):
+            _, prompt_wav, speaker = prompts[index % len(prompts)]
+            path = out / f"{sentence['id']}.wav"
+            meta = json.loads(path.with_suffix(".json").read_text()) if path.with_suffix(".json").exists() else {}
+            rows.append({**sentence, "speaker": speaker, "prompt": prompt_wav.name, "audio": str(path),
+                         "audio_seconds": meta.get("audio_seconds", sf.info(str(path)).duration), "rtf": meta.get("rtf")})
+        sentences = []
+    selector = HFWhisper(args.selector, args.device, args.language) if args.candidates > 1 and sentences else None
     for index, sentence in enumerate(sentences):
         voice, prompt_wav, speaker = prompts[index % len(prompts)]
         path = out / f"{sentence['id']}.wav"
@@ -148,16 +225,22 @@ def main():
                 from dacvae_tts.text import normalize
 
                 seconds = max(0.5, len(normalize(sentence["text"], "turkish-v1")) / args.chars_per_second)
-            result = tts.synthesize(
-                sentence["text"], reference=voice, output=path, seconds=seconds, steps=args.steps, guidance=args.guidance,
-                seed=args.seed + index, sway=args.sway, guidance_until=args.guidance_until,
-                noise_scale=args.noise_scale, duration_scale=args.duration_scale,
-            )
+            if selector is None:
+                result = tts.synthesize(
+                    sentence["text"], reference=voice, output=path, seconds=seconds, steps=args.steps, guidance=args.guidance,
+                    seed=args.seed + index, sway=args.sway, guidance_until=args.guidance_until,
+                    noise_scale=args.noise_scale, duration_scale=args.duration_scale, duration_mode=args.duration_mode,
+                    **sampler,
+                )
+                extra = {"audio_seconds": result.metadata["audio_seconds"], "rtf": result.metadata["rtf"]}
+            else:
+                extra = best_of_n(tts, selector, sentence["text"], voice, path, seconds, index, args, sampler)
         except ValueError as error:
             rows.append({**sentence, "speaker": speaker, "error": str(error)})
             continue
-        rows.append({**sentence, "speaker": speaker, "prompt": prompt_wav.name, "audio": str(path),
-                     "audio_seconds": result.metadata["audio_seconds"], "rtf": result.metadata["rtf"]})
+        rows.append({**sentence, "speaker": speaker, "prompt": prompt_wav.name, "audio": str(path), **extra})
+    if selector is not None:
+        del selector
     print(f"synthesized {len(rows)} in {time.time() - started:.0f}s", flush=True)
     del tts
     torch.cuda.empty_cache()
@@ -172,6 +255,9 @@ def main():
                 continue
             score = evaluator.score(row["audio"], row["text"], out / row["prompt"])
             scored.append({**row, **{k: v for k, v in score.items() if k != "evaluator"}})
+    for row in scored:
+        if "error" not in row:
+            row.update(audio_stats(row["audio"]))
     (out / "results.jsonl").write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in scored) + "\n")
     good = [r for r in scored if "error" not in r]
     summary = summarize(good) if good else {"count": 0}
@@ -179,9 +265,14 @@ def main():
         failed=len(scored) - len(good),
         per_sentence_wer_mean=float(np.mean([r["wer"] for r in good])) if good else None,
         sentences_wer_zero=sum(r["wer"] == 0 for r in good),
+        files_clipping=float(np.mean([r["clip_fraction"] > 0 for r in good])) if good else None,
+        clipped_sample_fraction=float(np.mean([r["clip_fraction"] for r in good])) if good else None,
+        median_lufs=float(np.median([r["lufs"] for r in good])) if good else None,
         checkpoint=args.checkpoint, steps=args.steps, guidance=args.guidance, guidance_until=args.guidance_until,
         noise_scale=args.noise_scale, sway=args.sway, duration_scale=args.duration_scale, asr_model=args.asr_model,
-        asr_backend=args.asr_backend, chars_per_second=args.chars_per_second,
+        asr_backend=args.asr_backend, chars_per_second=args.chars_per_second, duration_mode=args.duration_mode,
+        candidates=args.candidates, selector=args.selector if args.candidates > 1 else None, **sampler,
+        selection_changed=sum(r.get("selected", 0) != 0 for r in good) if args.candidates > 1 else None,
         sentences=str(args.sentences), prompts=len(prompts),
     )
     (out / "summary.json").write_text(json.dumps(summary, indent=2))

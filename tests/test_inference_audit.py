@@ -156,3 +156,34 @@ def test_case_export_rejects_known_overlapping_reference_targets(cache, tmp_path
                 limit=10,
             )
         )
+
+
+def test_synthesize_many_duration_modes_and_speaker_guidance(monkeypatch, cache, tmp_path):
+    import dacvae_tts.inference as module
+    from dacvae_tts.inference import VoiceReference
+
+    data = LatentDataset(cache)
+    config = Config(ModelConfig(latent_dim=4, width=16, depth=1, heads=2, text_depth=1, text_layout="joined",
+                                duration="rule", positions="rope", prediction="edm"))
+    model = FlowTTS(config.model)
+    path = tmp_path / "model.pt"
+    meta = {**data.meta, "text_normalization": "turkish-v1"}
+    torch.save({"model": model.state_dict(), "ema": model.state_dict(), "config": config.to_dict(), "codec": meta,
+                "mean": data.mean, "std": data.std}, path)
+    monkeypatch.setattr(module, "Codec", FakeCodec)
+    tts = Synthesizer(path, device="cpu", precision="fp32")
+    voice = VoiceReference(torch.zeros(60, 4), "Hızlı hızlı konuşan bir referans kaydı burada duruyor.", "test", {})
+    texts = ["Merhaba dünya.", "Bu biraz daha uzun ikinci bir cümle."]
+    results, metadata = tts.synthesize_many(texts, voice, candidates=3, steps=2, guidance=2.0, max_rows=4)
+    assert [len(r) for r in results] == [3, 3] and metadata["rows"] == 6
+    assert results[1][0]["frames"] > results[0][0]["frames"]
+    assert all(r["audio"].shape == (r["frames"] * 512,) for row in results for r in row)
+    rule = tts.target_frames(60, voice.transcript, texts[1])[0]
+    clamp, profile = tts.target_frames(60, voice.transcript, texts[1], duration_mode="clamp")
+    assert clamp > rule and profile["duration_clamp_factor"] > 1  # 54 characters in 2.4 s: a fast prompt
+    assert tts.target_frames(60, voice.transcript, texts[1], duration_mode="predictor")[0] > 0
+    assert tts.target_frames(60, voice.transcript, texts[1], duration_mode="syllable")[0] > 0
+    guided, _ = tts.synthesize_many(texts[:1], voice, steps=2, guidance=2.0, speaker_guidance=1.0)
+    assert guided[0][0]["frames"] == results[0][0]["frames"]
+    with pytest.raises(TypeError):
+        tts.synthesize_many(texts, voice, unknown_option=1)

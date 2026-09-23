@@ -488,6 +488,82 @@ def time_grid(steps, sway, device, times=None):
     return times
 
 
+def _masked_stats(x, mask):
+    """Per-example (sum of squares, element count) over active frames of [B,L,C]."""
+    x = sanitize(x.float(), mask)
+    return x.square().sum((1, 2)), (mask.sum(1) * x.size(-1)).clamp_min(1)
+
+
+def guided_update(v_cond, v_null, x, t, mask, guidance, rescale=0.0, eta=1.0, norm=0.0, momentum=0.0, state=None):
+    """Guided velocity from the conditional and null velocities.
+
+    Guidance acts on the clean-data estimate x1 = x + (1 - t) v of the linear path. With the defaults this is exactly
+    classifier-free guidance, v_null + g (v_cond - v_null). APG (Sadat et al., adaptive projected guidance) splits the
+    difference x1_cond - x1_null into its component parallel to x1_cond, which mostly raises amplitude and causes
+    over-saturation at high guidance, and the orthogonal rest; the parallel part is weighted by `eta`. `momentum` < 0
+    is APG's reverse momentum (running average kept in `state`), `norm` > 0 caps the per-element RMS of the
+    difference. `rescale` (phi of Lin et al.) blends the guided x1 with a copy rescaled to the conditional x1's
+    per-utterance standard deviation. All statistics are taken over the target frames of each example.
+    """
+    if rescale == 0 and eta == 1 and norm == 0 and momentum == 0:
+        return v_null + guidance * (v_cond - v_null)
+    one_minus_t = (1 - t)[:, None, None].to(x.dtype)
+    x1_cond = x + one_minus_t * v_cond
+    diff = sanitize(one_minus_t * (v_cond - v_null), mask)
+    if momentum:
+        running = state.get("running")
+        diff = diff if running is None else diff + momentum * running
+        state["running"] = diff
+    if norm > 0:
+        squares, count = _masked_stats(diff, mask)
+        rms = (squares / count).sqrt()
+        diff = diff * (norm / rms.clamp_min(1e-8)).clamp(max=1.0)[:, None, None].to(diff.dtype)
+    if eta != 1:
+        reference = sanitize(x1_cond.float(), mask)
+        unit = reference / reference.square().sum((1, 2), keepdim=True).sqrt().clamp_min(1e-8)
+        parallel = (diff.float() * unit).sum((1, 2), keepdim=True) * unit
+        diff = (diff.float() - parallel + eta * parallel).to(diff.dtype)
+    x1 = x1_cond + (guidance - 1) * diff
+    if rescale > 0:
+        def centered_std(value):
+            value = sanitize(value.float(), mask)
+            count = (mask.sum(1) * value.size(-1)).clamp_min(1)
+            mean = value.sum((1, 2)) / count
+            var = sanitize((value - mean[:, None, None]).square(), mask).sum((1, 2)) / count
+            return var.clamp_min(1e-12).sqrt()
+
+        factor = (centered_std(x1_cond) / centered_std(x1))[:, None, None].to(x1.dtype)
+        x1 = rescale * (x1 * factor) + (1 - rescale) * x1
+    return (x1 - x) / one_minus_t
+
+
+def text_only_rows(model, full_valid, prompt_mask, tokens, segments):
+    """Inputs of the prompt-free branch of independent guidance: each example's target frames as their own sequence.
+
+    Training drops the voice prompt entirely (prompt dropout: no reference frames, transcript of the target only),
+    so the text-only branch is exactly that condition. `tokens`/`segments` hold the target text alone per example.
+    Returns a dict with the gather index [B,T] into the full sequence, valid [B,T] and cached conditions.
+    """
+    target = full_valid & ~prompt_mask
+    lengths = target.sum(1)
+    width = int(lengths.max())
+    positions = torch.arange(width, device=full_valid.device)[None]
+    valid = positions < lengths[:, None]
+    start = prompt_mask.sum(1, keepdim=True)
+    index = torch.where(valid, start + positions, torch.zeros_like(positions)).long()
+    empty = torch.zeros(len(lengths), width, model.cfg.latent_dim, device=full_valid.device)
+    no_prompt = torch.zeros_like(valid)
+    return dict(
+        index=index,
+        valid=valid,
+        prompt=empty,
+        prompt_mask=no_prompt,
+        tokens=tokens,
+        segments=segments,
+        cached=model.conditions(empty, no_prompt, tokens, segments),
+    )
+
+
 @torch.inference_mode()
 def sample(
     model,
@@ -507,18 +583,32 @@ def sample(
     condition_cache=None,
     guidance_until=1.0,
     noise_scale=1.0,
+    guidance_from=0.0,
+    cfg_rescale=0.0,
+    apg_eta=1.0,
+    apg_norm=0.0,
+    apg_momentum=0.0,
+    speaker_guidance=None,
+    text_only=None,
 ):
     """Euler sampler with classifier-free guidance.
 
-    `guidance_until` restricts guidance to flow times t < guidance_until (t=0 is noise): Echo/Irodori apply
-    guidance only on the noisy half of the trajectory (cfg_min_t 0.5 in their reversed convention), which
-    keeps the alignment benefit at roughly half the extra forward passes. `noise_scale` shrinks the initial
-    noise (Echo's 0.8-0.9 "truncation"), an unprincipled but often artifact-reducing knob.
+    Guidance is applied while guidance_from <= t < guidance_until (t=0 is noise): Echo/Irodori guide only the noisy
+    half of the trajectory (cfg_min_t 0.5 in their reversed convention), which keeps the alignment benefit at roughly
+    half the extra forward passes. `noise_scale` shrinks the initial noise (Echo's 0.8-0.9 "truncation").
+    `cfg_rescale`, `apg_eta`, `apg_norm` and `apg_momentum` reshape the guided update (see `guided_update`); their
+    defaults give plain CFG. `speaker_guidance` enables independent text/speaker guidance with a third, prompt-free
+    branch built by `text_only_rows` (pass it as `text_only`): v_null + g (v_text - v_null) + g_s (v_full - v_text),
+    which equals plain CFG for g_s = g.
     """
     if steps < 1 or not -1 <= sway <= 0 or not math.isfinite(guidance) or guidance < 0:
         raise ValueError("Invalid sampler settings")
-    if not 0 < guidance_until <= 1 or not 0 < noise_scale <= 1.5:
-        raise ValueError("guidance_until must lie in (0,1] and noise_scale in (0,1.5]")
+    if not 0 < guidance_until <= 1 or not 0 < noise_scale <= 1.5 or not 0 <= guidance_from < guidance_until:
+        raise ValueError("Need 0 <= guidance_from < guidance_until <= 1 and noise_scale in (0,1.5]")
+    if not 0 <= cfg_rescale <= 1 or apg_norm < 0 or not -1 < apg_momentum < 1 or not math.isfinite(apg_eta):
+        raise ValueError("cfg_rescale must lie in [0,1], apg_norm >= 0, apg_momentum in (-1,1)")
+    if speaker_guidance is not None and (text_only is None or not math.isfinite(speaker_guidance)):
+        raise ValueError("Independent speaker guidance needs the prompt-free branch (text_only_rows)")
     gen = torch.Generator(device=prompt.device).manual_seed(seed)
     audio_shapes(prompt, prompt, prompt_mask, valid, prompt.size(-1))
     mask = mask_values(valid, prompt_mask)
@@ -555,18 +645,32 @@ def sample(
                 torch.cat([cond[2], zeros(cond[2])]),
             ),
         )
+    if speaker_guidance is not None:
+        index = text_only["index"][..., None].expand(-1, -1, x.size(-1))
+        text_valid = text_only["valid"]
+        branch = {k: text_only[k] for k in ("prompt", "prompt_mask", "tokens", "segments", "cached")}
     trajectory = [x.clone()] if return_trajectory else None
-    guided_steps = 0
+    guided_steps = evaluations = 0
+    apg_state = {}
     for t0, t1 in zip(times[:-1], times[1:]):
         t = t0.expand(x.size(0))
-        if guidance == 1 or float(t0) >= guidance_until:
+        if guidance == 1 or not guidance_from <= float(t0) < guidance_until:
             v = to_velocity(
                 model, model(x, t, prompt, prompt_mask, valid, tokens, segments, cached=cond), x, t
             )
+            evaluations += 1
         else:
             both = torch.cat([x, x.masked_fill(prompt_mask[..., None], 0)])
             v, u = to_velocity(model, model(both, t.repeat(2), **pair), both, t.repeat(2)).chunk(2)
-            v = u + guidance * (v - u)
+            evaluations += 2
+            if speaker_guidance is None:
+                v = guided_update(v, u, x, t, mask, guidance, cfg_rescale, apg_eta, apg_norm, apg_momentum, apg_state)
+            else:
+                rows = sanitize(torch.gather(x, 1, index), text_valid)
+                w = to_velocity(model, model(rows, t, valid=text_valid, **branch), rows, t)
+                w = torch.zeros_like(x).scatter_add(1, index, sanitize(w, text_valid))
+                v = u + guidance * (w - u) + speaker_guidance * (v - w)
+                evaluations += 1
             guided_steps += 1
         x = x + (t1 - t0) * sanitize(v, mask)
         x = sanitize(torch.where(prompt_mask[..., None], prompt, x), valid)
@@ -574,10 +678,14 @@ def sample(
             trajectory.append(x.clone())
     if stats is not None:
         stats.update(
-            forward_calls=steps,
-            branch_evaluations=steps + guided_steps,
+            forward_calls=steps + (guided_steps if speaker_guidance is not None else 0),
+            branch_evaluations=evaluations,
             guidance_until=guidance_until,
+            guidance_from=guidance_from,
             noise_scale=noise_scale,
+            cfg_rescale=cfg_rescale,
+            apg=dict(eta=apg_eta, norm=apg_norm, momentum=apg_momentum),
+            speaker_guidance=speaker_guidance,
             time_grid=times.cpu().tolist(),
             solver="euler",
         )

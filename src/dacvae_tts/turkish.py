@@ -96,7 +96,7 @@ def normalize_numbers(text):
     # ranges 3-4 -> 3 4
     text = re.sub(r"(\d+)\s?[-–]\s?(\d+)", r"\1 \2", text)
     # ordinals "12. nesil" -> "on ikinci nesil" (only when a lower-case word follows)
-    text = re.sub(rf"\b(\d+)\.(?=\s+[a-zçğıöşü])", lambda m: ordinal_words(int(m.group(1))), text)
+    text = re.sub(r"\b(\d+)\.(?=\s+[a-zçğıöşü])", lambda m: ordinal_words(int(m.group(1))), text)
     # split letters glued to digits: 350D -> 350 D ; USB3 -> USB 3
     text = re.sub(rf"(?<=\d)(?=[{LETTER}])", " ", text)
     text = re.sub(rf"(?<=[{LETTER}])(?=\d)", " ", text)

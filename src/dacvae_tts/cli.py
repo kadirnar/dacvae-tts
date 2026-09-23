@@ -143,6 +143,13 @@ def main():
     p.add_argument("--text", required=True)
     p.add_argument("--seconds", type=float)
     p.add_argument("--duration-scale", type=float, default=1.0)
+    p.add_argument(
+        "--duration-mode",
+        choices=["rule", "clamp", "syllable", "predictor"],
+        default="rule",
+        help="Target length for rule-duration models: prompt rate per byte, the same with fast prompts slowed, "
+        "per syllable, or the fitted duration predictor",
+    )
     p.add_argument("--compile", action="store_true")
     p.add_argument("--seed", type=int, default=42)
 
@@ -352,6 +359,14 @@ def add_inference_args(parser, steps=True):
         "--guidance-until", type=float, default=1.0, help="Apply CFG only while t < this (t=0 noise); 0.5 = noisy half"
     )
     parser.add_argument("--noise-scale", type=float, default=1.0, help="Scale of the initial noise (Echo: 0.8-0.9)")
+    parser.add_argument("--guidance-from", type=float, default=0.0, help="Apply CFG only while t >= this")
+    parser.add_argument("--cfg-rescale", type=float, default=0.0, help="CFG rescale phi in [0,1] (against over-saturation)")
+    parser.add_argument("--apg-eta", type=float, default=1.0, help="APG weight of the parallel guidance component")
+    parser.add_argument("--apg-norm", type=float, default=0.0, help="APG cap on the per-element RMS of the guidance")
+    parser.add_argument("--apg-momentum", type=float, default=0.0, help="APG (reverse) momentum, e.g. -0.3")
+    parser.add_argument(
+        "--speaker-guidance", type=float, help="Independent speaker guidance scale (text guidance = --guidance)"
+    )
 
 
 if __name__ == "__main__":
