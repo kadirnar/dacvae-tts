@@ -119,6 +119,32 @@ def _int_to_roman(n):
     return out
 
 
+def harmonize(stem, suffix):
+    """Re-apply Turkish vowel harmony and consonant assimilation to a suffix written for another stem.
+
+    "TL'dir" is harmonized to the spoken acronym ("te le"); once TL becomes "lira" the suffix must follow "lira":
+    harmonize("lira", "dir") -> "dır", harmonize("dolar", "yi") -> "ı", harmonize("avro", "dan") -> "dan".
+    """
+    stem_lower = tr_lower(stem)
+    vowels = [c for c in stem_lower if c in "aeıioöuü"]
+    last = vowels[-1] if vowels else "e"
+    out = []
+    suffix = tr_lower(suffix)
+    if stem_lower[-1] not in "aeıioöuü" and len(suffix) > 1 and suffix[0] in "yns" and suffix[1] in "aeıioöuü":
+        suffix = suffix[1:]  # buffer consonants only follow vowel-final stems: dolar + (y)ı
+    for index, c in enumerate(suffix):
+        if c in "ae":
+            c = "a" if last in "aıou" else "e"
+        elif c in "ıiuü":
+            c = {"a": "ı", "ı": "ı", "o": "u", "u": "u", "e": "i", "i": "i", "ö": "ü", "ü": "ü"}[last]
+        elif c in "dt" and index == 0:
+            c = "t" if stem_lower[-1] in "çfhkpsşt" else "d"
+        if c in "aeıioöuü":
+            last = c
+        out.append(c)
+    return "".join(out)
+
+
 def spell(acronym):
     return " ".join(LETTER_NAMES.get(c, c.lower()) for c in acronym)
 
@@ -170,7 +196,8 @@ def prepare_text(text):
     text = r.sub(rf"\b([{LETTERS}0-9_.+-]+)@([{LETTERS}0-9-]+(?:\.[{LETTERS}0-9-]+)+)",
                  lambda m: m.group(1).replace(".", " nokta ").replace("_", " ") + " et "
                  + m.group(2).replace(".", " nokta "), text, "e-posta")
-    text = r.sub(rf"(?<![{LETTERS}0-9])[@#]([{LETTERS}0-9_]+)", lambda m: m.group(1).replace("_", " "), text, "etiket")
+    text = r.sub(rf"(?<![{LETTERS}0-9])[@#]([{LETTERS}0-9_]+)",
+                 lambda m: re.sub(r"(?<=[a-zçğıöşü])(?=[A-ZÇĞİÖŞÜ])", " ", m.group(1).replace("_", " ")), text, "etiket")
     text = r.sub(rf"\b([{LETTERS}0-9-]+)\.(com|net|org|ai|io|co|gov|edu|tr|de|uk)(\.tr)?(/\S*)?",
                  lambda m: m.group(1) + " nokta " + m.group(2) + (" nokta tr" if m.group(3) else ""), text, "adres")
     # Dates: 23.09.2026, 23/09/2026, 23-09-2026 -> 23 eylül 2026 (the year keeps its suffix: 2026'da).
@@ -191,7 +218,7 @@ def prepare_text(text):
 
     text = r.sub(r"((?:[Ss]aat\s+)|(?<![\d.,]))(\d{1,2})[:](\d{2})\b(?![.,:]\d)", clock, text, "saat")
     text = r.sub(r"((?:[Ss]aat\s+))(\d{1,2})[.](\d{2})\b(?![.,:]\d)", clock, text, "saat")
-    text = r.sub(r"()(?<![\d.,])(0\d|1\d|2[0-3])[.](\d{2})(?=['’][" + LETTERS + r"])", clock, text, "saat")
+    text = r.sub(r"()(?<![\d.,])([01]?\d|2[0-3])[.](\d{2})(?=['’][" + LETTERS + r"])", clock, text, "saat")
     # Currency: symbols before or after the amount, and currency codes after it.
     for symbol, word in CURRENCY_SYMBOLS.items():
         s = re.escape(symbol)
@@ -199,7 +226,9 @@ def prepare_text(text):
         text = r.sub(rf"(\d+(?:[.,]\d+)*)\s?{s}", rf"\1 {word}", text, "para birimi")
         text = r.sub(s, f" {word} ", text, "para birimi")
     for code, word in CURRENCY_CODES.items():
-        text = r.sub(rf"(\d+(?:[.,]\d+)*)\s?{code}\b", rf"\1 {word}", text, "para birimi")
+        text = r.sub(rf"(\d+(?:[.,]\d+)*)\s?{code}\b(?:['’]([{LETTERS}]+))?",
+                     lambda m, w=word: f"{m.group(1)} {w}" + (harmonize(w, m.group(2)) if m.group(2) else ""),
+                     text, "para birimi")
     # Temperatures and angles.
     text = r.sub(r"(\d)\s?°\s?C\b", r"\1 derece", text, "sıcaklık")
     text = r.sub(r"(\d)\s?°\s?F\b", r"\1 fahrenhayt", text, "sıcaklık")
@@ -223,6 +252,10 @@ def prepare_text(text):
     text = r.sub(r"(?<![\w\d])-(?=\d)", "eksi ", text, "eksi")
     # Phone-style groups with a leading zero read as "sıfır beş yüz otuz iki".
     text = r.sub(r"(?<![\d.,])0(\d{3})(?=\s\d{3}\b)", r"sıfır \1", text, "telefon")
+    # Numbered items at a line or sentence start: "1. Madde" -> "birinci Madde" (turkish-v1 only reads an ordinal
+    # before a lower-case word).
+    text = r.sub(rf"((?:^|\n|[.!?:]\s+)\s*)(\d{{1,3}})\.(?=\s+[{UPPER}])", lambda m: m.group(1) + ordinal_words(int(m.group(2))),
+                 text, "sıra sayısı")
     # Roman ordinals: II. Dünya Savaşı -> ikinci Dünya Savaşı, XIX. yüzyıl -> on dokuzuncu yüzyıl.
     def roman(m):
         token = m.group(1)
@@ -241,7 +274,8 @@ def prepare_text(text):
         if abbreviation[0].islower():  # "armut vs. Sonra" keeps its sentence end; "Dr. Ahmet" does not
             text = r.sub(rf"(?<![{LETTERS}]){a}(?=\s+[{UPPER}])", word + ".", text, "kısaltma")
         text = r.sub(rf"(?<![{LETTERS}]){a}", word, text, "kısaltma")
-    # Letters glued to digits (5G, 3D, COVID-19): split, and spell a single capital letter.
+    # Letters glued to digits (5G, 3D, Q3, A4, H2O, COVID-19): split, and spell a single capital letter.
+    text = r.sub(rf"(?<![{LETTERS}])([{UPPER}])(?=\d)", lambda m: LETTER_NAMES.get(m.group(1), m.group(1)) + " ", text, "harf")
     text = r.sub(rf"(?<=[{LETTERS}])-(?=\d)", " ", text, "tire")
     text = r.sub(rf"(\d)([{UPPER}])(?![{LETTERS}])", lambda m: f"{m.group(1)} {LETTER_NAMES.get(m.group(2), m.group(2))}", text, "harf")
     # Acronyms: spelled out unless pronounceable or known as words.

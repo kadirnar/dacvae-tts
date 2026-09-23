@@ -68,3 +68,16 @@ def test_split_sentences_merges_short_and_cuts_long():
     assert " ".join(c for c, _ in chunks).split() == text.split()
     assert split_sentences("   ") == []
     assert split_sentences("Tek cümle.") == [("Tek cümle.", "sentence")]
+
+
+def test_suffix_harmony_list_ordinals_and_letter_names():
+    from dacvae_tts.frontend import harmonize
+
+    assert [harmonize("lira", "dir"), harmonize("dolar", "yi"), harmonize("avro", "dan"), harmonize("lira", "si")] == \
+        ["dır", "ı", "dan", "sı"]
+    text, _ = speakable("Kira 15.000 TL'dir, 10 USD'yi bozdurdum.")
+    assert text == "Kira on beş bin liradır, on doları bozdurdum."
+    assert speakable("1. Madde: Kira. 2. Madde: Depozito.")[0] == "birinci Madde: Kira. ikinci Madde: Depozito."
+    assert speakable("Saat 7.30'da çıktım.")[0] == "Saat yedi otuzda çıktım."
+    assert speakable("Q3 geliri, A4 kağıt.")[0] == "kü üç geliri, a dört kağıt."
+    assert speakable("#YapayZeka günü")[0] == "Yapay Zeka günü"
