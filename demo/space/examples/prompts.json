@@ -1,0 +1,26 @@
+[
+ {
+  "audio": "examples/prompt1.wav",
+  "text": "Aynen öyle. Ve işin ilginç yanı bu tepkiler yemeği ne kadar çok beğenirsek, ne kadar çok zevk alırsak o kadar güçlü oluyor.",
+  "seconds": 8.4,
+  "speaker": "84719_speaker_2",
+  "chars_per_second": 14.7,
+  "dnsmos_ovrl": 3.65
+ },
+ {
+  "audio": "examples/prompt2.wav",
+  "text": "Her yaşta beslenme alışkanlıklarınızı değiştirerek beyninize iyilik yapabilirsiniz.",
+  "seconds": 5.4,
+  "speaker": "84727_speaker_0",
+  "chars_per_second": 15.4,
+  "dnsmos_ovrl": 3.61
+ },
+ {
+  "audio": "examples/prompt3.wav",
+  "text": "Türkan Şoray'ın canlandırdığı Şahmaran var mesela yaratık olarak ele aldığımız zaman.",
+  "seconds": 5.4,
+  "speaker": "1588751_speaker_1",
+  "chars_per_second": 15.8,
+  "dnsmos_ovrl": 3.53
+ }
+]
