@@ -342,3 +342,9 @@ kırpılıyor, −15,8 → −13,0 LUFS; gerçek konuşma %12, −16,7 LUFS).
    −13,9 → −16,3/−18,4 LUFS) ama WER bedeli var; varsayılan CFG 5 + çıkışta −16 LUFS normalizasyonu, APG seçenek olarak duruyor.
    Bağımsız konuşmacı guidance'ı (üç dal) bu modelde yardımcı olmadı.
 4. Ham sonuçlar ve cümle bazında transkriptler: `VoiceHub/dacvae-tts-tr-w512-clean` → `demo-experiments/`.
+
+**Yayın (23 Eylül, 14:00):** yeni demo `Vyvo/dacvae-tts-tr-demo`'da canlı (önce özel `Vyvo/dacvae-tts-tr-demo-dev`'de doğrulandı);
+Space'in `HF_TOKEN` secret'ı silindi. Canlıda uçtan uca test: varsayılan istek 9,5 s (GPU 2,9 s), 19 s'lik 3 parçalı metin 7,3 s,
+A/B, toplu test, Hub URL'siyle özel checkpoint ve hata mesajları çalışıyor. ZeroGPU girişsiz ziyaretçilere yalnızca birkaç
+istek veriyor (API'de `token=` gerekir); sayfaya not eklendi. Model deposu `VoiceHub/dacvae-tts-tr-w512` (kart, paket, `space/`)
+güncellendi; karttaki kullanım örneği Hub'dan indirilen paketle doğrulandı.
