@@ -11,7 +11,7 @@ import torch
 from .codec import Codec, backend_options, check_compatibility, normalize_loudness, read_audio
 from .contracts import normalization_stats, target_mask
 from .duration import DurationPredictor, articulation_seconds, auto_mode, clamp_scale, rule_frames
-from .model import sample, text_only_rows
+from .model import quality_features, sample, text_only_rows
 from .quality import MOMENT_MATCH, latent_moments, match_moments
 from .text import BYTE_OFFSET, normalize, tokenize
 from .training import autocast, load_model
@@ -119,6 +119,8 @@ class Synthesizer:
         self.recommended_guidance = self.checkpoint.get("recommended_guidance")
         # Speaker-conditioned models embed every prompt with the speaker store's embedder (checkpoint record).
         self.speaker_record = self.checkpoint.get("speaker_condition")
+        # Requested DNSMOS [SIG, BAK, OVRL] of quality-conditioned models; None asks for model.cfg.quality_target.
+        self.quality_target = None
         if self.model.speaker_condition is not None and not self.speaker_record:
             raise ValueError("Speaker-conditioned checkpoint without the record of its speaker embedder")
         self.model_guidance_weight = float(self.checkpoint["config"].get("train", {}).get("model_guidance_weight", 0))
@@ -267,6 +269,15 @@ class Synthesizer:
         return {**speech_timing(audio, int(rate)), "source": "waveform"}
 
     @torch.inference_mode()
+    def quality_input(self, rows):
+        """The quality condition [rows, 3] of quality-conditioned models (the requested DNSMOS), else None."""
+        if getattr(self.model, "quality_condition", None) is None:
+            return None
+        target = self.model.cfg.quality_target if self.quality_target is None else self.quality_target
+        if len(target) != 3:
+            raise ValueError("quality_target must be [SIG, BAK, OVRL]")
+        return quality_features([list(target)] * rows).to(self.device)
+
     def speaker_embedding(self, reference):
         """Speaker-embedding condition [E] of a voice for speaker-conditioned models, else None; computed once per
         VoiceReference with the checkpoint's embedder on the prompt's codec reconstruction (speaker stores of
@@ -516,7 +527,7 @@ class Synthesizer:
         return sample(
             self.model, **core, steps=steps, guidance=guidance, seed=seed, sway=sway, stats=stats,
             condition_cache=condition_cache, speaker=batch.get("speaker"), context=batch.get("context"),
-            context_mask=batch.get("context_mask"), **sampler,
+            context_mask=batch.get("context_mask"), quality=self.quality_input(batch["prompt"].size(0)), **sampler,
         )
 
     @staticmethod

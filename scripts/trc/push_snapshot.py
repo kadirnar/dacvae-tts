@@ -25,7 +25,7 @@ from huggingface_hub import HfApi
 METRICS = (
     ("wer", "WER %", 100), ("cer", "CER %", 100), ("freya_wer", "Freya WER %", 100), ("freya_cer", "Freya CER %", 100),
     ("sim_o", "SIM-o", 1), ("dnsmos_ovrl", "DNSMOS OVRL", 1), ("dnsmos_sig", "SIG", 1), ("dnsmos_bak", "BAK", 1),
-    ("utmos", "UTMOS", 1), ("clipped_fraction", "clipped", 1),
+    ("sim_o_speechbrain", "SIM (SpeechBrain)", 1), ("utmos", "UTMOS", 1), ("files_clipping", "clipped files", 1),
 )
 
 
@@ -38,8 +38,8 @@ def summary_value(summary, key):
 
 
 def readme(title, repo, state, notes):
-    lines = [f"# {title}", "", f"Checkpoints and evaluations of `{repo.split('/')[-1]}` (DACVAE-TTS, Turkish, trained on "
-             "[Codyfederer/tr-combined](https://huggingface.co/datasets/Codyfederer/tr-combined)).", ""]
+    lines = [f"# {title}", "", f"Checkpoints and evaluations of `{repo.split('/')[-1]}` (DACVAE-TTS, Turkish zero-shot "
+             "voice cloning, https://github.com/kadirnar/dacvae-tts).", ""]
     if notes:
         lines += [notes, ""]
     lines += ["Evaluation: Freya-TR-Eval sentences spoken by leak-free Common Voice test voices (48 speakers), "

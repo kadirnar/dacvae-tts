@@ -38,6 +38,7 @@ BOUNDARY = {
     "duration.2.weight",
     "ctc.weight",
     "speaker_condition.weight",  # frozen speaker embedding in (zero-init): an input boundary like `input`
+    "quality_condition.weight",  # 3 DNSMOS scores in (zero-init): an input boundary, a 3-row map Muon cannot shape
     "speaker_context.input.weight",  # raw context latents in
 }
 # Per-head attention gate logits [heads, D] are a small zero-init output head, not a hidden map: Muon would

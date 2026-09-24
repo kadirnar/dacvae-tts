@@ -115,6 +115,24 @@ def load_silence(directory, meta):
 # of another, and every stream stays clear of the original seed range seed + epoch * rows + index.
 CROSS_STREAM, TAIL_STREAM, LONG_STREAM, TEMPO_STREAM, SPEAKER_STREAM = 1 << 48, 2 << 48, 3 << 48, 4 << 48, 5 << 48
 CONTEXT_STREAM = 6 << 48
+QUALITY_STREAM = 7 << 48
+QUALITY_FEATURES = 3  # DNSMOS SIG, BAK, OVRL (model.QUALITY_FEATURES)
+
+
+def load_quality_scores(path, db_path, split, ids):
+    """[len(ids), 3] raw DNSMOS of the split's rows (in `ids` order) from a JSON {uid: [SIG, BAK, OVRL]}; NaN where a
+    row has no score. The model sees (score - 3) / 0.5 with NaN -> 0 (model.quality_features)."""
+    scores = json.loads(Path(path).read_text())
+    position = {int(rowid): i for i, rowid in enumerate(ids)}
+    table = np.full((len(ids), QUALITY_FEATURES), np.nan, dtype=np.float32)
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as db:
+        for rowid, uid in db.execute("SELECT id, uid FROM samples WHERE split=?", (split,)):
+            value = scores.get(uid)
+            if value is not None and int(rowid) in position:
+                if len(value) != QUALITY_FEATURES:
+                    raise ValueError(f"{path}: {uid} needs [SIG, BAK, OVRL], got {value}")
+                table[position[int(rowid)]] = value
+    return table
 QUIET_CUT_SECONDS = 0.3
 
 
@@ -138,6 +156,8 @@ class LatentDataset(Dataset):
         speaker_condition=None,
         speaker_condition_source="other",
         speaker_condition_min_cosine=0.0,
+        quality_scores=None,
+        quality_dropout=0.1,
         **pair_options,
     ):
         if pairing not in {"cross", "within"} or layout not in {"segments", "joined"}:
@@ -204,6 +224,10 @@ class LatentDataset(Dataset):
             self.speaker_store = TeacherStore(speaker_condition, "speaker")
             self.speaker_store.check(self.db_path, split, self.meta["sample_rate"] / self.meta["hop_length"])
         self.speaker_source, self.speaker_min_cosine = speaker_condition_source, speaker_condition_min_cosine
+        # Quality condition (model.quality_condition): the target row's DNSMOS, dropped to "unknown" with quality_dropout.
+        self.quality, self.quality_dropout = None, quality_dropout
+        if quality_scores:
+            self.quality = load_quality_scores(quality_scores, self.db_path, split, self.ids)
         # Tempo-variant latents of the rows (tempo.py, scripts/build_tempo_variants.py) for prompt tempo perturbation.
         self.tempo_store = TempoStore(tempo_variants) if tempo_variants else None
         self.split = split
@@ -608,6 +632,12 @@ class LatentDataset(Dataset):
         all are off."""
         if self.speaker_store is not None:
             item = {**item, "speaker_condition": self.speaker_vector(epoch, index, item)}
+        if self.quality is not None:
+            # The target's recording quality; its own stream, so switching the condition moves no other draw.
+            dropped = random.Random(self.seed + epoch * len(self) + index + QUALITY_STREAM).random() < self.quality_dropout
+            scores = torch.from_numpy(self.quality[index])
+            features = torch.zeros(QUALITY_FEATURES) if dropped else torch.nan_to_num((scores - 3.0) / 0.5, nan=0.0)
+            item = {**item, "quality": features}
         if self.context_prob:
             rows = self.context_plan(epoch, index)
             context = [self.row(r)["latents"] for r in rows]
@@ -701,6 +731,11 @@ def collate(items):
         if not all(present):
             raise ValueError("Either every item or none carries a speaker_condition")
         batch["speaker_condition"] = torch.stack([item["speaker_condition"] for item in items]).float()
+    has_quality = [("quality" in item) for item in items]
+    if any(has_quality):
+        if not all(has_quality):
+            raise ValueError("Either every item or none carries a quality condition")
+        batch["quality"] = torch.stack([item["quality"] for item in items]).float()
     units = {item.get("text_units", "bytes") for item in items}
     if len(units) > 1:
         raise ValueError("A batch cannot mix text units")

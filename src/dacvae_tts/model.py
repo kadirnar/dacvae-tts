@@ -27,6 +27,15 @@ def masked_mean(x, mask):
     return sanitize(x, mask).sum(1) / mask.sum(1, keepdim=True).clamp_min(1)
 
 
+QUALITY_FEATURES = 3  # DNSMOS P.835 SIG, BAK, OVRL
+
+
+def quality_features(scores):
+    """Raw DNSMOS [..., 3] (MOS 1-5) -> the model's quality input: (score - 3) / 0.5; NaN (unscored) -> 0."""
+    scores = torch.as_tensor(scores, dtype=torch.float32)
+    return torch.nan_to_num((scores - 3.0) / 0.5, nan=0.0)
+
+
 # Length-aware RoPE (arXiv:2509.11084): cross-attention positions are gamma * index / length, so a
 # frame at 40% of the audio starts out looking at the text around 40% of the transcript.
 LENGTH_AWARE_SCALE = 10.0
@@ -396,6 +405,12 @@ class FlowTTS(nn.Module):
         if cfg.speaker_condition_dim:
             self.speaker_condition = nn.utils.skip_init(nn.Linear, cfg.speaker_condition_dim, d, bias=False)
             nn.init.zeros_(self.speaker_condition.weight)
+        # Quality condition: DNSMOS [SIG, BAK, OVRL] of the target -> voice condition (zero-init, bias-free: starts as
+        # the baseline and the zero vector, "unknown quality", adds nothing). skip_init draws no random numbers.
+        self.quality_condition = None
+        if cfg.quality_condition:
+            self.quality_condition = nn.utils.skip_init(nn.Linear, QUALITY_FEATURES, d, bias=False)
+            nn.init.zeros_(self.quality_condition.weight)
         # Training-only teacher heads (alignment.py): created last and only when configured, so models
         # without them keep their initialization and old checkpoints load strictly.
         self.repa = RepaProjector(d, cfg.repa_dim, p) if cfg.repa_layer else None
@@ -408,7 +423,7 @@ class FlowTTS(nn.Module):
         self.strict_checks = True  # train.strict_checks: false skips value checks that wait for the GPU
         self.block_runner = run_block  # train.compile: blocks swaps in a compiled runner (speed.py)
 
-    def reference_summary(self, prompt, prompt_mask, speaker=None, context=None, context_mask=None):
+    def reference_summary(self, prompt, prompt_mask, speaker=None, context=None, context_mask=None, quality=None):
         """Global voice vector [B,D] of the prompt; plus the projected speaker embedding `speaker` [B,E] for models
         with `speaker_condition_dim` (rows without a prompt or with a zero embedding get none), and the speaker
         context vector of `context` [B,L,C] / `context_mask` [B,L] for models with `speaker_context` (None: none)."""
@@ -437,16 +452,20 @@ class FlowTTS(nn.Module):
             voice = voice + self.speaker_context(context, context_mask)
         elif context is not None:
             raise ValueError("This model has no speaker context (model.speaker_context: none)")
+        if self.quality_condition is not None and quality is not None:
+            if quality.shape != (prompt.size(0), QUALITY_FEATURES):
+                raise ValueError(f"Quality must be [B,{QUALITY_FEATURES}] normalized DNSMOS (quality_features)")
+            voice = voice + self.quality_condition(quality.to(voice.dtype))
         return voice
 
     def conditions(self, prompt, prompt_mask, tokens, segments, drop=None, speaker=None, context=None,
-                   context_mask=None):
+                   context_mask=None, quality=None):
         if self.strict_checks and self.cfg.text_units == "chars":
             low, high = CONTINUATION  # UTF-8 continuation bytes never occur in character-unit rows
             if ((tokens >= low) & (tokens <= high)).any():
                 raise ValueError("UTF-8 byte ids given to a character-unit model (text.to_units converts them)")
         text, text_valid = self.text(tokens, segments)
-        voice = self.reference_summary(prompt, prompt_mask, speaker, context, context_mask)
+        voice = self.reference_summary(prompt, prompt_mask, speaker, context, context_mask, quality)
         if drop is not None:
             text = text.masked_fill(drop[:, None, None], 0)
             voice = voice.masked_fill(drop[:, None], 0)
@@ -501,6 +520,7 @@ class FlowTTS(nn.Module):
         speaker=None,
         context=None,
         context_mask=None,
+        quality=None,
     ):
         """Velocity [B,L,C]; with `return_ctc`, (velocity, CTC logits, packed mask). A nonempty
         `return_hidden` (1-based block indices) wraps that result as (result, {block: [B,N,D]}) for
@@ -518,7 +538,8 @@ class FlowTTS(nn.Module):
         b, length, channels = x.shape
         p = self.cfg.patch_size
         if cached is None:
-            cached = self.conditions(prompt, prompt_mask, tokens, segments, drop, speaker, context, context_mask)
+            cached = self.conditions(prompt, prompt_mask, tokens, segments, drop, speaker, context, context_mask,
+                                     quality)
         text, text_valid, voice = cached
         if (
             text.shape != (*tokens.shape, self.cfg.width)
@@ -747,6 +768,8 @@ def condition_inputs(batch):
         extra["speaker"] = batch["speaker_condition"]
     if "context" in batch:
         extra.update(context=batch["context"], context_mask=batch["context_mask"])
+    if "quality" in batch:
+        extra["quality"] = batch["quality"]
     return extra
 
 
@@ -989,6 +1012,7 @@ def sample(
     speaker=None,
     context=None,
     context_mask=None,
+    quality=None,
 ):
     """Euler sampler with classifier-free guidance.
 
@@ -1047,7 +1071,7 @@ def sample(
     times = time_grid(steps, sway, x.device, times)
     cond = (
         model.conditions(prompt, prompt_mask, tokens, segments, speaker=speaker, context=context,
-                         context_mask=context_mask)
+                         context_mask=context_mask, **({} if quality is None else {"quality": quality}))
         if condition_cache is None
         else condition_cache
     )

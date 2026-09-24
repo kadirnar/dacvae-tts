@@ -364,6 +364,8 @@ def main():
     parser.add_argument(
         "--select-speaker-model", default="microsoft/unispeech-sat-base-plus-sv",
         help="Speaker model of --select-by sim; must differ from the SIM judge --speaker-model (arXiv 2607.08256)")
+    parser.add_argument("--quality-target", type=lambda v: tuple(float(x) for x in v.split(",")),
+                        help="SIG,BAK,OVRL requested from a quality-conditioned model (default: its quality_target)")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--language", default="tr")
     parser.add_argument(
@@ -420,6 +422,8 @@ def main():
         check_rescore_prompts(out, cases, previous or ())
     (out / "cases.json").write_text(json.dumps(cases, indent=1, ensure_ascii=False))  # input of export_case_audio.py
     tts = None if reuse else Synthesizer(args.checkpoint, device=args.device)
+    if tts is not None and args.quality_target is not None:
+        tts.quality_target = args.quality_target
     if tts is not None:
         tts.articulation_options = args.articulation_options  # None: the defaults of duration.articulation_seconds
         if args.duration_model:

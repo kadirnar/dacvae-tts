@@ -573,14 +573,19 @@ def warm_start(module, state):
 
 
 def speaker_sources(cfg, cache):
-    """LatentDataset keywords of the speaker-embedding condition (model.speaker_condition_dim); empty if off."""
-    if not cfg.model.speaker_condition_dim:
-        return {}
+    """LatentDataset keywords of the voice conditions read from stores: the speaker embedding
+    (model.speaker_condition_dim) and the recording quality (model.quality_condition); empty if both are off."""
     from .teacher import resolve_store
 
-    return {"speaker_condition": resolve_store(cfg.train.speaker_condition, cache),
-            "speaker_condition_source": cfg.train.speaker_condition_source,
-            "speaker_condition_min_cosine": cfg.train.speaker_condition_min_cosine}
+    sources = {}
+    if cfg.model.speaker_condition_dim:
+        sources.update(speaker_condition=resolve_store(cfg.train.speaker_condition, cache),
+                       speaker_condition_source=cfg.train.speaker_condition_source,
+                       speaker_condition_min_cosine=cfg.train.speaker_condition_min_cosine)
+    if cfg.model.quality_condition:
+        sources.update(quality_scores=resolve_store(cfg.train.quality_scores, cache),
+                       quality_dropout=cfg.train.quality_dropout)
+    return sources
 
 
 def speaker_metadata(data):

@@ -4,7 +4,7 @@ The generator is overhead bound (small matrices, many kernels), so two arms shar
 hour than one; arms that share a comparison still share the GPU model, cache, frame budget and schedule. Finished
 arms (OUT/<arm>/done) are skipped; an arm whose stores are missing waits until the end of the queue and is reported.
 
-  python scripts/trc/queue.py base-s42 base-eager base-s43 --parallel 2
+  python scripts/trc/arm_queue.py base-s42 base-eager base-s43 --parallel 2
 """
 
 import argparse
@@ -48,7 +48,8 @@ def main():
             pending.remove(arm)
             issue, config, overrides, _ = ARMS[arm]
             command = [PY, "scripts/trc/run_arm.py", "--arm", arm, "--config", config, "--gpu", args.gpu,
-                       "--notes", f"Issue {issue}. Base `{config}`; overrides: {', '.join(overrides) or 'none'}. "
+                       "--notes", f"Trained on [Codyfederer/tr-combined](https://huggingface.co/datasets/Codyfederer/"
+                                  f"tr-combined). Issue {issue}. Base `{config}`; overrides: {', '.join(overrides) or 'none'}. "
                                   f"Frame budget {setting('FRAME_BUDGET')}, {setting('AB_STEPS')}-update LR schedule "
                                   f"stopped at {setting('AB_STOP')}; cache {cache.name} of tr-combined."]
             if overrides:

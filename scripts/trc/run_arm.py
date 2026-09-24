@@ -144,7 +144,8 @@ def main():
                                    env={**os.environ, "CUDA_VISIBLE_DEVICES": args.gpu, "TRAIN_GPUS": "1",
                                         "MASTER_PORT": str(29500 + hash(args.arm) % 1000)})
     title = args.title or f"DACVAE-TTS tr-combined A/B arm `{args.arm}`"
-    notes = args.notes or f"Config: `{config.name}` ({', '.join(args.set) or 'as given'}); frame budget " \
+    notes = args.notes or f"Trained on [Codyfederer/tr-combined](https://huggingface.co/datasets/Codyfederer/tr-combined). " \
+                          f"Config: `{config.name}` ({', '.join(args.set) or 'as given'}); frame budget " \
                           f"{setting('FRAME_BUDGET')}, {setting('AB_STEPS')}-update schedule stopped at {stop}."
     for step in steps:
         snapshot = run / f"step-{step:07d}.pt"
