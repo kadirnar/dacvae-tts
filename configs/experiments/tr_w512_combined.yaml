@@ -1,0 +1,131 @@
+# Combined recipe (integration branch, tracking issue #17): configs/nano_tr_w512.yaml (run C) plus the options
+# with the strongest evidence in docs/arastirma-raporu-2026-09-24.md, each commented with its issue number.
+# The DiT block options of #9 (long_skip, value_residual, ffn_conv_kernel, attn_gate, ffn_activation,
+# final_adaln, cond_text_pool) and #14's dropout / model guidance stay OFF: they need their individual A/Bs first.
+# Needs, next to the cache (see each issue's GPU notes):
+#   <cache>/silence.pt                          python scripts/silence_latent.py --cache <cache>          (#11)
+#   <cache>/teacher/mhubert147-l12-pca256       scripts/extract_teacher_features.py frames --layer 12 --pca-dim 256 (#10)
+#   <cache>/teacher/ecapa-speechbrain           scripts/extract_teacher_features.py speakers              (#10)
+# Not resumable from run C checkpoints (different configuration; the char CTC head and the teacher heads are new
+# parameters): start a new run. Validation stays on the baseline pairs, so validation_flow remains comparable,
+# but latent_delta places the optimum slightly past the positive target (#8): compare runs by Freya CER/WER.
+model:
+  width: 512
+  depth: 12
+  heads: 8
+  text_depth: 4
+  text_attention: 4
+  patch_size: 1
+  latent_dim: 128
+  positions: rope
+  qk_norm: true
+  prediction: edm
+  text_layout: joined
+  duration: rule
+  cond_dropout: 0.2
+  ctc_layer: 8
+  adaln_rank: 64
+  # (#11) CTC on Turkish letters + space (34 labels) instead of UTF-8 bytes: one label per letter, so fast
+  # speakers stay within the 25 fps CTC limit (A-DMA used character targets).
+  ctc_targets: chars
+  # (#10) speech-REPA: block 10 predicts mHuBERT-147 layer-12 frames (PCA 256); CTC stays on block 8 (A-DMA: text
+  # alignment earlier, speech alignment later, never the same block). repa_dim = the store's metadata "dim".
+  repa_layer: 10
+  repa_dim: 256
+  # (#10) TLA-SA: every block, time-dependent block weights, aligned to SpeechBrain ECAPA embeddings (192-d),
+  # a different SV model than the WavLM-large SIM-o judge, so a SIM gain is not metric gaming.
+  tla_layers: all
+  tla_dim: 192
+  tla_hidden: 256
+train:
+  steps: 60000
+  batch_size: 96
+  accumulation: 1
+  learning_rate: 0.0008
+  warmup: 2000
+  weight_decay: 0.01
+  optimizer: muon
+  muon_momentum: 0.95
+  ema_decay: 0.9999
+  precision: bf16
+  workers: 4
+  prefetch_factor: 4
+  checkpoint_every: 1000
+  keep_every: 5000
+  validate_every: 1000
+  log_every: 100
+  # (#7) Selective checkpointing: keep matmul/attention outputs, recompute only the pointwise ops; applied at
+  # trace time inside the compiled block step.
+  grad_checkpoint: selective
+  # (#7) Regional compilation: one compiled block step reused by all 12 blocks; a compiler failure falls back to
+  # eager with full checkpointing. Only the batch dimension is symbolic (lengths bounded by the pad multiples).
+  compile: blocks
+  compile_dynamic: batch
+  seed: 42
+  flow_reduction: frame
+  pairing: within
+  prompt_fraction_min: 0.1
+  prompt_fraction_max: 0.6
+  prompt_dropout: 0.3
+  time_sampling: logit_normal
+  batch_expansion: 4
+  ctc_weight: 0.1
+  # text_hinge settings of run C, unused under latent_delta; switching contrastive_mode back restores the hinge.
+  contrastive_weight: 0.2
+  contrastive_margin: 0.1
+  wandb_project: dacvae-tts-tr
+  # (#7) No per-step value checks that stall the host (shapes are still checked); nonfinite losses/gradients are
+  # caught at the next log/validation/checkpoint, always before a checkpoint is written.
+  strict_checks: false
+  # (#7) Masked length padding: identical losses, fewer compiled graphs; the frame budget counts padded frames
+  # (cross-prompt epoch costs included).
+  pad_multiple: 64
+  text_pad_multiple: 32
+  # (#7) Loader-side negatives apply to the text hinge only; inert under latent_delta (nothing is drawn), kept on so
+  # a text_hinge arm of this recipe stays sync-free.
+  loader_negatives: true
+  # (#8) RobustSpeechFlow/ΔFM latent negatives: repeat/skip-corrupted and shifted target latents with the correct
+  # text, L_pos - 0.2 L_rand - 0.2 L_aug, no extra generator pass (the hinge cost ~20-25% per step). Skip
+  # negatives pad their tail with <cache>/silence.pt (the same frame as the #11 tail silence).
+  contrastive_mode: latent_delta
+  contrastive_random_weight: 0.2
+  contrastive_aug_weight: 0.2
+  contrastive_span_min: 3
+  contrastive_span_max: 125
+  contrastive_repeat_coverage: [0.2, 0.4]
+  contrastive_skip_coverage: [0.4, 0.8]
+  contrastive_negative_cap: 0.0
+  # (#11) Cross-utterance prompts (VoiceStar CPM: WER 8.49 -> 6.42, SIM flat): 40% of the prompted rows use 1-3
+  # other utterances of the speaker label (<= 12 s) as the prompt.
+  cross_prompt_prob: 0.4
+  cross_prompt_max_utterances: 3
+  cross_prompt_max_seconds: 12.0
+  # (#11) Short targets: 25% of the cuts drawn from [prompt_fraction_max, 0.85].
+  long_prompt_prob: 0.25
+  prompt_fraction_long_max: 0.85
+  # (#11) Tail silence: 30% of the targets end in up to 0.8 s of encoded silence (learn to stop; Irodori v4.1).
+  tail_silence_prob: 0.3
+  tail_silence_max_seconds: 0.8
+  # (#11) Quiet cuts: the within cut moves to the silence-closest frame within +-0.3 s (prompts end in a pause).
+  prompt_cut: quiet
+  # (#10) speech-REPA and TLA-SA targets (stores relative to the cache directory).
+  teacher_features: teacher/mhubert147-l12-pca256
+  repa_weight: 1.0           # A-DMA lambda_speech
+  repa_stop_step: 0          # HASTE option; 0 keeps REPA on for the whole run
+  repa_frames: all
+  speaker_embeddings: teacher/ecapa-speechbrain
+  tla_weight: 0.5            # TLA-SA lambda
+  tla_entropy: 0.01
+  # (#14) WSD: constant LR until update 48k, then a 1-sqrt decay to 0 over the last 20% (equal to cosine, and any
+  # stable-phase snapshot can branch into its own cooldown). decay_cache (a second, hq cache for the decay phase) is
+  # machine specific and left out; add e.g. `decay_cache: /workspace/data/tr55/hq` (it needs its own silence.pt and
+  # teacher stores, or absolute store paths covering its rows).
+  lr_schedule: wsd
+  decay_fraction: 0.2
+  decay_shape: 1-sqrt
+  min_lr_ratio: 0.0
+  # (#14) Uniform flow times in the cooldown (BareWave: SIM 0.522 -> 0.543, UTMOS 3.70 -> 3.82, WER flat).
+  final_time_sampling: uniform
+  final_time_sampling_start: decay
+  # (#14) A second EMA track: `ema` keeps 0.9999 (ema_decay), `ema_0.999` follows the cooldown more closely.
+  ema_decays: [0.9999, 0.999]
