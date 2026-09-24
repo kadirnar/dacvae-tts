@@ -27,6 +27,7 @@ ORDINAL = {
 LATIN_EXTRA = set("çğıöşüâîûÇĞİÖŞÜÂÎÛ")
 PUNCTUATION = set(".,;:!?'\"-()")
 VOWELS = set("aeıioöuüâîû")
+VOICELESS = set("çfhkpsşt")  # a suffix-initial d assimilates to t after these (beşte, kırktan)
 # Abbreviations with a fixed spoken form. The synthesis frontend expands all of them; the training normalization
 # `turkish-v2` and the `turkish-v2` metric text only expand SAFE_ABBREVIATIONS (below).
 ABBREVIATIONS = {
@@ -178,7 +179,9 @@ def normalize_numbers(text, v2=False):
       (üçe, kırka, sekize are right as written) and ordinals are dördüncü either way; the suffix vowels were
       written for "dört" already, so its harmony stays correct;
     - an ordinal suffix followed by further suffixes is still an ordinal: 2'incisi -> ikincisi, 7'inciye ->
-      yedinciye, 6'ıncısı -> altıncısı (v1 only reads a bare ordinal suffix: ikiincisi, altııncısı).
+      yedinciye, 6'ıncısı -> altıncısı (v1 only reads a bare ordinal suffix: ikiincisi, altııncısı);
+    - a suffix-initial d after a number word ending in a voiceless consonant (ç f h k p s ş t) becomes t, the
+      common misspelling of the locative/ablative: 5'de -> beşte, 3'den -> üçten, 40'da -> kırkta (v1: beşde).
     """
     # 50% / %50 / % 50 -> yüzde 50
     text = re.sub(r"%\s?(\d+(?:[.,]\d+)?)", r"yüzde \1", text)
@@ -206,6 +209,8 @@ def normalize_numbers(text, v2=False):
         words = _int_words(number)
         if v2 and words.endswith("dört") and tr_lower(suffix[0]) in VOWELS:
             words = words[:-1] + "d"
+        if v2 and words[-1] in VOICELESS and suffix[0] in "dD":
+            suffix = ("t" if suffix[0] == "d" else "T") + suffix[1:]
         return words + suffix
 
     text = re.sub(rf"(\d+)['’]([{LETTER}]+)", suffixed, text)

@@ -69,6 +69,8 @@ V1_PINS = {
     "14'ün": "on dörtün",
     "2'incisi": "ikiincisi",
     "6'ıncısı": "altııncısı",
+    "5'de": "beşde",
+    "40'da": "kırkda",
     "T.C. vatandaşı": "T.C. vatandaşı",
     "Koç Holding A.Ş.": "Koç Holding A.Ş.",
     "Yılmaz Ltd. Şti.": "Yılmaz Ltd. Şti.",
@@ -132,6 +134,15 @@ def test_turkish_v1_outputs_are_pinned(raw, v1):
         ("6'ıncısı", "altıncısı"),
         ("4'üncüsü", "dördüncüsü"),
         ("2'nci", "ikinci"),
+        # A suffix-initial d after a voiceless final consonant is t (the common misspelling of -te/-ten/-ta).
+        ("5'de", "beşte"),
+        ("3'den", "üçten"),
+        ("40'da", "kırkta"),
+        ("60'dan", "altmıştan"),
+        ("4'de", "dörtte"),
+        ("%5'de", "yüzde beşte"),
+        ("2'de", "ikide"),
+        ("9'dan", "dokuzdan"),
         # Dates, clock times and minus signs are read as the synthesis frontend reads them.
         ("14:00'te", "on dörtte"),
         ("11.30'da", "on bir otuzda"),
@@ -214,6 +225,7 @@ METRIC_V1_PINS = {
     "COVID-19": "covıd on dokuz",
     "4'e": "dörte",
     "2'incisi": "ikiincisi",
+    "5'de": "beşde",
 }
 
 
@@ -292,6 +304,9 @@ def test_metric_v1_outputs_are_pinned(raw, v1):
         ("%4'ü", "yüzde dördü"),
         ("2'incisi", "ikincisi"),
         ("6'ıncısı", "altıncısı"),
+        ("5'de", "beşte"),
+        ("3'den", "üçten"),
+        ("40'da", "kırkta"),
         ("İsveç'ten 86 kişi!", "isveçten seksen altı kişi"),
         ("İsveç´ten", "isveçten"),
         ("‘Merhaba’ dedi", "merhaba dedi"),
@@ -315,6 +330,7 @@ def test_metric_v2(raw, v2):
         ("T.C. vatandaşı", "te ce vatandaşı"),
         ("5 km yürüdük", "beş kilometre yürüdük"),
         ("Saat 4'e kadar", "saat dörde kadar"),
+        ("Saat 5'de başladı", "saat beşte başladı"),
     ],
 )
 def test_metric_v2_scores_equivalent_spellings_as_equal(reference, hypothesis):
