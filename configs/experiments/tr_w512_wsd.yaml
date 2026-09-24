@@ -1,0 +1,62 @@
+# Issue #14 (a): run C (configs/nano_tr_w512.yaml) as a single 60k WSD run. Warmup 2k, constant LR 8e-4 until
+# update 48k, then a 1-sqrt decay to 0 over the last 20% (Hägele et al., arXiv:2405.18392) on the hq cache
+# (MiniCPM, arXiv:2404.06395) with uniform flow times (BareWave, arXiv:2606.09048): the clean -> hq warm-started
+# stages in one run, with the optimizer state and the EMA carried through the switch. Compare with C 60k +
+# stage 2 (configs/nano_tr_w512_stage2.yaml). Everything else is run C. Any stable-phase snapshot (step-*.pt
+# before 48k) can also be branched into its own cooldown: --init-from with warmup 0, lr_schedule wsd,
+# decay_fraction 1.0 (the optimizer state starts fresh; Muon's momentum rebuilds within a few dozen updates).
+model:
+  width: 512
+  depth: 12
+  heads: 8
+  text_depth: 4
+  text_attention: 4
+  patch_size: 1
+  latent_dim: 128
+  positions: rope
+  qk_norm: true
+  prediction: edm
+  text_layout: joined
+  duration: rule
+  cond_dropout: 0.2
+  ctc_layer: 8
+  adaln_rank: 64
+train:
+  steps: 60000
+  batch_size: 96
+  accumulation: 1
+  learning_rate: 0.0008
+  warmup: 2000
+  weight_decay: 0.01
+  optimizer: muon
+  muon_momentum: 0.95
+  ema_decay: 0.9999
+  precision: bf16
+  workers: 4
+  prefetch_factor: 4
+  checkpoint_every: 1000
+  keep_every: 5000
+  validate_every: 1000
+  log_every: 100
+  grad_checkpoint: true
+  compile: false
+  seed: 42
+  flow_reduction: frame
+  pairing: within
+  prompt_fraction_min: 0.1
+  prompt_fraction_max: 0.6
+  prompt_dropout: 0.3
+  time_sampling: logit_normal
+  batch_expansion: 4
+  ctc_weight: 0.1
+  contrastive_weight: 0.2
+  contrastive_margin: 0.1
+  wandb_project: dacvae-tts-tr
+  lr_schedule: wsd
+  decay_fraction: 0.2          # decay from update 48000 on
+  decay_shape: 1-sqrt
+  min_lr_ratio: 0.0            # decay to zero as in Hägele et al.; 0.1 keeps the cosine recipe's floor
+  decay_cache: /workspace/data/tr55/hq   # the hq subset on the training machine (validation stays on --cache)
+  final_time_sampling: uniform
+  final_time_sampling_start: decay
+  ema_decays: [0.9999, 0.9995] # 0.9995 (~2k-update horizon) follows the cooldown; 0.9999 averages ~10k

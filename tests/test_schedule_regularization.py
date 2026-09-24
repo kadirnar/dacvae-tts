@@ -1,6 +1,7 @@
 """Training schedule and regularization options of issue #14; every default keeps the original recipe."""
 
 import copy
+import dataclasses
 import json
 import math
 import shutil
@@ -476,3 +477,13 @@ def test_model_guidance_fine_tune_is_marked_for_sampling_without_cfg(cache, tmp_
                 cache, tmp_path / "tune", init_from=str(tmp_path / "base" / "last.pt"))
     assert tuned["recommended_guidance"] == 1.0 and tuned["step"] == 2 and "ema_0.9" in tuned
     assert all(torch.isfinite(v).all() for v in tuned["model"].values())
+
+
+# ------------------------------------------------------------------------------------------ example configs
+
+
+@pytest.mark.parametrize("name", ["tr_w512_wsd", "tr_w512_regularized", "tr_w512_model_guidance_ft"])
+def test_example_configs_load(name):
+    cfg = Config.load(CONFIGS / "experiments" / f"{name}.yaml")
+    # Same architecture as run C, so its checkpoints can warm-start them (dropout may differ).
+    assert dataclasses.replace(cfg.model, dropout=0.0) == Config.load(CONFIGS / "nano_tr_w512.yaml").model
