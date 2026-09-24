@@ -6,9 +6,11 @@ import pytest
 import torch
 
 from dacvae_tts.config import Config, ModelConfig
-from dacvae_tts.model import Attention, Block, FlowTTS
+from dacvae_tts.model import Attention, Block, FlowTTS, sample
 from dacvae_tts.optim import partition
+from dacvae_tts.text import BYTE_OFFSET
 from dacvae_tts.training import Objective
+from tests.test_model import model_and_batch
 from tests.test_nano import NANO, nano_batch
 
 BASE = dict(NANO, adaln_rank=8)
@@ -19,14 +21,15 @@ OPTIONS = {
     "attn_gate": dict(attn_gate="head"),
     "swiglu": dict(ffn_activation="swiglu"),
     "final_adaln": dict(final_adaln=True),
+    "cond_text_pool": dict(cond_text_pool=True),
 }
 # Every option explicitly disabled: must be exactly the previous model.
 OFF = dict(
     long_skip=False, value_residual=False, ffn_conv_kernel=0, attn_gate="none", ffn_activation="gelu",
-    final_adaln=False,
+    final_adaln=False, cond_text_pool=False,
 )
 # Options whose new parameters start at zero (or identity): the model starts as the baseline function.
-ZERO_INIT = ["long_skip", "value_residual", "ffn_conv", "attn_gate", "final_adaln"]
+ZERO_INIT = ["long_skip", "value_residual", "ffn_conv", "attn_gate", "final_adaln", "cond_text_pool"]
 ALL = {key: value for option in OPTIONS.values() for key, value in option.items()}
 CASES = {**OPTIONS, "all": ALL, "ffn_conv_patch2": dict(ffn_conv_kernel=3, patch_size=2)}
 
@@ -165,6 +168,7 @@ def test_muon_partition_covers_the_new_parameters():
     assert muon["blocks.0.ff.0.proj.weight"] == 2 and muon["blocks.0.ff.1.weight"] == 1  # SwiGLU gate | value
     assert muon["blocks.1.self_attn.kv.weight"] == 2
     assert muon["final_ada.0.weight"] == 1 and muon["final_ada.2.weight"] == 2  # rank-r down | shift, scale
+    assert muon["text_pool.weight"] == 1  # hidden D x D map
     full, _ = split(FlowTTS(ModelConfig(**NANO, final_adaln=True)))  # adaln_rank 0: one D -> 2D map
     assert full["final_ada.1.weight"] == 2
     gelu, _ = split(FlowTTS(ModelConfig(**{**BASE, **ALL, "ffn_activation": "gelu"})))
@@ -262,6 +266,42 @@ def test_final_adaln_modulates_the_output_norm_from_the_condition():
     # 1 + scale = 0 removes the normalized features: only the output head's bias is left on every frame.
     frames = int(batch["valid"].sum())
     assert torch.allclose(velocity[batch["valid"]], model.output[1].bias.expand(frames, -1))
+
+
+def test_cond_text_pool_averages_the_target_bytes_and_vanishes_when_dropped():
+    _, batch = model_and_batch()  # segments layout: reference and target transcripts
+    model = perturbed(FlowTTS(ModelConfig(**PLAIN, cond_text_pool=True))).eval()
+    assert model.text_pool.weight.shape == (32, 32) and model.text_pool.bias is None
+    seen = []
+    model.text_pool.register_forward_hook(lambda module, args, output: seen.append(args[0]))
+    model(batch["latents"], torch.tensor([0.3, 0.7]), **inputs(batch), drop=torch.tensor([False, True]))
+    text = model.conditions(batch["prompt"], batch["prompt_mask"], batch["tokens"], batch["segments"])[0]
+    target = (batch["segments"] == 1) & (batch["tokens"] >= BYTE_OFFSET)
+    assert target.sum() < batch["tokens"].ne(0).sum()  # reference transcript and special tokens excluded
+    expected = (text * target[..., None]).sum(1) / target.sum(1, keepdim=True)
+    assert torch.allclose(seen[0][0], expected[0], atol=1e-6)
+    assert not seen[0][1].any()  # dropped text: the pooled term is exactly zero
+
+
+def test_condition_dropout_removes_the_transcript_from_every_option():
+    """CFG's null branch: with the condition dropped no option (pooled text, gates, skips, final adaLN) may
+    carry the transcript, and forward's dropout agrees with the sampler's cached zero conditions."""
+    model = perturbed(FlowTTS(ModelConfig(**BASE, **ALL))).eval()
+    batch = nano_batch(prompts=(3, 4))
+    x, kwargs = batch["latents"], inputs(batch)
+    time, drop = torch.tensor([0.3, 0.7]), torch.ones(2, dtype=torch.bool)
+    tokens = kwargs["tokens"]
+    other = dict(kwargs, tokens=tokens.masked_fill(tokens >= BYTE_OFFSET, BYTE_OFFSET + ord("x")))  # same length
+    null = model(x, time, **kwargs, drop=drop)
+    assert torch.equal(model(x, time, **other, drop=drop), null)
+    assert not torch.allclose(model(x, time, **other), model(x, time, **kwargs), atol=1e-4)
+    cond = model.conditions(kwargs["prompt"], kwargs["prompt_mask"], kwargs["tokens"], kwargs["segments"])
+    zeros = (torch.zeros_like(cond[0]), cond[1], torch.zeros_like(cond[2]))
+    blank = x.masked_fill(batch["prompt_mask"][..., None], 0)
+    stripped = dict(kwargs, prompt=torch.zeros_like(x), prompt_mask=torch.zeros_like(batch["prompt_mask"]))
+    assert torch.allclose(model(blank, time, **stripped, cached=zeros), null, atol=1e-6)
+    guided = sample(model, **kwargs, steps=2, guidance=2.0, seed=1)
+    assert torch.isfinite(guided).all() and torch.equal(guided[batch["prompt_mask"]], x[batch["prompt_mask"]])
 
 
 def test_example_configs_change_one_model_option_of_the_w512_recipe():
