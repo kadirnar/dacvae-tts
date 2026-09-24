@@ -256,3 +256,42 @@ def test_padded_epoch_costs_keep_the_frame_budget(cache):
         sampler.epoch = epoch
         for batch in sampler.batches():
             assert max(padded[i] for i in batch) * len(batch) <= 80
+
+
+def teacher_dataset(cache, **pairs):
+    """Within-pairing dataset of the fixture cache with #10's fake teacher stores (test_teacher.py)."""
+    from test_teacher import build_stores
+
+    from dacvae_tts.data import LatentDataset
+
+    frames, speakers = build_stores(cache)
+    return LatentDataset(cache, "train", pairing="within", layout="joined", teacher_features=frames,
+                         speaker_embeddings=speakers, **pairs)
+
+
+def test_teacher_frames_follow_cross_prompts_tail_silence_and_padding(cache):
+    """#10 x #11 x #7: teacher frames are sliced like the latents of cross-utterance prompts, extended
+    (and masked out of REPA) over appended tail silence, and padded with the frames by pad_lengths."""
+    from dacvae_tts.speed import pad_lengths
+
+    write_silence(cache)
+    data = teacher_dataset(cache, cross_prompt_prob=1.0, cross_prompt_max_seconds=0.5, tail_silence_prob=1.0,
+                           prompt_cut="quiet")
+    items = [data[(0, index)] for index in range(len(data))]
+    crossed = [(index, item) for index, item in enumerate(items) if "|" in item["reference_uid"]]
+    assert crossed and len(crossed) < len(items)  # both cross prompts and within cuts occur
+    index, item = crossed[0]
+    references = data.cross_plan(0, index)
+    assert torch.equal(item["teacher_reference"], torch.cat([data.row(r)["teacher"] for r in references]))
+    batch = collate(items)
+    lengths = [len(item["reference"]) + len(item["target"]) for item in items]
+    real = [length - item["tail_silence"] for length, item in zip(lengths, items)]
+    assert batch["teacher"].shape[:2] == batch["valid"].shape
+    assert batch["teacher_valid"].sum(1).tolist() == real and any(item["tail_silence"] for item in items)
+    padded = pad_lengths(batch, 8, 8)
+    assert padded["teacher"].shape[1] % 8 == 0 and padded["teacher_valid"].shape == padded["valid"].shape
+    cfg = ModelConfig(latent_dim=4, width=16, heads=2, depth=2, text_depth=1, text_layout="joined",
+                      duration="rule", repa_layer=2, repa_dim=3, tla_layers="all", tla_dim=3, tla_hidden=8)
+    objective = Objective(FlowTTS(cfg), repa_weight=1.0, tla_weight=0.5).train()
+    losses = objective(padded)
+    assert torch.isfinite(losses["repa"]).all() and torch.isfinite(losses["tla"]).all()

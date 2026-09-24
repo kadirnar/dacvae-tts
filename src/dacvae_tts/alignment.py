@@ -128,6 +128,8 @@ def teacher_terms(model, batch, hidden, time, drop, repa=True, tla=True, repa_fr
             raise ValueError(f"Teacher frames must be [B,L,{model.cfg.repa_dim}] like the latents")
         blind = drop if model.cfg.reference_paths != "summary" else torch.ones_like(drop)
         mask = target if repa_frames == "target" else torch.where(blind[:, None], target, valid)
+        if "teacher_valid" in batch:  # appended tail silence (#11) has no teacher frames
+            mask = mask & batch["teacher_valid"]
         prediction = model.repa(hidden[model.cfg.repa_layer], valid.size(1))
         terms["repa"] = masked_distance(prediction, teacher, mask)
     if tla and model.tla is not None:

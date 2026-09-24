@@ -161,13 +161,20 @@ def pair_teacher(reference, target, cut=None):
     """Teacher targets sliced exactly like the latents of one training item.
 
     `within` pairing (`cut` given): reference = frames [:cut], target = frames [cut:] of the same row;
-    `cross`: the reference row's frames and the target row's frames. The speaker embedding is always
-    the target utterance's. Rows without teacher entries add nothing, keeping items unchanged.
+    `cross`: the reference row's frames and the target row's frames. A list of reference rows (#11's
+    cross-utterance prompts) concatenates their frames in order, like the prompt latents. The speaker
+    embedding is always the target utterance's. Rows without teacher entries add nothing, keeping items
+    unchanged.
     """
     extra = {}
     if "teacher" in target:
         whole = target["teacher"]
-        extra["teacher_reference"] = whole[:cut] if cut is not None else reference["teacher"]
+        if cut is not None:
+            extra["teacher_reference"] = whole[:cut]
+        elif isinstance(reference, (list, tuple)):
+            extra["teacher_reference"] = torch.cat([row["teacher"] for row in reference])
+        else:
+            extra["teacher_reference"] = reference["teacher"]
         extra["teacher_target"] = whole[cut:] if cut is not None else whole
     if "speaker_embedding" in target:
         extra["speaker_embedding"] = target["speaker_embedding"]
@@ -175,20 +182,29 @@ def pair_teacher(reference, target, cut=None):
 
 
 def collate_teacher(items):
-    """Padded "teacher" [B,L,D] in collate's [reference | target] frame order, "speaker_embedding" [B,E]."""
+    """Padded "teacher" [B,L,D] in collate's [reference | target] frame order, "speaker_embedding" [B,E].
+
+    With #11's tail silence (items carry `tail_silence`), the appended frames have zero teacher rows and a
+    boolean "teacher_valid" [B,L] marks the frames that have real teacher features; speech-REPA only
+    aligns those. Without tail silence the batch is unchanged.
+    """
     batch = {}
     for key in ("teacher_target", "speaker_embedding"):
         present = [key in item for item in items]
         if any(present) and not all(present):
             raise ValueError(f"Either every item or none carries {key}")
     if "teacher_target" in items[0]:
-        features = []
+        features, real = [], []
         for item in items:
             reference, target = item["teacher_reference"], item["teacher_target"]
             if len(reference) != len(item["reference"]) or len(target) != len(item["target"]):
                 raise ValueError("Teacher frames must align with the reference and target latent frames")
             features.append(torch.cat([reference, target]))
+            frames = len(reference) + len(target)
+            real.append(torch.arange(frames) < frames - item.get("tail_silence", 0))
         batch["teacher"] = pad_sequence(features, batch_first=True)
+        if any("tail_silence" in item for item in items):
+            batch["teacher_valid"] = pad_sequence(real, batch_first=True)
     if "speaker_embedding" in items[0]:
         batch["speaker_embedding"] = torch.stack([item["speaker_embedding"] for item in items]).float()
     return batch

@@ -397,6 +397,7 @@ class LatentDataset(Dataset):
             "speaker": target["speaker"],
             "text_normalization": self.meta.get("text_normalization", "unicode-v1"),
             "layout": self.layout,
+            **pair_teacher(refs, target),  # teacher frames of the references back to back, like the latents
         }
 
     def prompt_range(self, epoch, index):
@@ -430,7 +431,13 @@ class LatentDataset(Dataset):
         rng = random.Random(self.seed + epoch * len(self) + index + TAIL_STREAM)
         frames = rng.randint(1, self.tail_silence_frames) if rng.random() < self.tail_silence_prob else 0
         pad = self.silence.expand(frames, -1)
-        return {**item, "target": torch.cat([item["target"], pad]), "tail_silence": frames}
+        item = {**item, "target": torch.cat([item["target"], pad]), "tail_silence": frames}
+        if "teacher_target" in item:
+            # The appended silence has no teacher frames: zero rows keep the teacher aligned with the latents
+            # and collate_teacher masks them out of speech-REPA (teacher_valid), see teacher.py.
+            teacher = item["teacher_target"]
+            item["teacher_target"] = torch.cat([teacher, teacher.new_zeros(frames, teacher.size(-1))])
+        return item
 
 
 def collate(items):

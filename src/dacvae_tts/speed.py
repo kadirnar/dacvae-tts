@@ -210,7 +210,8 @@ def training_epoch_costs(dataset, train):
     return PaddedEpochCosts(dataset.epoch_costs, train.pad_multiple)
 
 
-FRAME_KEYS = ("latents", "prompt", "prompt_mask", "valid")
+# Every per-frame batch entry: #10's teacher frames (and their tail-silence mask) must stay [B,L,...] too.
+FRAME_KEYS = ("latents", "prompt", "prompt_mask", "valid", "teacher", "teacher_valid")
 TEXT_KEYS = ("tokens", "segments", "negative_tokens", "negative_segments")
 
 
