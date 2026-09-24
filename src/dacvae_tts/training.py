@@ -427,19 +427,25 @@ def decay_phase_loader(cache, reference, cfg, rank, world, frame_budget, device)
     return training_batches(data, cfg, rank, world, frame_budget, device)
 
 
-def rng_state(device):
-    return {
+def rng_state(device, negatives=None):
+    """This rank's generator states; `negatives` is the in-step text_hinge generator (Objective.rng)."""
+    state = {
         "torch": torch.get_rng_state(),
         "python": random.getstate(),
         "cuda": torch.cuda.get_rng_state(device) if device.type == "cuda" else None,
     }
+    if negatives is not None:
+        state["negatives"] = negatives.getstate()
+    return state
 
 
-def restore_rng(state, device):
+def restore_rng(state, device, negatives=None):
     torch.set_rng_state(state["torch"])
     random.setstate(state["python"])
     if state["cuda"] is not None and device.type == "cuda":
         torch.cuda.set_rng_state(state["cuda"], device)
+    if negatives is not None and "negatives" in state:  # older checkpoints: the stream restarts, as before
+        negatives.setstate(state["negatives"])
 
 
 def shuffled_conditions(batch):
@@ -572,7 +578,7 @@ def train(args):
             cfg.train.muon_momentum,
             fused=device.type == "cuda",
         )
-        start_step, epoch, batch_offset = 0, 0, 0
+        start_step, epoch, batch_offset, resumed_rng = 0, 0, 0, None
         if args.resume:
             saved = torch.load(args.resume, map_location="cpu", weights_only=True)
             # Checkpoints written before the optimizer became configurable were trained with AdamW.
@@ -594,7 +600,7 @@ def train(args):
                 average.load_state_dict(saved[key])
             optimizer.load_state_dict(saved["optimizer"])
             start_step, epoch, batch_offset = saved["step"], saved["epoch"], saved["batch_offset"]
-            restore_rng(saved["rng"][rank], device)
+            resumed_rng = saved["rng"][rank]  # restored once the objective (and its generator) exists
         else:
             if getattr(args, "init_from", None):
                 # Warm start: weights only. Schedule, optimizer state and data order start fresh, so
@@ -640,6 +646,8 @@ def train(args):
             tla_entropy=cfg.train.tla_entropy,
             guidance_weight=cfg.train.model_guidance_weight,
         ).train()
+        if resumed_rng is not None:
+            restore_rng(resumed_rng, device, objective.rng)
         raw_objective = objective  # compile/DDP wrap the module; helper methods stay reachable here
         eager_forward = model.forward
         eager_runner = model.block_runner
@@ -945,7 +953,7 @@ def train(args):
                 if watch is not None:
                     watch.check()  # never write a checkpoint after an unnoticed nonfinite update
                 states = [None] * world
-                state = rng_state(device)
+                state = rng_state(device, raw_objective.rng)
                 if world > 1:
                     dist.all_gather_object(states, state)
                 else:

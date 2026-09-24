@@ -99,6 +99,40 @@ def test_two_rank_ddp_smoke(cache, tmp_path, reduction):
     assert all(math.isfinite(r["validation_text_gain"]) for r in validations)
 
 
+@pytest.mark.parametrize("loader_negatives", [False, True])
+def test_text_hinge_resume_is_exact(cache, tmp_path, loader_negatives):
+    """Text-hinge negatives drawn in the step (loader_negatives: false) come from Objective.rng, whose state
+    is checkpointed per rank: stopping and resuming reproduces the uninterrupted run bit for bit."""
+    from dacvae_tts import training
+
+    config = config_file(tmp_path)
+    cfg = yaml.safe_load(config.read_text())
+    cfg["train"].update(steps=6, checkpoint_every=3, contrastive_weight=0.5, loader_negatives=loader_negatives)
+    config.write_text(yaml.safe_dump(cfg))
+    names = "steps batch_size accumulation workers precision learning_rate optimizer worker_threads"
+    names += " prefetch_factor loader_start_method cuda_prefetch compile stop_after init_from resume"
+    base = {**dict.fromkeys(names.split()), "config": str(config), "cache": str(cache), "device": "cpu"}
+    base.update(frame_budget=0, no_validation=True)
+    full, resumed = tmp_path / "full", tmp_path / "resumed"
+    training.train(types.SimpleNamespace(**base, output=str(full)))
+    training.train(types.SimpleNamespace(**{**base, "stop_after": 3}, output=str(resumed)))
+    saved = torch.load(resumed / "last.pt", weights_only=True)
+    assert saved["step"] == 3
+    training.train(types.SimpleNamespace(**{**base, "resume": str(resumed / "last.pt")}, output=str(resumed)))
+    a = torch.load(full / "last.pt", weights_only=True)
+    b = torch.load(resumed / "last.pt", weights_only=True)
+    assert a["step"] == b["step"] == 6
+    for key in a["model"]:
+        assert torch.equal(a["model"][key], b["model"][key]), key
+        assert torch.equal(a["ema"][key], b["ema"][key]), key
+    # Checkpoints written before the generator was saved still resume (with a fresh negative stream).
+    del saved["rng"][0]["negatives"]
+    torch.save(saved, tmp_path / "old.pt")
+    old = {**base, "resume": str(tmp_path / "old.pt"), "stop_after": 4}
+    training.train(types.SimpleNamespace(**old, output=str(tmp_path / "old")))
+    assert torch.load(tmp_path / "old" / "last.pt", weights_only=True)["step"] == 4
+
+
 def test_warm_start_loads_weights_and_restarts_schedule(cache, tmp_path):
     config = config_file(tmp_path)
     base = ["-m", "dacvae_tts", "train", "--config", str(config), "--cache", str(cache), "--device", "cpu"]
