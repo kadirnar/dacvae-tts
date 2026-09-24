@@ -139,3 +139,15 @@ def tokenize_bytes(reference: bytes, target: bytes, layout="segments"):
     if not target:
         raise ValueError("Empty target transcript bytes")
     return assemble(encode_ids(reference) if reference else None, encode_ids(target), layout)
+
+
+def join_ids(parts):
+    """Cached ids of several utterances -> one transcript [BOS a SPACE b ... EOS] (a multi-utterance prompt)."""
+    if not parts:
+        raise ValueError("Nothing to join")
+    bodies = []
+    for ids in parts:
+        if len(ids) < 3:
+            raise ValueError("Empty transcript ids")
+        bodies += [np.asarray(ids[1:-1], dtype=ID_DTYPE), np.array([SPACE], dtype=ID_DTYPE)]
+    return np.concatenate([np.array([BOS], dtype=ID_DTYPE), *bodies[:-1], np.array([EOS], dtype=ID_DTYPE)])

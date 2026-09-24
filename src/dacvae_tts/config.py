@@ -98,6 +98,24 @@ class TrainConfig:
     contrastive_weight: float = 0.0  # skip/repeat text negatives (RobustSpeechFlow-style hinge)
     contrastive_margin: float = 0.1  # required loss gap, relative to the positive loss
     wandb_project: str = ""  # set (or pass --wandb-project) to mirror the JSONL logs to Weights & Biases
+    # Training pairs (issue #11). All off by default, which reproduces the previous data stream exactly.
+    # Cross-utterance prompts (VoiceStar, arXiv:2505.19462: continuation-only WER 8.49 -> mixed 6.42, SIM flat):
+    # in `within` pairing a prompted item uses, with this probability, 1..max other utterances of its speaker
+    # label (joined transcripts, at most max seconds) as the prompt and its whole utterance as the target.
+    cross_prompt_prob: float = 0.0
+    cross_prompt_max_utterances: int = 3
+    cross_prompt_max_seconds: float = 12.0
+    # Short targets: with this probability the within cut fraction is drawn from
+    # [prompt_fraction_max, prompt_fraction_long_max] instead of [prompt_fraction_min, prompt_fraction_max].
+    long_prompt_prob: float = 0.0
+    prompt_fraction_long_max: float = 0.85
+    # Tail silence (Irodori v4.1: fixing over-long durations CER 5.35 -> 4.69): append 1..max seconds of the
+    # encoded-silence latent (<cache>/silence.pt, scripts/silence_latent.py) to targets; the loss covers it.
+    tail_silence_prob: float = 0.0
+    tail_silence_max_seconds: float = 0.8
+    # `quiet` moves each within cut to the silence-closest frame within +-0.3 s (needs silence.pt), so
+    # prompts end in a pause like inference prompts do instead of mid-word.
+    prompt_cut: str = "random"
 
     def __post_init__(self):
         if self.worker_threads < 1 or self.prefetch_factor < 1:
@@ -139,6 +157,20 @@ class TrainConfig:
             raise ValueError("contrastive settings must be nonnegative")
         if self.batch_expansion < 1 or self.keep_every < 0 or self.ctc_weight < 0:
             raise ValueError("batch_expansion must be positive and keep_every nonnegative")
+        if not all(
+            0 <= p <= 1 for p in (self.cross_prompt_prob, self.long_prompt_prob, self.tail_silence_prob)
+        ):
+            raise ValueError("cross_prompt_prob, long_prompt_prob and tail_silence_prob must lie in [0,1]")
+        if self.cross_prompt_max_utterances < 1 or self.cross_prompt_max_seconds <= 0:
+            raise ValueError("cross_prompt_max_utterances and cross_prompt_max_seconds must be positive")
+        if self.long_prompt_prob and not self.prompt_fraction_max <= self.prompt_fraction_long_max < 1:
+            raise ValueError("Need prompt_fraction_max <= prompt_fraction_long_max < 1")
+        if self.tail_silence_max_seconds <= 0 or self.prompt_cut not in {"random", "quiet"}:
+            raise ValueError("tail_silence_max_seconds must be positive; prompt_cut random or quiet")
+        if self.pairing != "within" and (
+            self.cross_prompt_prob or self.long_prompt_prob or self.prompt_cut != "random"
+        ):
+            raise ValueError("cross_prompt_prob, long_prompt_prob and prompt_cut: quiet need within pairing")
 
 
 @dataclass

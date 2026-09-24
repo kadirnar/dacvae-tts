@@ -220,6 +220,22 @@ def validate(model, loader, device, precision, max_batches=20, reduction="uttera
     }
 
 
+def pair_options(cfg):
+    """Training-pair options (issue #11) of the training set. Validation keeps the baseline pairs, so
+    validation_flow stays comparable between the A/B arms of these options."""
+    names = (
+        "cross_prompt_prob",
+        "cross_prompt_max_utterances",
+        "cross_prompt_max_seconds",
+        "long_prompt_prob",
+        "prompt_fraction_long_max",
+        "tail_silence_prob",
+        "tail_silence_max_seconds",
+        "prompt_cut",
+    )
+    return {name: getattr(cfg.train, name) for name in names}
+
+
 def train(args):
     device, rank, world = distributed_device(args.device)
     try:
@@ -256,7 +272,12 @@ def train(args):
             prompt_fraction=(cfg.train.prompt_fraction_min, cfg.train.prompt_fraction_max),
         )
         data = LatentDataset(
-            args.cache, "train", cfg.train.seed, prompt_dropout=cfg.train.prompt_dropout, **pairing
+            args.cache,
+            "train",
+            cfg.train.seed,
+            prompt_dropout=cfg.train.prompt_dropout,
+            **pairing,
+            **pair_options(cfg),
         )
         if not data.meta.get("merged"):
             raise ValueError("Run merge on all prepared partitions before training")
@@ -271,6 +292,7 @@ def train(args):
             args.frame_budget,
             speaker_counts=data.group_end - data.group_start,
             speaker_balance=cfg.train.speaker_balance,
+            epoch_costs=data.epoch_costs if cfg.train.cross_prompt_prob else None,
         )
         loader_rng = torch.Generator().manual_seed(cfg.train.seed + rank)
         loader = DataLoader(
