@@ -4,7 +4,8 @@ Synthesizes every case, then scores WER with Whisper-large-v3 (transformers) usi
 text convention (lower case, punctuation removed except apostrophes; both corpus-level and
 mean-per-utterance WER are reported) and speaker similarity with the repository's evaluator. The
 similarity model here is not the WavLM-large ECAPA checkpoint used by published SIM-o numbers, so
-treat that column as a development metric.
+treat that column as a development metric; `--sim-o` adds the published metric (dacvae_tts.sim_o,
+seed-tts-eval's WavLM-Large ECAPA-TDNN) against the original prompt wav as `sim_o`.
 
   python scripts/eval_seedtts.py --checkpoint runs/nano/step-0200000.pt \
       --meta seedtts_testset/en/meta.lst --audio-root seedtts_testset --output outputs/seedtts-nano
@@ -48,6 +49,10 @@ def main():
     parser.add_argument("--asr-device", default="cuda")
     parser.add_argument("--speaker-model", default="microsoft/wavlm-base-plus-sv")
     parser.add_argument("--skip-synthesis", action="store_true", help="Only score existing WAVs")
+    parser.add_argument("--sim-o", action="store_true",
+                        help="Also score SIM-o (seed-tts-eval WavLM-Large ECAPA-TDNN) against the original prompt")
+    parser.add_argument("--sim-o-checkpoint", help="Local wavlm_large_finetune.pth (default: pinned HF mirror)")
+    parser.add_argument("--sim-o-backend", choices=["transformers", "s3prl"], default="transformers")
     args = parser.parse_args()
 
     output = Path(args.output)
@@ -109,7 +114,12 @@ def main():
         AutoModelForAudioXVector.from_pretrained(args.speaker_model).to(similarity.device).eval()
     )
 
-    rows, edits, words, per_utterance, sims = [], 0, 0, [], []
+    sim_o = None
+    if args.sim_o:
+        from dacvae_tts.sim_o import SimO
+
+        sim_o = SimO(args.sim_o_checkpoint, args.sim_o_backend, args.asr_device)
+    rows, edits, words, per_utterance, sims, sims_o = [], 0, 0, [], [], []
     for case in cases:
         target = output / f"{case['id']}.wav"
         if not target.exists():
@@ -128,7 +138,11 @@ def main():
         with torch.inference_mode():
             sim = float((similarity.embedding(audio) * similarity.embedding(prompt)).sum())
         sims.append(sim)
-        rows.append({**case, "hypothesis": hypothesis, "wer": per_utterance[-1], "speaker_similarity": sim})
+        row = {**case, "hypothesis": hypothesis, "wer": per_utterance[-1], "speaker_similarity": sim}
+        if sim_o is not None:  # generated audio (no prompt frames) vs the ORIGINAL prompt recording
+            row["sim_o"] = sim_o.similarity(target, case["prompt_wav"])
+            sims_o.append(row["sim_o"])
+        rows.append(row)
     (output / "results.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
     summary = {
         "checkpoint": args.checkpoint,
@@ -145,6 +159,8 @@ def main():
         "seed": args.seed,
         "text_normalization": "seed-tts-eval: lower case, punctuation removed except apostrophes",
     }
+    if sim_o is not None:
+        summary.update(sim_o=float(np.mean(sims_o)) if sims_o else None, sim_o_model=sim_o.identity)
     (output / "summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))
 
