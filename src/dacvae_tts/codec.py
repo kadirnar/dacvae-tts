@@ -1,3 +1,4 @@
+import contextlib
 import hashlib
 import math
 import warnings
@@ -84,6 +85,95 @@ def read_audio(path, sample_rate, loudness=None):
     if loudness is not None:
         audio = normalize_loudness(audio, sample_rate, loudness)
     return torch.from_numpy(audio.copy())
+
+
+# "auto" pre-tanh gain: bring the 99.9th percentile of |tanh input| down to atanh(0.95) ~ 1.83, i.e. keep all but
+# the loudest 0.1% of samples below 0.95 at the output instead of on the flat top of the tanh (0.999 = atanh 3.8).
+PRE_TANH_CEILING = 0.95
+PRE_TANH_QUANTILE = 0.999
+
+
+def parse_pre_tanh_gain(value):
+    """CLI/API form of the pre-tanh gain: a positive number, "auto" or "auto:<output ceiling in (0,1)>"."""
+    if isinstance(value, str):
+        text = value.strip().lower()
+        try:
+            value = text if text.startswith("auto") else float(text)
+        except ValueError:
+            raise ValueError(f"pre_tanh_gain must be a positive number, auto or auto:<ceiling>, not {value!r}") from None
+    pre_tanh_mode(value)
+    return value
+
+
+def pre_tanh_mode(gain):
+    """None | ("fixed", gain) | ("auto", output ceiling); raises on anything else."""
+    if gain is None:
+        return None
+    if isinstance(gain, str):
+        head, _, tail = gain.partition(":")
+        if head == "auto":
+            try:
+                ceiling = float(tail) if tail else PRE_TANH_CEILING
+            except ValueError:
+                ceiling = float("nan")
+            if not 0 < ceiling < 1:
+                raise ValueError("The auto pre-tanh output ceiling must be a number in (0,1)")
+            return "auto", ceiling
+    elif isinstance(gain, (int, float)) and not isinstance(gain, bool) and math.isfinite(gain) and gain > 0:
+        return "fixed", float(gain)
+    raise ValueError(f"pre_tanh_gain must be None, a positive number, auto or auto:<ceiling>, not {gain!r}")
+
+
+def output_tanh(decoder):
+    """The decoder's output nn.Tanh, found by type (DACVAE: decoder.wm_model.encoder_block.pre[2]), never by path."""
+    found = [module for module in decoder.modules() if isinstance(module, torch.nn.Tanh)]
+    if not found:
+        raise ValueError("The codec decoder has no nn.Tanh output nonlinearity; pre_tanh_gain is unsupported")
+    if len(found) > 1:
+        raise ValueError(f"The codec decoder has {len(found)} nn.Tanh modules; its output tanh is ambiguous")
+    return found[0]
+
+
+def robust_level(x, quantile=PRE_TANH_QUANTILE):
+    """The `quantile` of |x| over all elements (kthvalue: no size limit, unlike torch.quantile)."""
+    values = x.detach().abs().flatten().float()
+    k = min(max(math.ceil(quantile * values.numel()), 1), values.numel())
+    return float(values.kthvalue(k).values)
+
+
+@contextlib.contextmanager
+def pre_tanh_gain_hook(decoder, gain):
+    """Scale the input of the decoder's output tanh by `gain` while the context is open; yields {"gain", "level"}.
+
+    DACVAE's decoder ends in `Decoder.watermark`: output = tanh(conv(snake(x))) + alpha * h, where the tanh sits in
+    `WatermarkEncoderBlock.pre` = [Snake, Conv(->1), Tanh, Conv(1->32)] (the output path drops the last conv via
+    `forward_no_conv`) and the watermark residual h is computed from the same tanh output. The 0.999 "clipping" of
+    high-guidance outputs (79/98/100/100% of files at g=3/4/5/6) is this tanh saturating: soft clipping baked into
+    the waveform that post-decode loudness normalization cannot undo. Scaling the latents is no loudness control
+    either (-18 dB at the codec input moved the latent norm by only 4%), so the gain acts on the tanh input.
+    `audio.finalize` restores -16 LUFS afterwards. The tanh runs twice per decode (watermark branch first, then the
+    output): the gain is fixed at the first call and reused, so both paths see the same scaled signal and the
+    watermark stays consistent. "auto" sets g = min(1, atanh(ceiling) / robust level), the level being the 99.9th
+    percentile of |tanh input| of the utterance, in the same single decoder pass; g = 1 leaves the output bit-exact.
+    """
+    mode, value = pre_tanh_mode(gain)
+    module = output_tanh(decoder)
+    applied = {}
+
+    def scale(_module, args):
+        if "gain" not in applied:
+            if mode == "auto":
+                level = robust_level(args[0])
+                applied.update(level=level, gain=min(1.0, math.atanh(value) / level) if level > 0 else 1.0)
+            else:
+                applied["gain"] = value
+        return (args[0] * applied["gain"], *args[1:])
+
+    handle = module.register_forward_pre_hook(scale)
+    try:
+        yield applied
+    finally:
+        handle.remove()
 
 
 class Codec:
@@ -242,7 +332,14 @@ class Codec:
         return mean.transpose(1, 2).contiguous().float().cpu()
 
     @torch.inference_mode()
-    def decode(self, latents):
+    def decode(self, latents, pre_tanh_gain=None, stats=None):
+        """Waveform [samples] of one utterance's latents [frames, C].
+
+        `pre_tanh_gain` (None, a positive number, "auto" or "auto:<output ceiling>") scales the input of the decoder's
+        output tanh against saturation; see `pre_tanh_gain_hook`. Both backends support it (FastCodec.decode runs the
+        original watermark head). None leaves the decoder untouched. `stats`, if a dict, receives the gain used
+        (`pre_tanh_gain`), the requested mode and, for "auto", the measured tanh-input level.
+        """
         if getattr(self, "encoder_only", False):
             raise ValueError("This codec was loaded encoder-only; reload with encoder_only=False to decode")
         if latents.ndim != 2 or latents.size(1) != self.latent_dim or latents.size(0) < 1:
@@ -250,6 +347,9 @@ class Codec:
         if not torch.isfinite(latents).all():
             raise ValueError("Cannot decode nonfinite latents")
         inputs = latents.to(self.device).T[None].contiguous()
+        gain = (
+            contextlib.nullcontext() if pre_tanh_gain is None else pre_tanh_gain_hook(self.model.decoder, pre_tanh_gain)
+        )
         with (
             torch.backends.cudnn.flags(
                 enabled=torch.backends.cudnn.enabled,
@@ -258,12 +358,19 @@ class Codec:
                 allow_tf32=False,
             ),
             torch.autocast(self.device.type, enabled=False),
+            gain as applied,
         ):
             waveform = (
                 self._fast.decode(inputs.float(), self.model)
                 if getattr(self, "_fast", None)
                 else self.model.decode(inputs.float())
             )
+        if pre_tanh_gain is not None:
+            if "gain" not in applied:
+                raise RuntimeError("The decoder never reached its output tanh; pre_tanh_gain had no effect")
+            if stats is not None:
+                stats.update(pre_tanh_gain=applied["gain"], pre_tanh_mode=str(pre_tanh_gain),
+                             pre_tanh_level=applied.get("level"))
         return waveform[0, 0].float().cpu()
 
     @torch.inference_mode()

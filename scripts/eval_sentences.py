@@ -18,12 +18,16 @@ recording (the published SIM-o). The originals come from the dataset: this scrip
       --dnsmos models/sig_bak_ovr.onnx [--band-limit-8k] [--utmosv2]
 
 `--band-limit-8k` is the FreyaTTS scoring protocol (8 kHz resample before ASR only) for Freya-TR-Eval tables.
+UTMOS comes from the protocol switches: `--utmos` (or `--utmos utmos22`) scores every output with UTMOS22-strong
+into `utmos`, `--utmosv2` (or `--utmos utmosv2`) with UTMOSv2 into `utmosv2`; `--select-utmos` is only the best-of-N
+selector's UTMOS.
 """
 
 import argparse
 import json
 import sys
 import time
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -33,9 +37,22 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from monitor import select_cases  # noqa: E402
 
-from dacvae_tts.eval_protocol import ProtocolScorer, add_protocol_args, protocol_from_args  # noqa: E402
-from dacvae_tts.inference import Synthesizer, VoiceReference  # noqa: E402
+from dacvae_tts.cli import add_output_quality_args  # noqa: E402
+from dacvae_tts.eval_protocol import (  # noqa: E402
+    ProtocolScorer,
+    add_protocol_args,
+    protocol_from_args,
+    utmos_models,
+)
+from dacvae_tts.inference import OUTPUT_OPTIONS, WINDOW_OPTIONS, Synthesizer, VoiceReference  # noqa: E402
 from dacvae_tts.metrics import Evaluator, summarize  # noqa: E402
+from dacvae_tts.quality import (  # noqa: E402
+    METRIC_FAMILY,
+    CandidateScorer,
+    load_utmos,
+    parse_select_by,
+    warn_judge_overlap,
+)
 from dacvae_tts.speakers import read_speaker_list  # noqa: E402
 
 
@@ -75,22 +92,34 @@ class HFWhisper:
         return [t.strip() for t in self.processor.batch_decode(ids, skip_special_tokens=True)]
 
 
-def best_of_n(tts, selector, text, voice, path, seconds, index, args, sampler):
-    """Synthesize N candidates in one batch; keep the lowest selector CER (ties: lowest WER, then first)."""
-    from dacvae_tts.metrics import error_counts
+def speaker_embedder(name, device):
+    """callable(16 kHz waveform) -> L2-normalized x-vector of a transformers AudioXVector model (SIM selection)."""
+    from transformers import AutoFeatureExtractor, AutoModelForAudioXVector
 
+    embedder = Evaluator.__new__(Evaluator)
+    embedder.device = torch.device(device)
+    embedder.extractor = AutoFeatureExtractor.from_pretrained(name)
+    embedder.speaker = AutoModelForAudioXVector.from_pretrained(name).to(device).eval()
+    return lambda audio: embedder.embedding(torch.as_tensor(audio))[0]
+
+
+def best_of_n(tts, scorer, text, voice, path, seconds, index, args, sampler, prompt_audio=None):
+    """Synthesize N candidates in one batch; keep the best under --select-by (default cer,wer: the lowest selector
+    CER, ties the lowest WER, then the first candidate)."""
+    select = partial(scorer.select, reference=prompt_audio) if "sim" in scorer.rule.metrics else scorer.select
     results, metadata = tts.synthesize_many(
         [text], voice, candidates=args.candidates, seconds=seconds, duration_scale=args.duration_scale,
         duration_mode=args.duration_mode, steps=args.steps, guidance=args.guidance, seed=args.seed + index,
-        sway=args.sway, guidance_until=args.guidance_until, noise_scale=args.noise_scale, **sampler,
+        sway=args.sway, guidance_until=args.guidance_until, noise_scale=args.noise_scale, selector=select, **sampler,
     )
     candidates = results[0]
-    hypotheses = selector.transcribe([c["audio"] for c in candidates], tts.codec.sample_rate)
-    scores = [error_counts(text, h, "turkish-v1") for h in hypotheses]
-    best = min(range(len(candidates)), key=lambda k: (scores[k]["cer"], scores[k]["wer"], k))
+    best = metadata["selected"][0]
+    scores = [c["selection"] for c in candidates]
     audio = candidates[best]["audio"]
     sf.write(path, audio, tts.codec.sample_rate, subtype="FLOAT")
-    meta = {**metadata, "selected": best, "candidate_cer": [s["cer"] for s in scores], "candidate_hypotheses": hypotheses,
+    chosen = {k: candidates[best][k] for k in ("latent_moments", "pre_tanh_gain", "pre_tanh_level") if k in candidates[best]}
+    meta = {**metadata, **chosen, "selected": best, "candidate_scores": scores,
+            "candidate_cer": [s.get("cer") for s in scores], "candidate_hypotheses": [s.get("hypothesis") for s in scores],
             "audio_seconds": len(audio) / tts.codec.sample_rate}
     path.with_suffix(".json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
     return {"audio_seconds": meta["audio_seconds"], "rtf": metadata["request_seconds"] / max(meta["audio_seconds"], 1e-6),
@@ -215,9 +244,19 @@ def main():
     parser.add_argument("--apg-norm", type=float, default=0.0)
     parser.add_argument("--apg-momentum", type=float, default=0.0)
     parser.add_argument("--speaker-guidance", type=float, default=None)
+    add_output_quality_args(parser)
     parser.add_argument("--candidates", type=int, default=1,
-                        help="Best-of-N: generate N candidates per sentence and keep the one the selector ASR transcribes best")
+                        help="Best-of-N: generate N candidates per sentence and keep the best one under --select-by")
     parser.add_argument("--selector", default="openai/whisper-large-v3-turbo", help="HF Whisper used for best-of-N selection")
+    parser.add_argument(
+        "--select-by", default="cer,wer",
+        help="Best-of-N rule over cer, wer, dnsmos(_sig/_bak), utmos, sim, clip: 'cer,wer' ranks lexicographically "
+        "(default, the ASR selector), 'cer:10,dnsmos:1' by weighted sum; dnsmos needs --dnsmos. Selecting with the "
+        "judge's model family (Whisper ASR, the same DNSMOS/UTMOS) is an oracle upper bound, not a gain")
+    parser.add_argument("--select-utmos", choices=["utmos22", "utmosv2"], default="utmos22", help="UTMOS used by --select-by utmos")
+    parser.add_argument(
+        "--select-speaker-model", default="microsoft/unispeech-sat-base-plus-sv",
+        help="Speaker model of --select-by sim; must differ from the SIM judge --speaker-model (arXiv 2607.08256)")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--language", default="tr")
     parser.add_argument("--asr-model", default="large-v3")
@@ -261,7 +300,8 @@ def main():
     rows = []
     started = time.time()
     sampler = dict(guidance_from=args.guidance_from, cfg_rescale=args.cfg_rescale, apg_eta=args.apg_eta,
-                   apg_norm=args.apg_norm, apg_momentum=args.apg_momentum, speaker_guidance=args.speaker_guidance)
+                   apg_norm=args.apg_norm, apg_momentum=args.apg_momentum, speaker_guidance=args.speaker_guidance,
+                   **{name: getattr(args, name) for name in (*WINDOW_OPTIONS, *OUTPUT_OPTIONS)})
     if tts is None and (out / "results.jsonl").exists():  # rescore: reuse the synthesis rows of the previous pass
         previous = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines() if line.strip()]
         rows = [{k: v for k, v in r.items() if k in {"id", "text", "speaker", "prompt", "audio", "audio_seconds", "rtf", "error"}} for r in previous]
@@ -274,10 +314,31 @@ def main():
             rows.append({**sentence, "speaker": speaker, "prompt": prompt_wav.name, "audio": str(path),
                          "audio_seconds": meta.get("audio_seconds", sf.info(str(path)).duration), "rtf": meta.get("rtf")})
         sentences = []
-    selector = HFWhisper(args.selector, args.device, args.language) if args.candidates > 1 and sentences else None
+    rule, selector, selection_bias = parse_select_by(args.select_by), None, None
+    if args.candidates > 1 and sentences:
+        from dacvae_tts.metrics import DNSMOS
+
+        needs = {METRIC_FAMILY[m] for m in rule.metrics}
+        selector = CandidateScorer(
+            rule,
+            transcriber=HFWhisper(args.selector, args.device, args.language) if "asr" in needs else None,
+            dnsmos=DNSMOS(args.dnsmos) if "dnsmos" in needs and args.dnsmos else None,
+            utmos=load_utmos(args.select_utmos, args.device) if "utmos" in needs else None,
+            speaker=speaker_embedder(args.select_speaker_model, args.device) if "speaker" in needs else None,
+        )
+        judge_asr = args.asr_model if "whisper" in args.asr_model else f"whisper-{args.asr_model}"
+        selection_bias = warn_judge_overlap(
+            rule,
+            {"asr": args.selector, "dnsmos": args.dnsmos, "utmos": args.select_utmos, "speaker": args.select_speaker_model},
+            {"asr": judge_asr, "dnsmos": args.dnsmos, "utmos": ",".join(utmos_models(protocol)) or None,
+             "speaker": args.speaker_model},
+        )
+    prompt_audio = {}
     for index, sentence in enumerate(sentences):
         voice, prompt_wav, speaker = prompts[index % len(prompts)]
         path = out / f"{sentence['id']}.wav"
+        if selector is not None and "sim" in rule.metrics and prompt_wav not in prompt_audio:
+            prompt_audio[prompt_wav] = sf.read(str(prompt_wav), dtype="float32")[0]
         try:
             seconds = None
             if args.chars_per_second > 0:
@@ -293,7 +354,8 @@ def main():
                 )
                 extra = {"audio_seconds": result.metadata["audio_seconds"], "rtf": result.metadata["rtf"]}
             else:
-                extra = best_of_n(tts, selector, sentence["text"], voice, path, seconds, index, args, sampler)
+                extra = best_of_n(tts, selector, sentence["text"], voice, path, seconds, index, args, sampler,
+                                  prompt_audio.get(prompt_wav))
         except ValueError as error:
             rows.append({**sentence, "speaker": speaker, "error": str(error)})
             continue
@@ -338,6 +400,8 @@ def main():
         asr_backend=args.asr_backend, chars_per_second=args.chars_per_second, duration_mode=args.duration_mode,
         candidates=args.candidates, selector=args.selector if args.candidates > 1 else None, **sampler,
         selection_changed=sum(r.get("selected", 0) != 0 for r in good) if args.candidates > 1 else None,
+        select_by=args.select_by if args.candidates > 1 else None, selection_judge_overlap=selection_bias,
+        utmos_model=utmos_models(protocol) or None,  # the means are `utmos` / `utmosv2` (summarize)
         sentences=str(args.sentences), prompts=len(prompts),
     )
     if protocol is not None:

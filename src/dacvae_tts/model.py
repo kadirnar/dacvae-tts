@@ -551,6 +551,36 @@ def guided_update(v_cond, v_null, x, t, mask, guidance, rescale=0.0, eta=1.0, no
     return (x1 - x) / one_minus_t
 
 
+LATE_OPTION_NAMES = dict(guidance="guidance_late", rescale="cfg_rescale_late", eta="apg_eta_late",
+                         norm="apg_norm_late", momentum="apg_momentum_late")
+
+
+def guidance_windows(early, split, start, until, **overrides):
+    """Settings of `sample`'s late guidance window: the early window's settings with the non-None `*_late` overrides.
+
+    Without a split there is a single window and the early settings are returned unchanged; late overrides would
+    then have no window to act on, so they are rejected instead of being silently ignored.
+    """
+    given = {k: v for k, v in overrides.items() if v is not None}
+    if split is None:
+        if given:
+            raise ValueError(f"{sorted(LATE_OPTION_NAMES[k] for k in given)} need guidance_split")
+        return early
+    if not math.isfinite(split) or not start <= split <= until:
+        raise ValueError("Need guidance_from <= guidance_split <= guidance_until")
+    late = {**early, **given}
+    if (
+        not math.isfinite(late["guidance"])
+        or late["guidance"] < 0
+        or not 0 <= late["rescale"] <= 1
+        or late["norm"] < 0
+        or not -1 < late["momentum"] < 1
+        or not math.isfinite(late["eta"])
+    ):
+        raise ValueError("Late window needs guidance >= 0, cfg_rescale in [0,1], apg_norm >= 0, apg_momentum in (-1,1)")
+    return late
+
+
 def text_only_rows(model, full_valid, prompt_mask, tokens, segments):
     """Inputs of the prompt-free branch of independent guidance: each example's target frames as their own sequence.
 
@@ -604,6 +634,12 @@ def sample(
     apg_momentum=0.0,
     speaker_guidance=None,
     text_only=None,
+    guidance_split=None,
+    guidance_late=None,
+    apg_eta_late=None,
+    apg_norm_late=None,
+    apg_momentum_late=None,
+    cfg_rescale_late=None,
 ):
     """Euler sampler with classifier-free guidance.
 
@@ -614,6 +650,17 @@ def sample(
     defaults give plain CFG. `speaker_guidance` enables independent text/speaker guidance with a third, prompt-free
     branch built by `text_only_rows` (pass it as `text_only`): v_null + g (v_text - v_null) + g_s (v_full - v_text),
     which equals plain CFG for g_s = g.
+
+    `guidance_split` cuts the guided interval into an early window [guidance_from, guidance_split), which uses the
+    settings above, and a late window [guidance_split, guidance_until), whose scale and update shape come from
+    `guidance_late`, `cfg_rescale_late`, `apg_eta_late`, `apg_norm_late` and `apg_momentum_late` (None: the early
+    value). Why: the guidance-interval study (Kynkaanniemi et al., arXiv 2404.07724) finds guidance harmful at high
+    noise and redundant at low noise, and here `guidance_until 0.5` kept WER while saving 15% of the compute. APG
+    (eta 0.5, momentum -0.3) and rescale 0.7 over the whole path cut the files touching the decoder's tanh ceiling
+    from 96% to 58%/22% at g=5 but raised WER 4.32 -> 4.96/5.16; the alignment is settled in the noisy early steps,
+    so APG/rescale confined to the late window should shape the amplitude without that WER cost (mechanistic, to be
+    measured). APG momentum keeps one running average over the steps whose window uses momentum: a split without
+    late overrides reproduces the single window exactly, and momentum used only late starts fresh at the split.
     """
     if steps < 1 or not -1 <= sway <= 0 or not math.isfinite(guidance) or guidance < 0:
         raise ValueError("Invalid sampler settings")
@@ -623,6 +670,10 @@ def sample(
         raise ValueError("cfg_rescale must lie in [0,1], apg_norm >= 0, apg_momentum in (-1,1)")
     if speaker_guidance is not None and (text_only is None or not math.isfinite(speaker_guidance)):
         raise ValueError("Independent speaker guidance needs the prompt-free branch (text_only_rows)")
+    early = dict(guidance=guidance, rescale=cfg_rescale, eta=apg_eta, norm=apg_norm, momentum=apg_momentum)
+    late = guidance_windows(early, guidance_split, guidance_from, guidance_until, guidance=guidance_late,
+                            rescale=cfg_rescale_late, eta=apg_eta_late, norm=apg_norm_late, momentum=apg_momentum_late)
+    split = guidance_until if guidance_split is None else guidance_split
     gen = torch.Generator(device=prompt.device).manual_seed(seed)
     audio_shapes(prompt, prompt, prompt_mask, valid, prompt.size(-1))
     mask = mask_values(valid, prompt_mask)
@@ -643,7 +694,7 @@ def sample(
         if condition_cache is None
         else condition_cache
     )
-    if guidance != 1:
+    if guidance != 1 or late["guidance"] != 1:
         # Conditioned and null branches share one forward pass. Joint dropout's null features are
         # exactly zero, so the text is not encoded a second time.
         zeros = torch.zeros_like
@@ -664,11 +715,13 @@ def sample(
         text_valid = text_only["valid"]
         branch = {k: text_only[k] for k in ("prompt", "prompt_mask", "tokens", "segments", "cached")}
     trajectory = [x.clone()] if return_trajectory else None
-    guided_steps = evaluations = 0
+    guided_steps = evaluations = late_steps = 0
     apg_state = {}
     for t0, t1 in zip(times[:-1], times[1:]):
         t = t0.expand(x.size(0))
-        if guidance == 1 or not guidance_from <= float(t0) < guidance_until:
+        window = early if float(t0) < split else late
+        scale = window["guidance"]
+        if scale == 1 or not guidance_from <= float(t0) < guidance_until:
             v = to_velocity(
                 model, model(x, t, prompt, prompt_mask, valid, tokens, segments, cached=cond), x, t
             )
@@ -678,14 +731,18 @@ def sample(
             v, u = to_velocity(model, model(both, t.repeat(2), **pair), both, t.repeat(2)).chunk(2)
             evaluations += 2
             if speaker_guidance is None:
-                v = guided_update(v, u, x, t, mask, guidance, cfg_rescale, apg_eta, apg_norm, apg_momentum, apg_state)
+                v = guided_update(
+                    v, u, x, t, mask, scale, window["rescale"], window["eta"], window["norm"], window["momentum"],
+                    apg_state,
+                )
             else:
                 rows = sanitize(torch.gather(x, 1, index), text_valid)
                 w = to_velocity(model, model(rows, t, valid=text_valid, **branch), rows, t)
                 w = torch.zeros_like(x).scatter_add(1, index, sanitize(w, text_valid))
-                v = u + guidance * (w - u) + speaker_guidance * (v - w)
+                v = u + scale * (w - u) + speaker_guidance * (v - w)
                 evaluations += 1
             guided_steps += 1
+            late_steps += guidance_split is not None and float(t0) >= split
         x = x + (t1 - t0) * sanitize(v, mask)
         x = sanitize(torch.where(prompt_mask[..., None], prompt, x), valid)
         if trajectory is not None:
@@ -700,6 +757,8 @@ def sample(
             cfg_rescale=cfg_rescale,
             apg=dict(eta=apg_eta, norm=apg_norm, momentum=apg_momentum),
             speaker_guidance=speaker_guidance,
+            guidance_split=guidance_split,
+            late_window=None if guidance_split is None else dict(late, guided_steps=late_steps),
             time_grid=times.cpu().tolist(),
             solver="euler",
         )

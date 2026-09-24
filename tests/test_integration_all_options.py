@@ -64,3 +64,21 @@ def test_latent_delta_without_strict_checks_is_identical():
         results.append(objective(tiny_batch()))
     for key in ("flow", "latent_delta", "negative_random", "negative_aug"):
         assert torch.equal(results[0][key], results[1][key]), key
+
+
+def test_utmos_flag_serves_protocol_and_eval_sentences():
+    """#3 x #13: one `--utmos` switch. Bare it is the protocol's UTMOS22-strong (`utmos` field); with a
+    model name (eval_sentences.py's former own flag) it picks that model, UTMOSv2 going to `utmosv2`."""
+    import argparse
+
+    from dacvae_tts.eval_protocol import add_protocol_args, protocol_from_args, utmos_models
+
+    parser = argparse.ArgumentParser()
+    add_protocol_args(parser)
+    assert protocol_from_args(parser.parse_args([])) is None
+    options = protocol_from_args(parser.parse_args(["--utmos"]))
+    assert options.utmos and not options.utmosv2 and utmos_models(options) == ["utmos22"]
+    options = protocol_from_args(parser.parse_args(["--utmos", "utmosv2"]))
+    assert options.utmosv2 and not options.utmos and utmos_models(options) == ["utmosv2"]
+    options = protocol_from_args(parser.parse_args(["--protocol-v2", "--utmos", "utmosv2"]))
+    assert utmos_models(options) == ["utmos22", "utmosv2"]

@@ -94,6 +94,16 @@ class ProtocolOptions:
 
 
 _SWITCHES = tuple(f.name for f in fields(ProtocolOptions) if f.type is bool)
+# `--utmos` optionally names its model (the spelling of scripts/eval_sentences.py's former own flag, #13);
+# UTMOS22-strong scores go to the `utmos` field and UTMOSv2 scores to `utmosv2`, whichever flag asked for them.
+UTMOS_CHOICES = ("utmos22", "utmosv2")
+
+
+def utmos_models(options):
+    """Names of the UTMOS models an enabled protocol scores with (for summaries and judge-overlap checks)."""
+    if options is None:
+        return []
+    return [name for name, on in zip(UTMOS_CHOICES, (options.utmos, options.utmosv2)) if on]
 
 
 def protocol_v2(**overrides):
@@ -136,7 +146,10 @@ def add_protocol_args(parser):
                        help="WavLM-Large implementation (s3prl = upstream torch.hub path, needs s3prl)")
     group.add_argument("--sim-speechbrain", action="store_true",
                        help="Second, independent speaker metric: speechbrain/spkrec-ecapa-voxceleb (needs speechbrain)")
-    group.add_argument("--utmos", action="store_true", help="UTMOS22-strong (torch.hub tarepan/SpeechMOS:v1.2.0)")
+    group.add_argument(
+        "--utmos", nargs="?", const="utmos22", choices=UTMOS_CHOICES,
+        help="UTMOS22-strong (torch.hub tarepan/SpeechMOS:v1.2.0) -> `utmos`; `--utmos utmosv2` equals --utmosv2",
+    )
     group.add_argument("--utmosv2", action="store_true", help="UTMOSv2 (needs the utmosv2 package)")
     return group
 
@@ -144,7 +157,12 @@ def add_protocol_args(parser):
 def protocol_from_args(args):
     """ProtocolOptions from parsed flags, or None when no v2 flag was given (v1 behavior, nothing changes)."""
     has_dnsmos = bool(getattr(args, "dnsmos", None) or getattr(args, "dnsmos_model", None))
-    chosen = {name: True for name in _SWITCHES if getattr(args, name, False)}
+    switches = {name: bool(getattr(args, name, False)) for name in _SWITCHES}
+    utmos = getattr(args, "utmos", None)
+    if isinstance(utmos, str):  # `--utmos [utmos22|utmosv2]`: the named model's switch (and field)
+        switches["utmos"] = utmos == "utmos22"
+        switches["utmosv2"] = switches["utmosv2"] or utmos == "utmosv2"
+    chosen = {name: True for name, on in switches.items() if on}
     if chosen.get("prompt_dnsmos") and not has_dnsmos:
         raise ValueError("--prompt-dnsmos needs a DNSMOS model (--dnsmos / --dnsmos-model)")
     extra = dict(sim_o_backend=getattr(args, "sim_o_backend", None) or "transformers",
