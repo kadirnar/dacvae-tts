@@ -141,7 +141,7 @@ def main():
     )
 
     p = sub.add_parser("infer", help="Synthesize using a complete reference utterance and transcript")
-    add_inference_args(p)
+    add_inference_args(p, guidance=None)
     p.add_argument("--reference", "--ref-audio", dest="reference", required=True)
     p.add_argument(
         "--reference-text", help="Optional; omitted transcripts use ASR, not a transcript-free TTS model"
@@ -453,7 +453,8 @@ def add_grpo_args(parser, training=True):
     t.add_argument("--monitor-audio", type=int, default=4, help="Monitor samples saved per evaluation")
 
 
-def add_inference_args(parser, steps=True):
+def add_inference_args(parser, steps=True, guidance=1.5):
+    """`guidance` None: an unset --guidance follows the checkpoint's recommended_guidance, else 1.5 (`infer`)."""
     add_codec_args(parser)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output", required=True)
@@ -464,8 +465,10 @@ def add_inference_args(parser, steps=True):
     parser.add_argument(
         "--guidance",
         type=float,
-        default=1.5,
-        help="1 disables CFG; use 1 for a distilled model with baked-in guidance",
+        default=guidance,
+        help="1 disables CFG; use 1 for a distilled model with baked-in guidance"
+        + ("" if guidance is not None else " (default: the checkpoint's recommended_guidance, e.g. 1 for "
+           "model-guidance and distilled checkpoints, else 1.5)"),
     )
     parser.add_argument("--sway", type=float, default=-1.0)
     parser.add_argument(

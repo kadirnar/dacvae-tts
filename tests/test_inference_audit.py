@@ -281,6 +281,58 @@ def test_synthesize_many_sizes_duration_head_models_like_synthesize(monkeypatch,
     assert results[0][0]["frames"] == round(0.5 * 24000 / 512)
 
 
+def test_model_guidance_checkpoints_default_to_their_recommended_guidance(monkeypatch, cache, tmp_path):
+    # Training marks model-guidance checkpoints with recommended_guidance 1.0, but nothing read it: `infer` stacked
+    # its default CFG 1.5 on a w=0.7 checkpoint that already acts like CFG 3.3 (~5 effective; --guidance 5: ~17).
+    import sys
+    import warnings
+
+    import dacvae_tts.cli as cli
+    import dacvae_tts.inference as module
+    from dacvae_tts.config import TrainConfig
+    from dacvae_tts.inference import VoiceReference
+
+    data = LatentDataset(cache)
+    model_config = ModelConfig(latent_dim=4, width=16, depth=1, heads=2, text_depth=1, text_layout="joined",
+                               duration="rule")
+    state = FlowTTS(model_config).state_dict()
+    paths = {}
+    for name, weight, extra in (("plain", 0.0, {}), ("guided", 0.7, {"recommended_guidance": 1.0})):
+        paths[name] = tmp_path / f"{name}.pt"
+        config = Config(model_config, TrainConfig(model_guidance_weight=weight))
+        torch.save({"model": state, "ema": state, "config": config.to_dict(), "codec": data.meta, "mean": data.mean,
+                    "std": data.std, **extra}, paths[name])
+    monkeypatch.setattr(module, "Codec", FakeCodec)
+    plain = Synthesizer(paths["plain"], device="cpu", precision="fp32")
+    guided = Synthesizer(paths["guided"], device="cpu", precision="fp32")
+    assert (plain.recommended_guidance, plain.model_guidance_weight) == (None, 0.0)
+    assert (guided.recommended_guidance, guided.model_guidance_weight) == (1.0, 0.7)
+    voice = VoiceReference(torch.zeros(20, 4), "Reference words.", "test", {})
+    with pytest.warns(UserWarning, match="model guidance"):
+        guided.synthesize("Target words.", reference=voice, seconds=0.5, steps=1, guidance=1.5)
+    with pytest.warns(UserWarning, match="model guidance"):
+        guided.synthesize_many(["Target words."], voice, seconds=0.5, steps=1)  # default guidance 5
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        guided.synthesize("Target words.", reference=voice, seconds=0.5, steps=1, guidance=1.0)
+        guided.synthesize_many(["Target words."], voice, seconds=0.5, steps=1, guidance=1.0)
+        plain.synthesize("Target words.", reference=voice, seconds=0.5, steps=1, guidance=3.0)
+    # The CLI leaves --guidance unset (None) and `infer` resolves it: recommended, else the old default 1.5.
+    parsed, infer = [], module.infer
+    monkeypatch.setattr(module, "infer", parsed.append)
+    monkeypatch.setattr(sys, "argv", ["dacvae-tts", "infer", "--checkpoint", "c.pt", "--output", "o.wav",
+                                      "--reference", "r.wav", "--text", "x"])
+    cli.main()
+    assert parsed[0].guidance is None
+    used = []
+    monkeypatch.setattr(module.Synthesizer, "synthesize",
+                        lambda self, *a, **k: used.append(k["guidance"]) or SimpleNamespace(metadata={}))
+    for name, given in (("guided", None), ("plain", None), ("guided", 2.0)):
+        infer(SimpleNamespace(**{**vars(parsed[0]), "checkpoint": paths[name], "device": "cpu", "precision": "fp32",
+                                 "guidance": given}))
+    assert used == [1.0, 1.5, 2.0]
+
+
 def test_auto_duration_picks_the_rule_per_prompt_rate():
     from dacvae_tts.duration import auto_mode
 

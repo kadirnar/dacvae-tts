@@ -1,6 +1,7 @@
 import json
 import math
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -104,11 +105,26 @@ class Synthesizer:
         self.text_version = self.checkpoint["codec"].get("text_normalization", "unicode-v1")
         self.asr_model, self.asr_language = asr_defaults(self.text_version, asr_model, asr_language)
         self.asr_device, self._asr = asr_device, None
+        # Guidance the checkpoint was prepared for (model guidance and distillation: 1, GRPO: its policy's); None if
+        # unset. Model guidance (train.model_guidance_weight w > 0) bakes CFG ~1/(1-w) into the conditional velocity.
+        self.recommended_guidance = self.checkpoint.get("recommended_guidance")
+        self.model_guidance_weight = float(self.checkpoint["config"].get("train", {}).get("model_guidance_weight", 0))
         self.duration_profile = {}
         if compile_model:
             self.model.forward = torch.compile(self.model.forward, dynamic=True)
         self._sync()
         self.load_seconds = time.perf_counter() - started
+
+    def check_guidance(self, guidance):
+        """Warn when CFG is stacked on a model-guidance checkpoint, whose guidance is already built in."""
+        w = self.model_guidance_weight
+        if w > 0 and guidance != 1:
+            warnings.warn(
+                f"This checkpoint was trained with model guidance (w={w:g}) and already acts like CFG {1 / (1 - w):.3g};"
+                f" guidance={guidance:g} stacks on top (~{guidance / (1 - w):.3g} effective, over-saturation risk)."
+                " Sample it with guidance=1 (its recommended_guidance).",
+                stacklevel=3,
+            )
 
     def _sync(self):
         if self.device.type == "cuda":
@@ -255,6 +271,7 @@ class Synthesizer:
         unknown = set(sampler) - set(SAMPLER_OPTIONS) - set(OUTPUT_OPTIONS)
         if unknown:
             raise TypeError(f"Unknown sampler options: {sorted(unknown)}")
+        self.check_guidance(guidance)
         started = time.perf_counter()
         reused = reference is not None
         reference = reference or self.prepare_reference(ref_audio, reference_text)
@@ -569,6 +586,7 @@ class Synthesizer:
         unknown = set(sampler) - set(SAMPLER_OPTIONS) - set(OUTPUT_OPTIONS)
         if unknown:
             raise TypeError(f"Unknown sampler options: {sorted(unknown)}")
+        self.check_guidance(guidance)
         output = self._output_options(sampler)
         if not texts or candidates < 1 or max_rows < 1:
             raise ValueError("Need at least one text, one candidate and a positive batch size")
@@ -684,6 +702,9 @@ def infer(args):
         codec_options=backend_options(args),
         asr_language=getattr(args, "asr_language", None),
     )
+    guidance = args.guidance
+    if guidance is None:  # unset --guidance: what the checkpoint was prepared for, else the long-standing 1.5
+        guidance = 1.5 if tts.recommended_guidance is None else float(tts.recommended_guidance)
     result = tts.synthesize(
         args.text,
         args.reference,
@@ -692,7 +713,7 @@ def infer(args):
         seconds=args.seconds,
         duration_scale=args.duration_scale,
         steps=args.steps,
-        guidance=args.guidance,
+        guidance=guidance,
         seed=args.seed,
         sway=args.sway,
         guidance_until=getattr(args, "guidance_until", 1.0),
