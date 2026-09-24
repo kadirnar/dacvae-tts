@@ -6,6 +6,11 @@ corpus WER/CER (faster-whisper), speaker similarity against the codec-decoded pr
 generated/ground-truth duration ratio. Results go to RUN/monitor.jsonl; audio to RUN/monitor/step-N/.
 
   python scripts/monitor.py --run runs/nano --cache data/corpus/merged --cases 48 --asr-model small.en
+
+Evaluation protocol v2 (issue #3) is opt-in (`--protocol-v2` or the individual flags, see dacvae_tts.eval_protocol).
+Its seed-tts-eval SIM is reported as `sim_r` (vs the codec-decoded prompt, always available) and `sim_o` (vs the
+original prompt from `--prompt-audio`, never a codec fallback); the record then also carries the per-utterance and
+v2 summary keys. `speaker_similarity` keeps its v1 meaning.
 """
 
 import argparse
@@ -20,12 +25,15 @@ import soundfile as sf
 import torch
 
 from dacvae_tts.data import LatentDataset
+from dacvae_tts.eval_protocol import add_protocol_args, protocol_from_args
 from dacvae_tts.inference import Synthesizer, VoiceReference
 from dacvae_tts.metrics import Evaluator, summarize
+from dacvae_tts.speakers import read_speaker_list
 
 
-def select_cases(cache, count, seed, min_frames=75, max_frames=375):
-    """Deterministic (prompt, target) pairs of distinct validation recordings per speaker."""
+def select_cases(cache, count, seed, min_frames=75, max_frames=375, exclude=()):
+    """Deterministic (prompt, target) pairs of distinct validation recordings per speaker; `exclude`
+    drops labels whose voice also occurs in train (leakage.json of scripts/speaker_clusters.py)."""
     data = LatentDataset(cache, "val", pairing="within", layout="joined")
     db = sqlite3.connect(f"file:{Path(cache) / 'index.sqlite'}?mode=ro", uri=True)
     rows = db.execute(
@@ -36,7 +44,7 @@ def select_cases(cache, count, seed, min_frames=75, max_frames=375):
     by_speaker = {}
     for row in rows:
         by_speaker.setdefault(row[2], []).append(row)
-    speakers = sorted(s for s, items in by_speaker.items() if len(items) >= 2)
+    speakers = sorted(s for s, items in by_speaker.items() if len(items) >= 2 and s not in exclude)
     rng = random.Random(seed)
     rng.shuffle(speakers)
     index = {int(v): i for i, v in enumerate(data.ids)}
@@ -92,27 +100,34 @@ def main():
     parser.add_argument("--asr-device", default="cpu")
     parser.add_argument(
         "--metric-normalization",
-        choices=["english-unicode-v2", "legacy-ascii-v1", "turkish-v1"],
+        choices=["english-unicode-v2", "legacy-ascii-v1", "turkish-v1", "turkish-v2"],
         help="WER/CER normalization (default follows --language: turkish-v1 for tr)",
     )
     parser.add_argument("--speaker-model", default="microsoft/wavlm-base-plus-sv")
+    parser.add_argument(
+        "--exclude-speakers", help="Labels never used as cases, e.g. leakage.json of speaker_clusters.py"
+    )
     parser.add_argument("--dnsmos", help="Path to sig_bak_ovr.onnx; adds DNSMOS SIG/BAK/OVRL per case and to the summary")
     parser.add_argument("--once", action="store_true", help="Score the checkpoints present now, then exit")
     parser.add_argument("--checkpoint", help="Score one checkpoint file instead of watching the run")
     parser.add_argument("--poll", type=int, default=120)
     parser.add_argument(
         "--prompt-audio",
-        help="Directory of original prompt WAVs from export_case_audio.py; scores become SIM-o",
+        help="Directory of original prompt WAVs from export_case_audio.py; speaker_similarity is then scored "
+        "against them (same wavlm-base-plus-sv model) and protocol v2 adds the real SIM-o as sim_o",
     )
     parser.add_argument("--wandb-project", help="Log scores and a few audio samples to this W&B project")
     parser.add_argument("--wandb-id", help="W&B run id to attach to (default: the run directory name)")
     parser.add_argument("--wandb-audio", type=int, default=4, help="Samples per checkpoint uploaded as audio")
+    add_protocol_args(parser)
     args = parser.parse_args()
+    protocol = protocol_from_args(args)
 
     run = Path(args.run)
     monitor = run / "monitor"
     monitor.mkdir(parents=True, exist_ok=True)
-    data, cases = select_cases(args.cache, args.cases, args.seed)
+    exclude = read_speaker_list(args.exclude_speakers) if args.exclude_speakers else ()
+    data, cases = select_cases(args.cache, args.cases, args.seed, exclude=exclude)
     (monitor / "cases.json").write_text(json.dumps(cases, indent=1))
     print(f"{len(cases)} cases from {len({c['speaker'] for c in cases})} held-out speakers", flush=True)
     evaluator = Evaluator(
@@ -122,6 +137,7 @@ def main():
         args.asr_device,
         metric_normalization=args.metric_normalization,
         language=args.language,
+        protocol=protocol,
     )
     scored = set()
     log = run / "monitor.jsonl"
@@ -180,15 +196,20 @@ def main():
                 except ValueError as error:
                     rows.append({**case, "error": str(error)})
                     continue
-                prompt_wav = monitor / f"prompt-{case['uid'].replace('/', '_').replace(':', '_')}.wav"
+                prompt_wav = codec_prompt = monitor / f"prompt-{case['uid'].replace('/', '_').replace(':', '_')}.wav"
+                original = None
                 if args.prompt_audio:
                     original = Path(args.prompt_audio) / (
                         case["prompt_uid"].replace("/", "_").replace(":", "_") + ".wav"
                     )
                     if original.exists():
                         prompt_wav = original
+                    else:
+                        original = None
                 try:
-                    score = evaluator.score(output, case["text"], prompt_wav)
+                    score = evaluator.score(
+                        output, case["text"], prompt_wav, original_prompt=original, codec_prompt=codec_prompt
+                    )
                 except (RuntimeError, ValueError, OSError) as error:  # ASR OOM, empty transcript, bad file
                     rows.append({**case, "error": f"score: {error}"[:300]})
                     continue
@@ -227,6 +248,9 @@ def main():
                 "sampler_steps": args.steps,
                 "seconds": time.time() - started,
             }
+            if protocol is not None:  # v2: per-utterance WER/CER, S/D/I, sim_o/sim_r, UTMOS, signal statistics
+                record.update({k: v for k, v in summary.items() if k not in record and k != "count"})
+                record["protocol"] = evaluator.identity["protocol"]["options"]
             with open(log, "a") as stream:
                 stream.write(json.dumps(record) + "\n")
             tracker.log(record, step=step, prefix="monitor/")

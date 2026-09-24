@@ -26,8 +26,10 @@ def main():
     p.add_argument("--speaker-column", default="speaker_id")
     p.add_argument(
         "--text-normalization",
-        choices=["unicode-v1", "english-explicit-v2", "turkish-v1"],
+        choices=["unicode-v1", "english-explicit-v2", "turkish-v1", "turkish-v2"],
         default="unicode-v1",
+        help="Transcript normalization stored in the cache; turkish-v2 = turkish-v1 plus 'dört' softening "
+        "(4'e -> dörde) and T.C./A.Ş./Ltd. Şti./Dr./vb. expansion (scripts/renormalize_cache.py converts a cache)",
     )
     p.add_argument("--min-seconds", type=float, default=1.0)
     p.add_argument("--max-seconds", type=float, default=15.0)
@@ -76,6 +78,7 @@ def main():
         action="store_true",
         help="Keep the original encoder weight-normalization hooks for comparison",
     )
+    add_split_key_arg(p)
     add_partition_args(p)
 
     p = sub.add_parser("merge", help="Merge partitions, deduplicate, check splits and calculate statistics")
@@ -91,6 +94,13 @@ def main():
         "--keep-singletons",
         action="store_true",
         help="Keep speakers with one recording (usable only with within-utterance pairing)",
+    )
+    add_split_key_arg(p, " Re-splits every row while merging (no re-encoding).")
+    p.add_argument(
+        "--split-map",
+        help="JSON {speaker label or split key: train|val|test} applied while merging, e.g. split_map.json "
+        "of scripts/speaker_clusters.py (one split per cross-episode voice cluster); labels without an "
+        "entry fall back to --split-key, else keep their split",
     )
 
     p = sub.add_parser("train", help="Pretrain from scratch; launch with torchrun for DDP")
@@ -122,8 +132,8 @@ def main():
         "--compile",
         nargs="?",
         const="objective",
-        choices=["objective", "model"],
-        help="Compile the whole objective, or only the generator with --compile model",
+        choices=["objective", "model", "blocks"],
+        help="Compile the whole objective, only the generator (model) or each generator block (blocks)",
     )
     p.add_argument("--no-validation", action="store_true", help="For smoke tests only")
     p.add_argument(
@@ -145,10 +155,12 @@ def main():
     p.add_argument("--duration-scale", type=float, default=1.0)
     p.add_argument(
         "--duration-mode",
-        choices=["rule", "clamp", "syllable", "predictor", "auto"],
+        choices=["rule", "clamp", "syllable", "predictor", "auto", "articulation"],
         default="rule",
         help="Target length for rule-duration models: prompt rate per byte, the same with fast prompts slowed, "
-        "per syllable, or the fitted duration predictor",
+        "per syllable, the fitted duration predictor, auto (rule/clamp/predictor by prompt rate), or articulation "
+        "(syllables per second of the prompt's speaking time without edge silence and pauses >= 200 ms, plus "
+        "0.15 s per internal comma and 0.3 s per internal sentence end; see dacvae_tts/duration.py)",
     )
     p.add_argument("--compile", action="store_true")
     p.add_argument("--seed", type=int, default=42)
@@ -181,6 +193,11 @@ def main():
     p.add_argument("--limit", type=positive_int, default=1000)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cross-session", action="store_true")
+    p.add_argument(
+        "--exclude-speakers",
+        help="Speaker labels never used in cases (JSON list, JSON object keys such as leakage.json of "
+        "scripts/speaker_clusters.py, or one per line), so cases use only truly unseen speakers",
+    )
 
     p = sub.add_parser(
         "run-eval", help="Run a bounded, configured duration/sampler/profile comparison on frozen cases"
@@ -207,9 +224,19 @@ def main():
     p.add_argument("--no-speaker", action="store_true")
     p.add_argument(
         "--metric-normalization",
-        choices=["english-unicode-v2", "legacy-ascii-v1", "turkish-v1"],
-        help="WER/CER text normalization (default: turkish-v1 for --language tr, else english-unicode-v2)",
+        choices=["english-unicode-v2", "legacy-ascii-v1", "turkish-v1", "turkish-v2"],
+        help="WER/CER text normalization (default: turkish-v1 for --language tr, else english-unicode-v2); "
+        "turkish-v2 also reads Roman numerals, clock times, units and acronyms and folds â/î/û",
     )
+    p.add_argument(
+        "--reference-kind",
+        choices=["original", "codec"],
+        help="Protocol v2: what the manifest's reference_audio is (original recording -> sim_o, codec "
+        "resynthesis -> sim_r); rows may instead carry original_prompt_audio / codec_prompt_audio",
+    )
+    from .eval_protocol import add_protocol_args
+
+    add_protocol_args(p)
 
     p = sub.add_parser(
         "compare", help="Paired before/after metrics with speaker-clustered bootstrap intervals"
@@ -217,7 +244,7 @@ def main():
     p.add_argument("--before", required=True)
     p.add_argument("--after", required=True)
     p.add_argument("--output", required=True)
-    p.add_argument("--bootstrap", type=positive_int, default=2000)
+    p.add_argument("--bootstrap", type=positive_int, default=5000)
     p.add_argument("--seed", type=int, default=42)
 
     p = sub.add_parser("rank-pairs", help="Select non-regressing metric-ranked training pairs")
@@ -237,12 +264,12 @@ def main():
     p.add_argument("--student-steps", type=positive_int, default=8)
 
     p = sub.add_parser(
-        "post-train", help="Experimental preference learning or trajectory distillation with DDP"
+        "post-train", help="Experimental preference learning or trajectory distillation with DDP, or online Flow-GRPO"
     )
-    p.add_argument("--mode", choices=["preference", "distill"], required=True)
+    p.add_argument("--mode", choices=["preference", "distill", "grpo"], required=True)
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--cache", required=True)
-    p.add_argument("--data", required=True, help="Pair or trajectory JSONL")
+    p.add_argument("--data", help="Pair or trajectory JSONL (required for preference/distill)")
     p.add_argument("--output", required=True)
     p.add_argument("--device", default="auto", choices=["auto", "cpu"])
     p.add_argument("--steps", type=positive_int, default=1000)
@@ -261,8 +288,11 @@ def main():
     p.add_argument("--grad-checkpoint", action="store_true")
     p.add_argument("--save-every", type=positive_int, default=100)
     p.add_argument("--seed", type=int, default=42)
+    add_grpo_args(p)
 
     args = parser.parse_args()
+    if args.command == "post-train" and args.mode != "grpo" and not args.data:
+        parser.error("--data is required for --mode preference/distill")
     if getattr(args, "languages", None) is not None:
         from .prepare import ENGLISH_TAGS
 
@@ -305,6 +335,10 @@ def main():
         from .comparison import compare
 
         compare(args)
+    elif args.command == "post-train" and args.mode == "grpo":
+        from .grpo import grpo_train
+
+        grpo_train(args)
     elif args.command in {"audit-cache", "codec-reconstruct", "make-cases", "run-eval"}:
         from . import experiments
 
@@ -319,6 +353,15 @@ def add_partition_args(parser):
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--num-shards", type=positive_int, default=1)
     parser.add_argument("--seed", type=int, default=42)
+
+
+def add_split_key_arg(parser, note=""):
+    parser.add_argument(
+        "--split-key",
+        help="Regex extracting the key the split hash uses from the speaker label (named group `key`, else "
+        "group 1, else the whole match), e.g. '^(.+)_speaker_\\d+$' holds whole episodes out; labels it does "
+        "not match are errors." + note,
+    )
 
 
 def add_codec_args(parser):
@@ -338,6 +381,69 @@ def add_loader_args(parser):
     parser.add_argument("--worker-threads", type=positive_int)
     parser.add_argument("--prefetch-factor", type=positive_int)
     parser.add_argument("--loader-start-method", choices=["spawn", "forkserver"])
+
+
+def add_grpo_args(parser, training=True):
+    """Options of `post-train --mode grpo`; training=False keeps the sampler/reward part (best-of-N oracle).
+
+    Only read in grpo mode (see dacvae_tts/grpo.py for the math and the defaults' sources).
+    """
+    add_codec_args(parser)
+    g = parser.add_argument_group("GRPO sampler and reward")
+    g.add_argument("--sample-steps", type=positive_int, default=16, help="Euler steps of a rollout (FlowTTS-GRPO: 16)")
+    g.add_argument("--guidance", type=float, default=5.0, help="CFG of the sampled policy (deployed default 5)")
+    g.add_argument("--sway", type=float, default=-1.0)
+    g.add_argument("--guidance-from", type=float, default=0.0)
+    g.add_argument("--guidance-until", type=float, default=1.0)
+    g.add_argument(
+        "--duration-mode", choices=["gt", "rule", "clamp", "syllable", "predictor", "auto"], default="auto",
+        help="Target length of a prompt: the deployed rules, or gt = the recorded length",
+    )
+    g.add_argument("--duration-scale", type=float, default=1.0)
+    g.add_argument("--max-frames", type=positive_int, default=1000, help="Skip longer prompts (prompt+target frames)")
+    g.add_argument("--sde-window", type=positive_int, default=2, help="Consecutive stochastic (SDE) steps")
+    g.add_argument("--sde-sigma", type=float, default=0.5, help="Constant sigma, or `a` of the flow schedule")
+    g.add_argument("--sigma-schedule", choices=["constant", "flow"], default="constant")
+    g.add_argument("--window-max", type=float, default=0.5, help="The window ends within this fraction of the steps")
+    g.add_argument(
+        "--shared-noise", action=argparse.BooleanOptionalAction, default=True,
+        help="Samples of a group share the initial noise (differences come from the SDE window only)",
+    )
+    g.add_argument(
+        "--reward-weights", default="cer=1.0,sim=0.5,dnsmos=0.4,utmos=0.4",
+        help="name=weight list: cer, wer, sim, dnsmos, utmos, distillmos or module:attr",
+    )
+    g.add_argument("--reward-floors", default="", help="name=value overrides of the minimum group spread per term")
+    g.add_argument("--advantage", choices=["standardized", "weighted"], default="standardized")
+    g.add_argument("--allow-single-reward", action="store_true", help="Permit one reward term (hacking risk)")
+    g.add_argument("--asr-model", default="openai/whisper-large-v3-turbo", help="Reward ASR (transformers Whisper)")
+    g.add_argument("--speaker-model", default="microsoft/unispeech-sat-base-plus-sv", help="Reward SV model")
+    g.add_argument("--dnsmos-model", help="Official sig_bak_ovr.onnx (needed by the dnsmos term)")
+    g.add_argument("--utmos-repo", default="tarepan/SpeechMOS:v1.2.0", help="torch.hub repo of UTMOS22-strong")
+    g.add_argument("--language", default="tr", help="Whisper language of the judges")
+    g.add_argument(
+        "--metric-normalization", choices=["english-unicode-v2", "legacy-ascii-v1", "turkish-v1", "turkish-v2"]
+    )
+    g.add_argument("--reward-device", help="Device of the codec and judges (default: the policy device)")
+    if not training:
+        return
+    t = parser.add_argument_group("GRPO optimization and held-out monitor")
+    t.add_argument("--group-size", type=positive_int, default=8, help="Samples per prompt (FlowTTS-GRPO: 10)")
+    t.add_argument("--prompts-per-step", type=positive_int, default=4, help="Groups per rollout step")
+    t.add_argument("--micro-batch", type=positive_int, default=8, help="Samples per gradient forward")
+    t.add_argument("--clip", type=float, default=1e-4, help="PPO ratio clip (per-element mean log-ratio)")
+    t.add_argument("--kl", type=float, default=0.04, help="Weight of the closed-form KL to the start model")
+    t.add_argument("--ppo-epochs", type=positive_int, default=1)
+    t.add_argument("--updates-per-rollout", type=positive_int, default=1)
+    t.add_argument("--logprob-reduction", choices=["mean", "sum"], default="mean")
+    t.add_argument("--max-grad-norm", type=float, default=1.0)
+    t.add_argument("--monitor-every", type=int, default=50, help="Held-out monitor interval in steps; 0 disables")
+    t.add_argument("--monitor-prompts", type=int, default=32)
+    t.add_argument("--monitor-steps", type=positive_int, default=32, help="Steps of the deployed ODE sampler")
+    t.add_argument("--monitor-terms", default="cer,wer,sim,dnsmos", help="Held-out metrics (add distillmos)")
+    t.add_argument("--monitor-asr-model", default="large-v3")
+    t.add_argument("--monitor-speaker-model", default="microsoft/wavlm-base-plus-sv")
+    t.add_argument("--monitor-audio", type=int, default=4, help="Monitor samples saved per evaluation")
 
 
 def add_inference_args(parser, steps=True):
@@ -366,6 +472,42 @@ def add_inference_args(parser, steps=True):
     parser.add_argument("--apg-momentum", type=float, default=0.0, help="APG (reverse) momentum, e.g. -0.3")
     parser.add_argument(
         "--speaker-guidance", type=float, help="Independent speaker guidance scale (text guidance = --guidance)"
+    )
+    add_output_quality_args(parser)
+
+
+def pre_tanh_gain(value):
+    from .codec import parse_pre_tanh_gain
+
+    try:
+        return parse_pre_tanh_gain(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
+def add_output_quality_args(parser):
+    """Late guidance window, latent moment matching and the decoder's pre-tanh gain (all off by default)."""
+    parser.add_argument(
+        "--guidance-split",
+        type=float,
+        help="Split the guided interval at this t: [from, split) uses --guidance/--apg-*/--cfg-rescale, "
+        "[split, until) the *-late values (e.g. 0.5 with --apg-eta-late 0.5: CFG early, APG late)",
+    )
+    parser.add_argument("--guidance-late", type=float, help="Late-window CFG scale (default: --guidance)")
+    parser.add_argument("--apg-eta-late", type=float, help="Late-window APG eta (default: --apg-eta)")
+    parser.add_argument("--apg-norm-late", type=float, help="Late-window APG norm cap (default: --apg-norm)")
+    parser.add_argument("--apg-momentum-late", type=float, help="Late-window APG momentum (default: --apg-momentum)")
+    parser.add_argument("--cfg-rescale-late", type=float, help="Late-window CFG rescale phi (default: --cfg-rescale)")
+    parser.add_argument(
+        "--moment-match",
+        choices=["std", "meanstd"],
+        help="Rescale each generated latent channel to the voice prompt's std (meanstd: also its mean) before decoding",
+    )
+    parser.add_argument(
+        "--pre-tanh-gain",
+        type=pre_tanh_gain,
+        help="Scale the codec decoder's output-tanh input against saturation: a number, auto (99.9th percentile of "
+        "|input| to atanh 0.95) or auto:<output ceiling>",
     )
 
 

@@ -15,6 +15,7 @@ from .codec import Codec, backend_options, check_compatibility, file_digest, rea
 from .data import LatentDataset, jsonl, load_stats
 from .inference import Synthesizer
 from .metrics import Evaluator, summarize
+from .speakers import read_speaker_list
 from .text import normalize
 
 
@@ -156,6 +157,9 @@ def make_cases(args):
         "SELECT speaker FROM samples GROUP BY speaker HAVING count(DISTINCT split)>1 LIMIT 1"
     ).fetchone():
         raise ValueError("Speaker leakage across splits; repair the cache before exporting cases")
+    # Held-out labels whose voice also appears in train (speaker_clusters.py leakage.json) are not unseen.
+    exclude_file = getattr(args, "exclude_speakers", None)
+    excluded = read_speaker_list(exclude_file) if exclude_file else set()
     rows, seen = [], set()
     seen_digests, selected_intervals, intervals = set(), [], {}
 
@@ -186,6 +190,8 @@ def make_cases(args):
         target = db.execute(
             "SELECT uid,speaker,text,audio,frames,digest FROM samples WHERE uid=?", (uid,)
         ).fetchone()
+        if target[1] in excluded:
+            continue
         candidates = db.execute(
             "SELECT uid,text,audio,digest FROM samples WHERE speaker=? AND split=? AND uid!=? ORDER BY uid",
             (target[1], args.split, uid),
@@ -252,6 +258,16 @@ def make_cases(args):
     with open(output, "x") as stream:
         for row in rows:
             stream.write(json.dumps(row) + "\n")
+    exclusion = (
+        {
+            "speakers": len({row["speaker"] for row in rows}),
+            "excluded_speakers": len(excluded),
+            "exclude_speakers_file": str(Path(exclude_file).resolve()),
+            "exclude_speakers_sha256": file_digest(exclude_file),
+        }
+        if exclude_file
+        else {}
+    )
     write_report(
         output.with_suffix(".metadata.json"),
         {
@@ -262,6 +278,7 @@ def make_cases(args):
             "reference_target_reuse": False,
             "known_interval_overlap": False,
             "unknown_intervals_and_near_duplicates": "not verified",
+            **exclusion,
         },
     )
 

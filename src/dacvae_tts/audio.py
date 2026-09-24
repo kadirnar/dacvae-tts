@@ -2,9 +2,11 @@
 
 These act on float numpy waveforms outside the model. `trim_silence` is used on voice prompts (long leading or
 trailing silence would lower the measured speaking rate and add a pause before the new sentence) and on generated
-chunks before they are joined with controlled pauses. `finalize` gives every output the same presentation: short
-fades against clicks (generated speech starts on the first frame), a little padding, -16 LUFS integrated loudness
-(the training data's level; high guidance otherwise makes outputs ~2-3 dB louder) with the peak kept under -1 dBFS.
+chunks before they are joined with controlled pauses; `speech_timing` measures a prompt's edge silence, pauses and
+net speaking time for the `articulation` duration rule (duration.py). `finalize` gives every output the same
+presentation: short fades against clicks (generated speech starts on the first frame), a little padding, -16 LUFS
+integrated loudness (the training data's level; high guidance otherwise makes outputs ~2-3 dB louder) with the peak
+kept under -1 dBFS.
 """
 
 import numpy as np
@@ -33,6 +35,52 @@ def trim_silence(audio, sample_rate, below_peak_db=40.0, floor_db=-60.0, margin_
     start = max(loud[0] * size - int(sample_rate * margin_start_ms / 1000), 0)
     end = min((loud[-1] + 1) * size + int(sample_rate * margin_end_ms / 1000), len(audio))
     return audio[start:end], start, end
+
+
+def _runs(mask):
+    """[start, end) frame indices of the True runs of a boolean array, shape (runs, 2)."""
+    edges = np.flatnonzero(np.diff(np.concatenate([[0], mask.astype(np.int8), [0]])))
+    return edges.reshape(-1, 2)
+
+
+def speech_timing(audio, sample_rate, below_peak_db=35.0, floor_db=-60.0, min_pause_ms=200, min_speech_ms=50,
+                  percentile=95.0, frame_ms=10):
+    """Edge silence, internal pauses and net speaking time of a voice prompt (inputs of the `articulation` rule).
+
+    A 10 ms frame is speech when its RMS level is above max(p - below_peak_db, floor_db), p the `percentile`-th
+    frame level (a robust peak: one click cannot raise the threshold the way the maximum does; 35 dB below it is
+    about F5-TTS's -42 dBFS edge trim for its -20 dBFS RMS prompts). Speech runs shorter than `min_speech_ms`
+    (clicks, lip smacks) count as silence. Leading/trailing silence is cut, and silent runs of at least
+    `min_pause_ms` between speech are pauses: 200 ms is above stop closures and ordinary word gaps, which belong to
+    articulation, and below phrase pauses. Speaking time = trimmed span - pauses. Loudness-invariant apart from
+    the floor. Returns a dict of plain floats (JSON metadata); speech_seconds is 0 when no frame is loud.
+    """
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    total = len(audio) / sample_rate
+    levels, size = frame_levels(audio, sample_rate, frame_ms)
+    step = size / sample_rate
+    reference = float(np.percentile(levels, percentile))
+    threshold = max(reference - below_peak_db, floor_db)
+    loud = levels > threshold
+    for start, end in _runs(loud):
+        if (end - start) * step < min_speech_ms / 1000:
+            loud[start:end] = False
+    runs = _runs(loud)
+    timing = {"total_seconds": total, "reference_db": reference, "threshold_db": threshold, "min_pause_ms": min_pause_ms}
+    if not len(runs):
+        return {**timing, "speech_seconds": 0.0, "pause_seconds": 0.0, "pauses": 0, "leading_silence_seconds": total,
+                "trailing_silence_seconds": 0.0}
+    gaps = runs[1:, 0] - runs[:-1, 1]
+    pauses = gaps[gaps * step >= min_pause_ms / 1000 - 1e-9]
+    first, last = int(runs[0, 0]), int(runs[-1, 1])
+    return {
+        **timing,
+        "speech_seconds": float((last - first - pauses.sum()) * step),
+        "pause_seconds": float(pauses.sum() * step),
+        "pauses": int(len(pauses)),
+        "leading_silence_seconds": first * step,
+        "trailing_silence_seconds": max(total - last * step, 0.0),
+    }
 
 
 def fade(audio, sample_rate, fade_in_ms=10, fade_out_ms=20):

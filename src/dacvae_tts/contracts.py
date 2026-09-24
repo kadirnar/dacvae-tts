@@ -25,8 +25,12 @@ def audio_shapes(x, prompt, reference, valid, channels):
         raise ValueError("audio, prompt and masks must share a device")
 
 
-def mask_values(valid, reference, require_target=True):
+def mask_values(valid, reference, require_target=True, strict=True):
+    """Target mask; `strict=False` (train.strict_checks) skips the value checks, each of which makes
+    the host wait for the device, and keeps the cheap shape and dtype checks."""
     mask = target_mask(valid, reference)
+    if not strict:
+        return mask
     if (reference & ~valid).any():
         raise ValueError("reference frames must be a subset of valid frames")
     if (~valid[:, :-1] & valid[:, 1:]).any():

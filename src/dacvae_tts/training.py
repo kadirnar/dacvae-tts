@@ -1,6 +1,7 @@
 """DDP training with sample-weighted accumulation and per-rank resumable RNG state."""
 
 import copy
+import dataclasses
 import json
 import math
 import os
@@ -16,14 +17,30 @@ from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
+from .alignment import teacher_layers, teacher_terms
+from .codec import check_compatibility
 from .config import Config
+from .contracts import sanitize, target_mask
 from .data import BucketBatchSampler, LatentDataset, collate, move_batch
+from .data import load_silence as raw_silence
 from .diagnostics import ActivationProbe, gradient_contributions, gradient_groups, loss_buckets
-from .model import FlowTTS, flow_loss, reduce_flow
+from .model import FlowTTS, flow_loss, flow_target, reduce_flow
+from .negatives import (
+    augmented_negatives,
+    delta_record,
+    delta_sums,
+    load_silence,
+    negative_distance,
+    random_negatives,
+)
 from .optim import build_optimizer
 from .parallel import device_batches, loader_options
+from .speed import NonfiniteWatch, compile_blocks, training_epoch_costs, training_loader
+from .teacher import teacher_sources
 from .text import BYTE_OFFSET, corrupt_transcript
 from .tracking import Tracker
+
+TEACHER_LOGS = ("repa", "tla", "tla_entropy")
 
 
 class Objective(nn.Module):
@@ -31,7 +48,12 @@ class Objective(nn.Module):
 
     `expansion` > 1 is context-sharing batch expansion (SupertonicTTS, arXiv:2503.23108): every
     utterance receives several independent (time, noise) draws that share one condition encoding.
-    Flow entries are then [B * expansion] while duration entries stay [B].
+    Flow entries are then [B * expansion] while duration entries stay [B]. `guidance_weight` > 0 trains
+    toward the model-guidance target (see `guidance_direction`); evaluation keeps the plain target.
+
+    `contrastive_mode` picks the negatives: `text_hinge` (a one-word skip/repeat transcript, one more
+    text encoding and generator pass), `latent_delta` (corrupted target latents with the correct text,
+    target-only, see `dacvae_tts.negatives`) or `none`.
     """
 
     def __init__(
@@ -43,16 +65,43 @@ class Objective(nn.Module):
         ctc_weight=0.0,
         contrastive_weight=0.0,
         contrastive_margin=0.1,
+        contrastive_mode="text_hinge",
+        random_weight=0.2,
+        aug_weight=0.2,
+        span=(3, 125),
+        repeat_coverage=(0.2, 0.4),
+        skip_coverage=(0.4, 0.8),
+        negative_cap=0.0,
+        silence=None,
+        repa_weight=0.0,
+        repa_frames="all",
+        tla_weight=0.0,
+        tla_entropy=0.01,
+        guidance_weight=0.0,
     ):
         super().__init__()
         self.model = model
+        self.guidance_weight = guidance_weight
         self.duration_weight, self.ctc_weight = duration_weight, ctc_weight
         self.contrastive_weight, self.contrastive_margin = contrastive_weight, contrastive_margin
         self.time_sampling, self.expansion = time_sampling, expansion
         self.rng = random.Random(0)
+        if contrastive_mode not in {"text_hinge", "latent_delta", "none"}:
+            raise ValueError("contrastive_mode must be text_hinge, latent_delta or none")
+        self.contrastive_mode = contrastive_mode
+        # latent_delta only (see dacvae_tts.negatives); `silence` is a standardized [C] tail padding.
+        self.random_weight, self.aug_weight, self.negative_cap = random_weight, aug_weight, negative_cap
+        self.augment = dict(span=tuple(span), repeat_coverage=repeat_coverage, skip_coverage=skip_coverage)
+        self.silence = silence
+        # Teacher alignment (alignment.py); the train loop clears `repa_active` at repa_stop_step.
+        self.repa_weight, self.repa_frames = repa_weight, repa_frames
+        self.tla_weight, self.tla_entropy = tla_weight, tla_entropy
+        self.repa_active = True
 
     def negatives(self, batch):
         """Corrupted transcripts [B,S'] plus a mask of the examples that could be corrupted."""
+        if "negative_tokens" in batch:  # drawn by the loader workers (train.loader_negatives)
+            return batch["negative_tokens"], batch["negative_segments"], batch["negative_usable"]
         tokens, segments = batch["tokens"].cpu(), batch["segments"].cpu()
         rows, usable = [], []
         for row_tokens, row_segments in zip(tokens, segments):
@@ -67,6 +116,40 @@ class Objective(nn.Module):
         device = batch["tokens"].device
         return padded_tokens.to(device), padded_segments.to(device), torch.tensor(usable, device=device)
 
+    def latent_delta(self, batch, prediction, details, copies, offset=None):
+        """RobustSpeechFlow/ΔFM latent negatives on the (expanded) batch, from this pass's prediction.
+
+        Returns per-row [B * expansion] tensors: the raw distances `negative_random` and `negative_aug`
+        (zero where not applied) and `latent_delta` = -λ_rand d_rand - λ_aug d_aug, which the training
+        loop adds with the flow term's own weights. Rows dropped for classifier-free guidance learn the
+        unconditional field and get no negatives; prompt and padding frames never enter a distance.
+        With model guidance (`offset` = w sg(out_cond - out_null), #14) every negative target is shifted by
+        the same offset as the positive one, so F+ - F- and the push away from the negatives are exactly
+        those without guidance and the optimum is the guided target plus the usual ΔFM step.
+        """
+        valid, prompt_mask = batch["valid"], batch["prompt_mask"]
+        x1, mask = sanitize(batch["latents"], valid), target_mask(valid, prompt_mask)
+        noise, time = details["noise"], details["times"]
+        positive = flow_target(self.model, x1, noise, time) if self.negative_cap > 0 else None
+        if positive is not None and offset is not None:
+            positive = positive + offset
+        terms = {"latent_delta": torch.zeros(x1.size(0), device=x1.device)}
+        for name, weight in (("negative_random", self.random_weight), ("negative_aug", self.aug_weight)):
+            terms[name] = torch.zeros_like(terms["latent_delta"])
+            if weight == 0:
+                continue
+            negative, usable = (
+                random_negatives(x1, valid, prompt_mask, copies, self.silence)
+                if name == "negative_random"
+                else augmented_negatives(x1, valid, prompt_mask, **self.augment, fill=self.silence)
+            )
+            distance = negative_distance(
+                self.model, prediction, negative, noise, time, mask, positive, self.negative_cap, offset
+            )
+            terms[name] = distance.masked_fill(details["drop"] | ~usable, 0)
+            terms["latent_delta"] = terms["latent_delta"] - weight * terms[name]
+        return terms
+
     def forward(self, batch):
         cached = self.model.conditions(
             batch["prompt"], batch["prompt_mask"], batch["tokens"], batch["segments"]
@@ -75,6 +158,9 @@ class Objective(nn.Module):
         if self.expansion > 1 and self.training:
             expanded = {key: value.repeat_interleave(self.expansion, 0) for key, value in batch.items()}
             shared = tuple(value.repeat_interleave(self.expansion, 0) for value in cached)
+        repa = self.training and self.repa_weight > 0 and self.repa_active
+        tla = self.training and self.tla_weight > 0
+        layers = teacher_layers(self.model, repa, tla)
         details = flow_loss(
             self.model,
             expanded,
@@ -82,7 +168,16 @@ class Objective(nn.Module):
             return_details=True,
             cached=shared,
             time_sampling=self.time_sampling,
+            **({"hidden_layers": layers} if layers else {}),
+            guidance_weight=self.guidance_weight if self.training else 0.0,
         )
+        prediction = details.pop("prediction")
+        offset = details.pop("guidance_offset", None)
+        if self.training:
+            hidden = details.pop("hidden", {})
+            times, drop = details["times"], details["drop"]
+            terms = teacher_terms(self.model, expanded, hidden, times, drop, repa, tla, self.repa_frames)
+            details.update(terms)
         flow = details["flow"]
         if self.model.duration is None:
             duration_loss = flow.new_zeros(batch["latents"].size(0))
@@ -95,7 +190,7 @@ class Objective(nn.Module):
             )
             duration_loss = F.smooth_l1_loss(duration.float(), log_rate, reduction="none")
         copies = flow.numel() // duration_loss.numel()
-        if self.contrastive_weight > 0 and self.training:
+        if self.contrastive_mode == "text_hinge" and self.contrastive_weight > 0 and self.training:
             # Same audio, noise and time as each utterance's first draw, wrong transcript by one word:
             # the true transcript must explain the audio better by a margin.
             tokens, segments, usable = self.negatives(batch)
@@ -112,6 +207,9 @@ class Objective(nn.Module):
             hinge = F.relu(positive + self.contrastive_margin * positive.detach() - negative)
             hinge = hinge.masked_fill(details["drop"][::copies] | ~usable, 0)
             details["contrastive"] = hinge.repeat_interleave(copies) / copies
+        elif self.contrastive_mode == "latent_delta" and self.training:
+            # Correct text, corrupted target latents: only the regression target changes (no forward).
+            details.update(self.latent_delta(expanded, prediction, details, copies, offset))
         total = flow + self.duration_weight * duration_loss.repeat_interleave(copies)
         return {"loss": total, "duration": duration_loss, **details}
 
@@ -122,7 +220,23 @@ class Objective(nn.Module):
             terms.append(self.ctc_weight * losses["ctc"])
         if "contrastive" in losses:
             terms.append(self.contrastive_weight * losses["contrastive"])
+        if "repa" in losses:
+            terms.append(self.repa_weight * losses["repa"])
+        if "tla" in losses:
+            terms.append(self.tla_weight * (losses["tla"] + self.tla_entropy * losses["tla_entropy"]))
+        if "teacher_idle" in losses:
+            terms.append(losses["teacher_idle"])
         return sum(terms) if terms else None
+
+    def teacher_sums(self, losses):
+        """Summed [repa, tla, tla_entropy] terms of one micro-batch, for logging."""
+        zero = losses["flow"].new_zeros(())
+        return torch.stack([losses[k].detach().sum() if k in losses else zero for k in TEACHER_LOGS])
+
+    def teacher_record(self, means):
+        """Logged means of the enabled teacher terms; no keys at all when both are off."""
+        enabled = (self.repa_weight > 0, self.tla_weight > 0, self.tla_weight > 0)
+        return {key: float(value) for key, value, on in zip(TEACHER_LOGS, means, enabled) if on}
 
 
 def distributed_device(requested="auto"):
@@ -150,19 +264,161 @@ def atomic_save(obj, path):
     os.replace(temporary, path)
 
 
+def ema_key(decay):
+    """Checkpoint key of an extra EMA track, e.g. ema_0.999 (shortest round-trip float spelling)."""
+    return f"ema_{float(decay)!r}"
+
+
+def ema_tracks(train):
+    """Extra EMA tracks {checkpoint key: decay}; `ema_decay` itself always stays under `ema`."""
+    return {ema_key(decay): decay for decay in train.ema_decays if decay != train.ema_decay}
+
+
+def weights_key(checkpoint, ema=True):
+    """Checkpoint entry for `ema`: True -> "ema", False -> "model", a decay (0.999 or "0.999") or a key
+    ("ema_0.999") -> that EMA track; the primary decay maps to "ema"."""
+    if ema is True or ema is False:
+        return "ema" if ema else "model"
+    key = ema if str(ema).startswith("ema") else ema_key(float(ema))
+    if key == ema_key(Config.from_dict(checkpoint["config"]).train.ema_decay):
+        key = "ema"
+    if key not in checkpoint:
+        tracks = sorted(k for k in checkpoint if k == "ema" or k.startswith("ema_"))
+        raise KeyError(f"Checkpoint has no {key}; available weights: model, {', '.join(tracks)}")
+    return key
+
+
 def load_model(path, device="cpu", ema=True):
+    """`ema`: True loads the primary EMA, False the raw weights, a decay or key one of `train.ema_decays`."""
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     cfg = Config.from_dict(checkpoint["config"])
     model = FlowTTS(cfg.model)
-    model.load_state_dict(checkpoint["ema"] if ema else checkpoint["model"])
+    model.load_state_dict(checkpoint[weights_key(checkpoint, ema)])
     return model.to(device).eval(), checkpoint
 
 
-def lr_multiplier(step, warmup, steps):
+def export_ema(path, ema, output):
+    """Optimizer-free copy of a checkpoint whose `ema` holds another EMA track, for the evaluation tools
+    that load the default EMA (monitor, eval scripts, demo)."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    key = weights_key(checkpoint, ema)
+    dropped = {"optimizer", "rng"}
+    result = {k: v for k, v in checkpoint.items() if k not in dropped and not k.startswith("ema_")}
+    result.update(ema=checkpoint[key], exported_ema=key)
+    atomic_save(result, output)
+
+
+def decay_start(steps, decay_fraction):
+    """First update of the WSD decay phase."""
+    return steps - round(steps * decay_fraction)
+
+
+def lr_multiplier(
+    step, warmup, steps, schedule="cosine", decay_fraction=0.2, decay_shape="1-sqrt", floor=0.1
+):
+    """Linear warmup, then cosine to `floor`, or WSD: constant until `decay_start`, then a linear or 1-sqrt
+    decay to `floor` (Hägele et al., arXiv:2405.18392). The defaults are the original cosine schedule."""
     if step < warmup:
         return (step + 1) / max(warmup, 1)
+    if schedule == "wsd":
+        start = decay_start(steps, decay_fraction)
+        progress = min(max(step - start, 0) / max(steps - start, 1), 1)
+        return floor + (1 - floor) * (1 - (math.sqrt(progress) if decay_shape == "1-sqrt" else progress))
     progress = (step - warmup) / max(steps - warmup, 1)
-    return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(progress, 1)))
+    return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * min(progress, 1)))
+
+
+def schedule_multiplier(step, train):
+    return lr_multiplier(
+        step,
+        train.warmup,
+        train.steps,
+        train.lr_schedule,
+        train.decay_fraction,
+        train.decay_shape,
+        train.min_lr_ratio,
+    )
+
+
+def time_sampling_at(step, train):
+    """Flow-time distribution of an update: `final_time_sampling` from its start on (a function of the step
+    only, so exact resume is unaffected)."""
+    if train.final_time_sampling is None:
+        return train.time_sampling
+    start = train.final_time_sampling_start
+    first = decay_start(train.steps, train.decay_fraction) if start == "decay" else round(start * train.steps)
+    return train.final_time_sampling if step >= first else train.time_sampling
+
+
+def training_dataset(cache, cfg):
+    """The training split of `cache` with every data option of `cfg`: the pairing, the training-pair options
+    (#11) and the teacher stores (#10, relative store paths resolve against `cache`)."""
+    return LatentDataset(
+        cache,
+        "train",
+        cfg.train.seed,
+        prompt_dropout=cfg.train.prompt_dropout,
+        pairing=cfg.train.pairing,
+        layout=cfg.model.text_layout,
+        prompt_fraction=(cfg.train.prompt_fraction_min, cfg.train.prompt_fraction_max),
+        **pair_options(cfg),
+        **teacher_sources(cfg.train, cache),
+    )
+
+
+def training_batches(data, cfg, rank, world, frame_budget, device):
+    """Sampler and loader of a training dataset: the throughput options of #7 (length padding, loader-side
+    negatives, padded sampler costs) and #11's exact per-epoch cross-prompt costs. With the defaults this is
+    the plain bucket sampler over `data.costs` and `collate`."""
+    items, train_collate, costs = training_loader(data, cfg.train)
+    sampler = BucketBatchSampler(
+        costs,
+        cfg.train.batch_size,
+        rank,
+        world,
+        cfg.train.seed,
+        frame_budget,
+        speaker_counts=data.group_end - data.group_start,
+        speaker_balance=cfg.train.speaker_balance,
+        # Exact per-epoch lengths of cross prompts, rounded up like `costs` when pad_multiple > 1.
+        epoch_costs=training_epoch_costs(data, cfg.train),
+    )
+    loader = DataLoader(
+        items,
+        batch_sampler=sampler,
+        collate_fn=train_collate,
+        **loader_options(
+            cfg.train.workers,
+            device,
+            cfg.train.prefetch_factor,
+            cfg.train.worker_threads,
+            cfg.train.loader_start_method,
+        ),
+        generator=torch.Generator().manual_seed(cfg.train.seed + rank),
+    )
+    return sampler, loader
+
+
+def decay_phase_loader(cache, reference, cfg, rank, world, frame_budget, device):
+    """Sampler and loader over the WSD decay cache, built exactly like the main training loader (the same
+    pair, teacher and throughput options; see `training_dataset` and `training_batches`).
+
+    Latents are normalized with the main cache's statistics, so the latent space does not shift at the
+    switch and the checkpoint's mean/std stay valid for inference; the codec metadata must match. The
+    encoded-silence frame of tail silence / quiet cuts (#11) is re-standardized with the same statistics.
+    Teacher stores given as relative paths are looked up in the decay cache, which needs its own
+    extraction (or absolute store paths covering its rows).
+    """
+    data = training_dataset(cache, cfg)
+    if not data.meta.get("merged"):
+        raise ValueError("Run merge on the decay cache before training")
+    check_compatibility(data.meta, reference.meta)
+    if data.channels != reference.channels:
+        raise ValueError("The decay cache has a different latent width")
+    data.mean, data.std = reference.mean, reference.std
+    if data.silence is not None:
+        data.silence = (raw_silence(cache, data.meta) - data.mean) / data.std
+    return training_batches(data, cfg, rank, world, frame_budget, device)
 
 
 def rng_state(device):
@@ -220,6 +476,22 @@ def validate(model, loader, device, precision, max_batches=20, reduction="uttera
     }
 
 
+def pair_options(cfg):
+    """Training-pair options (issue #11) of the training set. Validation keeps the baseline pairs, so
+    validation_flow stays comparable between the A/B arms of these options."""
+    names = (
+        "cross_prompt_prob",
+        "cross_prompt_max_utterances",
+        "cross_prompt_max_seconds",
+        "long_prompt_prob",
+        "prompt_fraction_long_max",
+        "tail_silence_prob",
+        "tail_silence_max_seconds",
+        "prompt_cut",
+    )
+    return {**{name: getattr(cfg.train, name) for name in names}, "ctc_targets": cfg.model.ctc_targets}
+
+
 def train(args):
     device, rank, world = distributed_device(args.device)
     try:
@@ -255,37 +527,18 @@ def train(args):
             layout=cfg.model.text_layout,
             prompt_fraction=(cfg.train.prompt_fraction_min, cfg.train.prompt_fraction_max),
         )
-        data = LatentDataset(
-            args.cache, "train", cfg.train.seed, prompt_dropout=cfg.train.prompt_dropout, **pairing
-        )
+        data = training_dataset(args.cache, cfg)
         if not data.meta.get("merged"):
             raise ValueError("Run merge on all prepared partitions before training")
         if cfg.model.latent_dim != data.channels:
             raise ValueError(f"Config latent_dim={cfg.model.latent_dim}, codec cache has {data.channels}")
-        sampler = BucketBatchSampler(
-            data.costs,
-            cfg.train.batch_size,
-            rank,
-            world,
-            cfg.train.seed,
-            args.frame_budget,
-            speaker_counts=data.group_end - data.group_start,
-            speaker_balance=cfg.train.speaker_balance,
-        )
-        loader_rng = torch.Generator().manual_seed(cfg.train.seed + rank)
-        loader = DataLoader(
-            data,
-            batch_sampler=sampler,
-            collate_fn=collate,
-            **loader_options(
-                cfg.train.workers,
-                device,
-                cfg.train.prefetch_factor,
-                cfg.train.worker_threads,
-                cfg.train.loader_start_method,
-            ),
-            generator=loader_rng,
-        )
+        # Defaults: (data, collate, data.costs). Padding/loader negatives change collate and costs.
+        sampler, loader = training_batches(data, cfg, rank, world, args.frame_budget, device)
+        decay_loader = None
+        if cfg.train.decay_cache:
+            decay_loader = decay_phase_loader(
+                cfg.train.decay_cache, data, cfg, rank, world, args.frame_budget, device
+            )
         validation = None
         if not args.no_validation:
             val_data = LatentDataset(args.cache, "val", cfg.train.seed, **pairing)
@@ -299,7 +552,9 @@ def train(args):
             )
         model = FlowTTS(cfg.model).to(device)
         model.grad_checkpoint = cfg.train.grad_checkpoint
+        model.strict_checks = cfg.train.strict_checks
         ema = copy.deepcopy(model).eval().requires_grad_(False)
+        averages = {key: (decay, copy.deepcopy(ema)) for key, decay in ema_tracks(cfg.train).items()}
         optimizer = build_optimizer(
             model,
             cfg.train.optimizer,
@@ -326,6 +581,8 @@ def train(args):
                 raise ValueError("Resume requires the same cache path and frame budget")
             model.load_state_dict(saved["model"])
             ema.load_state_dict(saved["ema"])
+            for key, (_, average) in averages.items():
+                average.load_state_dict(saved[key])
             optimizer.load_state_dict(saved["optimizer"])
             start_step, epoch, batch_offset = saved["step"], saved["epoch"], saved["batch_offset"]
             restore_rng(saved["rng"][rank], device)
@@ -334,12 +591,24 @@ def train(args):
                 # Warm start: weights only. Schedule, optimizer state and data order start fresh, so
                 # a run can continue on a larger cache than the one that produced the checkpoint.
                 warm = torch.load(args.init_from, map_location="cpu", weights_only=True)
-                if Config.from_dict(warm["config"]).model != cfg.model:
-                    raise ValueError("--init-from requires an identical model configuration")
+                warm_model = Config.from_dict(warm["config"]).model
+                # Dropout has no parameters, so a run may switch it on or off when warm starting.
+                if dataclasses.replace(warm_model, dropout=cfg.model.dropout) != cfg.model:
+                    raise ValueError("--init-from requires an identical model configuration (except dropout)")
                 model.load_state_dict(warm["model"])
                 ema.load_state_dict(warm["ema"])
+                for key, (_, average) in averages.items():
+                    average.load_state_dict(warm.get(key, warm["ema"]))
             torch.manual_seed(cfg.train.seed + rank)
             random.seed(cfg.train.seed + rank)
+        silence = None
+        if cfg.train.contrastive_mode == "latent_delta":
+            # Tail padding of skip and short random negatives: the cache's silence latent if it has one.
+            silence = load_silence(args.cache, data.channels, data.mean, data.std, data.meta)
+            silence = None if silence is None else silence.to(device)
+            if rank == 0:
+                fill = "last target frame (no silence.pt)" if silence is None else "silence.pt"
+                print(json.dumps({"latent_negative_fill": fill}), flush=True)
         objective = Objective(
             model,
             cfg.train.duration_weight,
@@ -348,14 +617,30 @@ def train(args):
             cfg.train.ctc_weight,
             cfg.train.contrastive_weight,
             cfg.train.contrastive_margin,
+            contrastive_mode=cfg.train.contrastive_mode,
+            random_weight=cfg.train.contrastive_random_weight,
+            aug_weight=cfg.train.contrastive_aug_weight,
+            span=(cfg.train.contrastive_span_min, cfg.train.contrastive_span_max),
+            repeat_coverage=cfg.train.contrastive_repeat_coverage,
+            skip_coverage=cfg.train.contrastive_skip_coverage,
+            negative_cap=cfg.train.contrastive_negative_cap,
+            silence=silence,
+            repa_weight=cfg.train.repa_weight,
+            repa_frames=cfg.train.repa_frames,
+            tla_weight=cfg.train.tla_weight,
+            tla_entropy=cfg.train.tla_entropy,
+            guidance_weight=cfg.train.model_guidance_weight,
         ).train()
         raw_objective = objective  # compile/DDP wrap the module; helper methods stay reachable here
         eager_forward = model.forward
+        eager_runner = model.block_runner
         compiled = bool(cfg.train.compile)
         if cfg.train.compile == "model":
             # Only the generator: the loss, CTC and batch expansion stay eager, which avoids
             # dynamic-shape failures in the compiler while keeping most of the speed-up.
             model.forward = torch.compile(model.forward, dynamic=True)
+        elif cfg.train.compile == "blocks":
+            compile_blocks(model, cfg.train.compile_dynamic)  # regional: one compiled block step
         elif cfg.train.compile:
             objective = torch.compile(objective, dynamic=True)
 
@@ -367,8 +652,8 @@ def train(args):
                 return module(batch)
             except Exception as error:
                 origin = type(error).__module__
-                # Under DDP only the generator-only mode can be swapped (the objective is wrapped).
-                swappable = cfg.train.compile == "model" or world == 1
+                # Under DDP only the generator/block modes can be swapped (the objective is wrapped).
+                swappable = cfg.train.compile in ("model", "blocks") or world == 1
                 if (
                     not compiled
                     or not swappable
@@ -376,6 +661,7 @@ def train(args):
                 ):
                     raise
                 model.forward = eager_forward
+                model.block_runner = eager_runner
                 objective = raw_objective
                 compiled = False
                 # Eager activations need roughly twice the memory of the compiled graph; recompute
@@ -432,11 +718,23 @@ def train(args):
                 ),
                 flush=True,
             )
+        switch = decay_start(cfg.train.steps, cfg.train.decay_fraction) if decay_loader else None
+        if decay_loader is not None and start_step > switch:
+            # Resumed inside the decay phase: the saved epoch and offset count decay-cache batches.
+            sampler, loader = decay_loader
         sampler.epoch, sampler.start_batch = epoch, batch_offset
+        # strict_checks: false defers the loss/gradient finiteness checks to the next host sync.
+        watch = None if cfg.train.strict_checks else NonfiniteWatch(device)
         iterator = iter(loader)
         last_time = time.monotonic()
         inactive = {}
         for step in range(start_step, cfg.train.steps):
+            if decay_loader is not None and step == switch:
+                sampler, loader = decay_loader
+                epoch, batch_offset = 0, 0
+                sampler.epoch, sampler.start_batch = 0, 0
+                iterator = iter(loader)
+            raw_objective.time_sampling = time_sampling_at(step, cfg.train)
             # Collect a window before backward so variable batches receive exact example weighting.
             batches = []
             for _ in range(cfg.train.accumulation):
@@ -463,11 +761,14 @@ def train(args):
             # Batch expansion multiplies the flow terms only; duration terms stay per utterance.
             flow_examples = denominator * cfg.train.batch_expansion
             frame_denominator = frame_denominator * cfg.train.batch_expansion
-            learning_rate = cfg.train.learning_rate * lr_multiplier(step, cfg.train.warmup, cfg.train.steps)
+            learning_rate = cfg.train.learning_rate * schedule_multiplier(step, cfg.train)
             for group in optimizer.param_groups:
                 group["lr"] = learning_rate
             optimizer.zero_grad(set_to_none=True)
             metrics = torch.zeros(5, device=device)
+            negative_metrics = torch.zeros(5, device=device)  # latent_delta only, see delta_sums
+            teacher_metrics = torch.zeros(len(TEACHER_LOGS), device=device)
+            raw_objective.repa_active = not cfg.train.repa_stop_step or step < cfg.train.repa_stop_step
             buckets = torch.zeros(9, 2, device=device)
             diagnostics = {}
             diagnose = cfg.train.diagnostics_every > 0 and step % cfg.train.diagnostics_every == 0
@@ -493,9 +794,18 @@ def train(args):
                         auxiliary = raw_objective.auxiliary(losses)
                         if auxiliary is not None:
                             loss = loss + auxiliary.sum() * world / flow_examples
+                        if "latent_delta" in losses:
+                            # The flow term's own weights and denominator: per frame the objective stays
+                            # a convex quadratic in the prediction (see dacvae_tts.negatives).
+                            delta = (losses["latent_delta"] * flow_weights).sum()
+                            loss = loss + delta * world / flow_denominator
                     if probe is not None:
                         diagnostics["activation_max_abs"] = probe.close()
-                        if world == 1:
+                        if model.grad_checkpoint == "selective":
+                            diagnostics["gradient_contributions"] = (
+                                "Unavailable under selective checkpointing, which allows a single backward"
+                            )
+                        elif world == 1:
                             diagnostics.update(
                                 gradient_contributions(
                                     model,
@@ -507,7 +817,9 @@ def train(args):
                             diagnostics["gradient_contributions"] = (
                                 "Use a single-process diagnostic run; autograd.grad is not used inside DDP"
                             )
-                    if not torch.isfinite(loss):
+                    if watch is not None:
+                        watch.note("objective", loss, step)
+                    elif not torch.isfinite(loss):
                         raise FloatingPointError(f"Nonfinite objective at update {step + 1}")
                     loss.backward()
                 buckets += loss_buckets(losses["flow"], losses["times"], losses["frames"])
@@ -522,8 +834,13 @@ def train(args):
                         else losses["flow"].new_zeros(()),
                     ]
                 )
+                if "latent_delta" in losses:
+                    negative_metrics += delta_sums(losses, flow_weights)
+                teacher_metrics += raw_objective.teacher_sums(losses)
             norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            if not torch.isfinite(norm):
+            if watch is not None:
+                watch.note("gradient", norm, step)
+            elif not torch.isfinite(norm):
                 raise FloatingPointError(f"Nonfinite gradient at update {step + 1}")
             if diagnose:
                 diagnostics["gradient_groups_after_clip"] = gradient_groups(model)
@@ -535,10 +852,18 @@ def train(args):
                 # Warm-up keeps the average from being dominated by the random initialization.
                 decay = min(cfg.train.ema_decay, (1 + step) / (10 + step))
                 torch._foreach_lerp_(list(ema.parameters()), list(model.parameters()), 1 - decay)
+                for track_decay, average in averages.values():
+                    decay = min(track_decay, (1 + step) / (10 + step))
+                    torch._foreach_lerp_(list(average.parameters()), list(model.parameters()), 1 - decay)
             if (step + 1) % cfg.train.log_every == 0 or step == start_step or diagnose:
+                if watch is not None:
+                    watch.check()
                 if world > 1:
                     dist.all_reduce(metrics)
                     dist.all_reduce(buckets)
+                    if cfg.train.contrastive_mode == "latent_delta":
+                        dist.all_reduce(negative_metrics)
+                    dist.all_reduce(teacher_metrics)
                 if rank == 0:
                     record = {
                         "step": step + 1,
@@ -552,6 +877,7 @@ def train(args):
                         "duration": (metrics[2] / denominator).item(),
                         "ctc": (metrics[3] / flow_examples).item(),
                         "contrastive": (metrics[4] / flow_examples).item(),
+                        **raw_objective.teacher_record(teacher_metrics / flow_examples),
                         "elapsed_seconds": time.monotonic() - last_time,
                         "valid_target_frames": int(frame_denominator),
                         "gradient_norm_before_clip": float(norm),
@@ -562,12 +888,16 @@ def train(args):
                         "time_and_length_buckets_sum_count": buckets.cpu().tolist(),
                         "diagnostics_rank0": diagnostics,
                     }
+                    if cfg.train.contrastive_mode == "latent_delta":
+                        record.update(delta_record(negative_metrics, flow_denominator))
                     print(json.dumps(record), flush=True)
                     with open(out / "train.jsonl", "a") as stream:
                         stream.write(json.dumps(record) + "\n")
                     tracker.log(record, step=step + 1, prefix="train/")
                 last_time = time.monotonic()
             if validation is not None and (step + 1) % cfg.train.validate_every == 0:
+                if watch is not None:
+                    watch.check()
                 val = validate(
                     ema,
                     validation,
@@ -576,6 +906,17 @@ def train(args):
                     reduction=cfg.train.flow_reduction,
                     duration_weight=cfg.train.duration_weight,
                 )
+                for key, (_, average) in averages.items():
+                    extra = validate(
+                        average,
+                        validation,
+                        device,
+                        cfg.train.precision,
+                        reduction=cfg.train.flow_reduction,
+                        duration_weight=cfg.train.duration_weight,
+                    )
+                    label = key.replace(".", "_")  # dots are W&B's nested-key separator
+                    val.update({f"{label}/{name}": value for name, value in extra.items()})
                 if rank == 0:
                     record = {"step": step + 1, **val}
                     print(json.dumps(record), flush=True)
@@ -590,6 +931,8 @@ def train(args):
                 or stopping
                 or keeping
             ):
+                if watch is not None:
+                    watch.check()  # never write a checkpoint after an unnoticed nonfinite update
                 states = [None] * world
                 state = rng_state(device)
                 if world > 1:
@@ -615,6 +958,9 @@ def train(args):
                         "stage": "pretrain",
                         "init_from": getattr(args, "init_from", None),
                     }
+                    saved.update({key: average.state_dict() for key, (_, average) in averages.items()})
+                    if cfg.train.model_guidance_weight:
+                        saved["recommended_guidance"] = 1.0  # guidance is baked in: sample without CFG
                     atomic_save(saved, out / "last.pt")
                     if keeping:
                         # Permanent, optimizer-free snapshot for later speech evaluation and selection.

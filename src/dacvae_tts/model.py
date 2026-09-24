@@ -5,12 +5,13 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.checkpoint import checkpoint
 
+from .alignment import RepaProjector, SpeakerAlignment
 from .config import ModelConfig
 from .contracts import audio_shapes, mask_values, sanitize, text_shapes
 from .reference import ReferencePool, TemporalReference
-from .text import BYTE_OFFSET, VOCAB_SIZE
+from .speed import block_checkpoint, run_block
+from .text import BYTE_OFFSET, CHAR_VOCAB_SIZE, VOCAB_SIZE, char_ctc_targets
 
 
 def sinusoidal(positions, width):
@@ -45,7 +46,7 @@ def rotate(x, angles):
 
 
 class Attention(nn.Module):
-    def __init__(self, width, heads, qk_norm=False):
+    def __init__(self, width, heads, qk_norm=False, gate=False):
         super().__init__()
         self.heads = heads
         self.q = nn.Linear(width, width)
@@ -53,19 +54,38 @@ class Attention(nn.Module):
         self.out = nn.Linear(width, width)
         self.q_norm = nn.RMSNorm(width // heads) if qk_norm else None
         self.k_norm = nn.RMSNorm(width // heads) if qk_norm else None
+        # Head-wise output gate y_h <- 2 sigmoid(w_h . x + b_h) y_h from the query-side input (Qwen gated
+        # attention, arXiv:2505.06708: query-dependent sparsity, no attention sink, higher-LR stability; Echo,
+        # Irodori and Darya gate too; no TTS ablation). 2 sigmoid with zero init is exactly 1: starts as the
+        # baseline and can still open to 2. skip_init draws no random numbers (baseline weights per seed).
+        self.gate = None
+        if gate:
+            self.gate = nn.utils.skip_init(nn.Linear, width, heads)
+            nn.init.zeros_(self.gate.weight)
+            nn.init.zeros_(self.gate.bias)
 
-    def forward(self, x, context, valid, query_angles=None, key_angles=None):
+    def forward(
+        self, x, context, valid, query_angles=None, key_angles=None, value_mix=None, first_value=None
+    ):
         b, n, d = x.shape
         q = self.q(x).view(b, n, self.heads, d // self.heads).transpose(1, 2)
         k, v = self.kv(context).chunk(2, dim=-1)
         k = k.view(b, -1, self.heads, d // self.heads).transpose(1, 2)
         v = v.view(b, -1, self.heads, d // self.heads).transpose(1, 2)
+        if value_mix is not None:
+            # Value residual: v <- l1 v + l2 v_1 with the first block's raw values [B,H,N,D/H], which are
+            # returned for the later blocks (the first block has none yet and mixes its own).
+            first_value = v if first_value is None else first_value
+            v = value_mix[0] * v + value_mix[1] * first_value
         if self.q_norm is not None:
             q, k = self.q_norm(q), self.k_norm(k)
         if query_angles is not None:
             q, k = rotate(q, query_angles), rotate(k, key_angles)
         y = F.scaled_dot_product_attention(q.to(v.dtype), k.to(v.dtype), v, attn_mask=valid[:, None, None, :])
-        return self.out(y.transpose(1, 2).reshape(b, n, d))
+        if self.gate is not None:
+            y = y * (2 * torch.sigmoid(self.gate(x))).transpose(1, 2)[..., None].to(y.dtype)
+        y = self.out(y.transpose(1, 2).reshape(b, n, d))
+        return y if value_mix is None else (y, first_value)
 
 
 class TextBlock(nn.Module):
@@ -119,6 +139,18 @@ class TextEncoder(nn.Module):
         return self.norm(x) * valid[..., None], valid
 
 
+class SwiGLU(nn.Module):
+    """silu(gate) * value from one fused projection; its two row halves are separate maps for Muon."""
+
+    def __init__(self, width, hidden):
+        super().__init__()
+        self.proj = nn.Linear(width, 2 * hidden)
+
+    def forward(self, x):
+        gate, value = self.proj(x).chunk(2, dim=-1)
+        return F.silu(gate) * value
+
+
 class Block(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -126,11 +158,17 @@ class Block(nn.Module):
         self.norm1 = nn.LayerNorm(d, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(d, elementwise_affine=False)
         self.norm3 = nn.LayerNorm(d, elementwise_affine=False)
-        self.self_attn = Attention(d, cfg.heads, cfg.qk_norm)
-        self.cross_attn = Attention(d, cfg.heads, cfg.qk_norm)
-        self.ff = nn.Sequential(
-            nn.Linear(d, d * cfg.ff_mult), nn.GELU(approximate="tanh"), nn.Linear(d * cfg.ff_mult, d)
-        )
+        self.self_attn = Attention(d, cfg.heads, cfg.qk_norm, cfg.attn_gate == "head")
+        self.cross_attn = Attention(d, cfg.heads, cfg.qk_norm, cfg.attn_gate == "head")
+        if cfg.ffn_activation == "swiglu":
+            # Equal parameters: hidden 2/3 of the GELU width, rounded to a multiple of 64 (1024 at 512 x 3).
+            # T5 and LightningDiT gain from GLUs; the 140M SR-DiT ablation was neutral: an A/B, not a default.
+            hidden = max(64, 64 * round(2 * d * cfg.ff_mult / 3 / 64))
+            self.ff = nn.Sequential(SwiGLU(d, hidden), nn.Linear(hidden, d))
+        else:
+            self.ff = nn.Sequential(
+                nn.Linear(d, d * cfg.ff_mult), nn.GELU(approximate="tanh"), nn.Linear(d * cfg.ff_mult, d)
+            )
         if cfg.adaln_rank:
             # Low-rank per-block correction on top of a modulation shared by every block
             # (PixArt-alpha / EzAudio SOLA / Echo-TTS style); the up projection starts at zero.
@@ -142,11 +180,36 @@ class Block(nn.Module):
             self.ada = nn.Sequential(nn.SiLU(), nn.Linear(d, d * 9))
             nn.init.zeros_(self.ada[-1].weight)
             nn.init.zeros_(self.ada[-1].bias)
+        # Value residual (ResFormer, arXiv:2410.17897; 140M SR-DiT FID 4.02 -> 3.64): self-attention values
+        # v_l <- l1 v_l + l2 v_1 keep the first block's token features reachable in deep blocks. Two scalars
+        # per block, identity at init (l1 = 1, l2 = 0). Block 1 mixes its own values: all are used (DDP).
+        self.value_mix = nn.Parameter(torch.tensor([1.0, 0.0])) if cfg.value_residual else None
+        # Depthwise time convolution on the FFN hidden units, after the activation and residual (Mix-FFN
+        # style): the only local mixing along frames in the generator. ZipVoice WER 1.69 -> 9.79 without
+        # its conv modules, FastSpeech CMOS -0.11 without conv in the FFN, U-DiT/SANA gains; F5's
+        # Conv2Audio is the counter-example (4.17 -> 5.78). Zero-init, so the model starts as the baseline;
+        # skip_init draws no random numbers, so the other weights stay the baseline's for the same seed.
+        self.ff_conv = None
+        if cfg.ffn_conv_kernel:
+            hidden, kernel = self.ff[-1].in_features, cfg.ffn_conv_kernel
+            self.ff_conv = nn.utils.skip_init(
+                nn.Conv1d, hidden, hidden, kernel, padding=kernel // 2, groups=hidden
+            )
+            nn.init.zeros_(self.ff_conv.weight)
+            nn.init.zeros_(self.ff_conv.bias)
 
     def modulation(self, cond, shared):
         if shared is None:
             return self.ada(cond)
         return shared + self.ada_up(F.silu(self.ada_down(cond)))
+
+    def conv_feed_forward(self, h, valid):
+        """The FFN with its depthwise time convolution between the activation and the output projection."""
+        *project, down = self.ff
+        for layer in project:
+            h = layer(h)
+        h = h * valid[..., None]  # padded frames hold bias-driven activations: keep them from neighbours
+        return down(h + self.ff_conv(h.transpose(1, 2)).transpose(1, 2))
 
     def forward(
         self,
@@ -159,15 +222,67 @@ class Block(nn.Module):
         query_angles=None,
         key_angles=None,
         shared=None,
+        first_value=None,
     ):
+        """Returns x, or (x, first-block values) with value_residual; the values are passed explicitly so
+        activation checkpointing recomputes each block from its inputs alone."""
         params = self.modulation(cond, shared).unsqueeze(1).chunk(9, dim=-1)
         s1, b1, g1, s2, b2, g2, s3, b3, g3 = params
         h = self.norm1(x) * (1 + s1) + b1
-        x = x + g1 * self.self_attn(h, h, valid, self_angles, self_angles)
+        if self.value_mix is None:
+            x = x + g1 * self.self_attn(h, h, valid, self_angles, self_angles)
+        else:
+            mix = self.value_mix
+            y, first_value = self.self_attn(h, h, valid, self_angles, self_angles, mix, first_value)
+            x = x + g1 * y
         h = self.norm2(x) * (1 + s2) + b2
         x = x + g2 * self.cross_attn(h, text, text_valid, query_angles, key_angles)
-        x = x + g3 * self.ff(self.norm3(x) * (1 + s3) + b3)
-        return x * valid[..., None]
+        if self.ff_conv is None:
+            x = x + g3 * self.ff(self.norm3(x) * (1 + s3) + b3)
+        else:
+            x = x + g3 * self.conv_feed_forward(self.norm3(x) * (1 + s3) + b3, valid)
+        x = x * valid[..., None]
+        return x if self.value_mix is None else (x, first_value)
+
+
+def _output_dropout(module, args, output):
+    if isinstance(output, tuple):  # value-residual self-attention (#9): (output, first-block values)
+        return (F.dropout(output[0], module.output_dropout, module.training), *output[1:])
+    return F.dropout(output, module.output_dropout, module.training)
+
+
+def add_dropout(block, p):
+    """Residual-branch dropout where F5-TTS's DiT has it (0.1): after both attention output projections and on
+    the FFN hidden activation. Only parameter-free pieces are added (an output hook, a Dropout next to the
+    activation), so state-dict keys, initialization and checkpoints are the same with and without it.
+
+    The #9 block options keep the same placement: the GELU FFN (also with ffn_conv_kernel, whose depthwise
+    convolution then sees the dropped activation) gets the Dropout next to its GELU; the SwiGLU FFN
+    ([SwiGLU, Linear]) gets the output hook on its gated activation instead, which keeps its state-dict keys;
+    the attention hook drops only the attention output of a value-residual self-attention, whose first-block
+    values pass through unchanged, and acts after the head gate (attn_gate), i.e. on what the block adds.
+    """
+    if isinstance(block.ff[0], SwiGLU):
+        block.ff[0].output_dropout = p
+        block.ff[0].register_forward_hook(_output_dropout)
+    elif len(block.ff) == 3 and isinstance(block.ff[1], nn.GELU):
+        block.ff[1] = nn.Sequential(block.ff[1], nn.Dropout(p))
+    else:
+        raise TypeError("Dropout expects the block feed-forward as Linear, GELU, Linear or SwiGLU, Linear")
+    for attention in (block.self_attn, block.cross_attn):
+        attention.output_dropout = p
+        attention.register_forward_hook(_output_dropout)
+
+
+def set_dropout(model, p):
+    """Set the rate of the residual-branch dropout that `add_dropout` installed in the generator blocks; 0
+    turns it off in training mode too (e.g. for GRPO, whose PPO ratio needs the rollout policy)."""
+    for block in model.blocks:
+        for module in block.modules():
+            if hasattr(module, "output_dropout"):
+                module.output_dropout = p
+            elif isinstance(module, nn.Dropout):
+                module.p = p
 
 
 class FlowTTS(nn.Module):
@@ -183,6 +298,9 @@ class FlowTTS(nn.Module):
         self.time = nn.Sequential(nn.Linear(d, d), nn.SiLU(), nn.Linear(d, d))
         self.input = nn.Linear((2 * c + 1) * p, d)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.depth)])
+        if cfg.dropout:  # at 0 nothing is installed, so default runs draw exactly the same random numbers
+            for block in self.blocks:
+                add_dropout(block, cfg.dropout)
         self.ada_shared = None
         if cfg.adaln_rank:
             self.ada_shared = nn.Sequential(nn.SiLU(), nn.Linear(d, d * 9))
@@ -199,9 +317,49 @@ class FlowTTS(nn.Module):
             else None
         )
         # Auxiliary CTC head on intermediate frames (A-DMA, arXiv:2505.19595): training only. It makes
-        # the generator route every transcript byte to its frames early, i.e. learn the alignment.
-        self.ctc = nn.Linear(d, VOCAB_SIZE) if cfg.ctc_layer else None
+        # the generator route every transcript byte (or letter, ctc_targets: chars) to its frames early,
+        # i.e. learn the alignment.
+        labels = CHAR_VOCAB_SIZE if cfg.ctc_targets == "chars" else VOCAB_SIZE
+        self.ctc = nn.Linear(d, labels) if cfg.ctc_layer else None
+        # Input -> output long skip: the input embedding re-enters just before the output head, fused with the
+        # last block by LN + Linear over [h_0, h_L] (the pre-norm matches their scales; the head's LayerNorm
+        # then normalizes the sum, Hunyuan-DiT's fix for loss spikes after skip fusion). DiTTo, a
+        # cross-attention DiT like this one: WER 3.30 -> 2.93, SIM 0.573 -> 0.588; EzAudio: faster
+        # convergence. Counter-evidence is in-context only (F5 4.17 -> 5.17). Zero-init: starts as baseline.
+        self.skip = None
+        if cfg.long_skip:
+            self.skip = nn.Sequential(nn.LayerNorm(2 * d), nn.Linear(2 * d, d))
+            nn.init.zeros_(self.skip[-1].weight)
+            nn.init.zeros_(self.skip[-1].bias)
+        # Final adaLN (the DiT / F5 final layer): shift and scale of the output LayerNorm come from the
+        # condition, so the velocity head can adapt to flow time and voice. Rank-r like the blocks when
+        # adaln_rank > 0, else a full D -> 2D map; the last projection starts at zero (baseline at init).
+        self.final_ada = None
+        if cfg.final_adaln:
+            r = cfg.adaln_rank
+            self.final_ada = (
+                nn.Sequential(nn.Linear(d, r), nn.SiLU(), nn.Linear(r, 2 * d))
+                if r
+                else nn.Sequential(nn.SiLU(), nn.Linear(d, 2 * d))
+            )
+            nn.init.zeros_(self.final_ada[-1].weight)
+            nn.init.zeros_(self.final_ada[-1].bias)
+        # Pooled transcript in the condition (DiTTo: WER 3.00 -> 2.93): the masked mean of the target-byte
+        # encodings joins time + voice, so every adaLN sees the whole sentence. No bias and zero-init: it
+        # starts as the baseline, and text dropped for guidance (all zeros) adds nothing to the null branch.
+        self.text_pool = None
+        if cfg.cond_text_pool:
+            self.text_pool = nn.Linear(d, d, bias=False)
+            nn.init.zeros_(self.text_pool.weight)
+        # Training-only teacher heads (alignment.py): created last and only when configured, so models
+        # without them keep their initialization and old checkpoints load strictly.
+        self.repa = RepaProjector(d, cfg.repa_dim, p) if cfg.repa_layer else None
+        self.tla = (
+            SpeakerAlignment(d, cfg.tla_dim, len(cfg.tla_layers), cfg.tla_hidden) if cfg.tla_layers else None
+        )
         self.grad_checkpoint = False
+        self.strict_checks = True  # train.strict_checks: false skips value checks that wait for the GPU
+        self.block_runner = run_block  # train.compile: blocks swaps in a compiled runner (speed.py)
 
     def reference_summary(self, prompt, prompt_mask):
         prompt = sanitize(prompt, prompt_mask)
@@ -237,7 +395,7 @@ class FlowTTS(nn.Module):
         text_shapes(tokens, segments, prompt.size(0), prompt.device)
         text, _, voice = self.conditions(prompt, prompt_mask, tokens, segments) if cached is None else cached
         target_bytes = (segments == 1) & (tokens >= BYTE_OFFSET)
-        if (target_bytes.sum(1) == 0).any():
+        if self.strict_checks and (target_bytes.sum(1) == 0).any():
             raise ValueError("Duration prediction requires nonempty target text")
         ref_bytes = ((segments == 0) & (tokens >= BYTE_OFFSET)).sum(1).clamp_min(1)
         rate = (prompt_mask.sum(1).float().clamp_min(1) / ref_bytes).log().unsqueeze(1)
@@ -255,8 +413,22 @@ class FlowTTS(nn.Module):
         return self.duration(torch.cat(features, -1)).squeeze(-1)
 
     def forward(
-        self, x, time, prompt, prompt_mask, valid, tokens, segments, drop=None, cached=None, return_ctc=False
+        self,
+        x,
+        time,
+        prompt,
+        prompt_mask,
+        valid,
+        tokens,
+        segments,
+        drop=None,
+        cached=None,
+        return_ctc=False,
+        return_hidden=(),
     ):
+        """Velocity [B,L,C]; with `return_ctc`, (velocity, CTC logits, packed mask). A nonempty
+        `return_hidden` (1-based block indices) wraps that result as (result, {block: [B,N,D]}) for
+        training-only objectives that read intermediate states."""
         audio_shapes(x, prompt, prompt_mask, valid, self.cfg.latent_dim)
         text_shapes(tokens, segments, x.size(0), x.device)
         if time.shape != (x.size(0),) or time.device != x.device or not time.is_floating_point():
@@ -313,27 +485,43 @@ class FlowTTS(nn.Module):
         if time_embedding.shape != voice.shape:
             raise ValueError("Time embedding and reference summary must both be [B,D]")
         cond = time_embedding + voice
+        if self.text_pool is not None:  # target bytes, as the duration head; `text` is zero where dropped
+            cond = cond + self.text_pool(masked_mean(text, (segments == 1) & (tokens >= BYTE_OFFSET)))
         shared = self.ada_shared(cond) if self.ada_shared is not None else None
         ctc_logits = None
+        first = h  # input embedding h_0, for the optional long skip
+        first_value = None  # first block's self-attention values, for the optional value residual
+        hidden = {}
         for number, block in enumerate(self.blocks, 1):
             args = (h, text, packed_valid, text_valid, cond, *angles, shared)
-            h = (
-                checkpoint(block, *args, use_reentrant=False)
-                if self.grad_checkpoint and self.training
-                else block(*args)
-            )
+            if self.cfg.value_residual:
+                args = (*args, first_value)
+            # block_runner/block_checkpoint (speed.py): every train.grad_checkpoint mode and compile: blocks
+            # see the value-residual input and (x, first-block values) output like any other block tensor.
+            h = self.block_runner(block, args, block_checkpoint(self.grad_checkpoint, number, self.training))
+            if self.cfg.value_residual:
+                h, first_value = h
             if return_ctc and number == self.cfg.ctc_layer:
                 ctc_logits = self.ctc(h)
-        output = self.output(h)
+            if number in return_hidden:
+                hidden[number] = h
+        if self.skip is not None:
+            h = h + self.skip(torch.cat([first, h], -1))
+        if self.final_ada is None:
+            output = self.output(h)
+        else:
+            shift, scale = self.final_ada(cond).unsqueeze(1).chunk(2, dim=-1)
+            output = self.output[1](self.output[0](h) * (1 + scale) + shift)
         expected_packs = (length + pad) // p
         if output.shape != (b, expected_packs, channels * p):
             raise ValueError("Velocity projection returned an unexpected packed length or width")
         # Remove only the explicitly added packing padding, then mask at frame resolution.
         velocity = sanitize(output.reshape(b, length + pad, channels)[:, :length], valid)
-        return (velocity, ctc_logits, packed_valid) if return_ctc else velocity
+        result = (velocity, ctc_logits, packed_valid) if return_ctc else velocity
+        return (result, hidden) if return_hidden else result
 
 
-def per_example_mse(prediction, target, mask):
+def per_example_mse(prediction, target, mask, strict=True):
     if (
         prediction.shape != target.shape
         or prediction.ndim != 3
@@ -341,7 +529,7 @@ def per_example_mse(prediction, target, mask):
         or mask.dtype != torch.bool
     ):
         raise ValueError("MSE requires matching [B,L,C] predictions/targets and boolean [B,L] mask")
-    if (mask.sum(-1) == 0).any():
+    if strict and (mask.sum(-1) == 0).any():
         raise ValueError("Each example must contain at least one valid target frame")
     error = (sanitize(prediction.float(), mask) - sanitize(target.float(), mask)).square().mean(-1)
     return error.sum(-1) / mask.sum(-1)
@@ -379,6 +567,19 @@ def sample_time(count, device, mode="uniform"):
     return torch.sigmoid(torch.special.ndtri(uniform.clamp(1e-4, 1 - 1e-4))).clamp(1e-3, 1 - 1e-3)
 
 
+def flow_target(model, x1, noise, time):
+    """Regression target of the linear path x_t=(1-t)noise+t x1 in the model's parameterization.
+
+    Velocity: x1 - noise. EDM: the unit-variance F that `to_velocity` inverts. Latent negatives
+    (ΔFM) evaluate it on corrupted x1 with the positive's noise and time, so both must agree.
+    """
+    target = x1 - noise
+    if prediction_kind(model) == "edm":
+        t = time[:, None, None]
+        target = ((1 - t) * x1 - t * noise) / (t.square() + (1 - t).square()).sqrt()
+    return target
+
+
 def flow_loss(
     model,
     batch,
@@ -388,17 +589,22 @@ def flow_loss(
     return_details=False,
     cached=None,
     time_sampling="uniform",
+    hidden_layers=(),
+    guidance_weight=0.0,
 ):
+    """Per-example flow losses; `return_details` adds diagnostics, the CTC term and, for nonempty
+    `hidden_layers`, the requested block outputs under "hidden" (training-only teacher terms)."""
     if not 0 <= dropout <= 1:
         raise ValueError("dropout must lie in [0,1]")
-    mask = mask_values(batch["valid"], batch["prompt_mask"])
+    strict = getattr(model, "strict_checks", True)
+    mask = mask_values(batch["valid"], batch["prompt_mask"], strict=strict)
     x1 = sanitize(batch["latents"], batch["valid"])
     b = x1.size(0)
     time = sample_time(b, x1.device, time_sampling) if time is None else time
     noise = torch.randn_like(x1) if noise is None else noise
     if time.shape != (b,) or noise.shape != x1.shape or time.device != x1.device or noise.device != x1.device:
         raise ValueError("Noise must match [B,L,C]; time must match [B], on the audio device")
-    if not torch.isfinite(time).all() or (time < 0).any() or (time > 1).any():
+    if strict and (not torch.isfinite(time).all() or (time < 0).any() or (time > 1).any()):
         raise ValueError("Flow time must be finite and lie in [0,1]")
     noise = sanitize(noise, batch["valid"])
     xt = (1 - time[:, None, None]) * noise + time[:, None, None] * x1
@@ -408,6 +614,7 @@ def flow_loss(
     # Remove reference from the state too, otherwise CFG's null branch leaks the voice.
     xt = xt.masked_fill((drop[:, None] & batch["prompt_mask"])[..., None], 0)
     with_ctc = return_details and getattr(model, "ctc", None) is not None and model.training
+    with_hidden = return_details and bool(hidden_layers)
     pred = model(
         xt,
         time,
@@ -419,16 +626,21 @@ def flow_loss(
         drop=drop,
         **({} if cached is None else {"cached": cached}),
         **({"return_ctc": True} if with_ctc else {}),
+        **({"return_hidden": tuple(hidden_layers)} if with_hidden else {}),
     )
+    hidden = None
+    if with_hidden:
+        pred, hidden = pred
     ctc = None
     if with_ctc:
         pred, logits, token_valid = pred
-        ctc = ctc_alignment_loss(logits, token_valid, batch["tokens"], drop)
-    target = x1 - noise
-    if prediction_kind(model) == "edm":
-        t = time[:, None, None]
-        target = ((1 - t) * x1 - t * noise) / (t.square() + (1 - t).square()).sqrt()
-    losses = per_example_mse(pred, target, mask)
+        ctc = ctc_alignment_loss(logits, token_valid, batch["tokens"], drop, *ctc_labels(model, batch))
+    target = flow_target(model, x1, noise, time)
+    offset = None
+    if guidance_weight:
+        offset = guidance_weight * guidance_direction(model, pred, xt, time, batch, drop, cached)
+        target = target + offset
+    losses = per_example_mse(pred, target, mask, strict)
     if return_details:
         counts = mask.sum(1)
         rms = (sanitize(pred.float(), mask).square().sum((1, 2)) / (counts * pred.size(-1))).sqrt()
@@ -439,25 +651,79 @@ def flow_loss(
             "prediction_rms": rms,
             "noise": noise,
             "drop": drop,
+            "prediction": pred,  # lets target-only terms (latent negatives) reuse this generator pass
         }
         if ctc is not None:
             details["ctc"] = ctc
+        if hidden is not None:
+            details["hidden"] = hidden
+        if offset is not None:  # model guidance: target-only terms (latent negatives) shift their targets too
+            details["guidance_offset"] = offset
         return details
     return losses
 
 
-def ctc_alignment_loss(logits, token_valid, tokens, drop):
+def ctc_labels(model, batch):
+    """(targets [B,T], lengths [B]) of a character CTC head, () for the byte head.
+
+    The loader normally builds them (collate); batches from elsewhere get them from their tokens here.
+    """
+    if getattr(getattr(model, "cfg", None), "ctc_targets", "bytes") != "chars":
+        return ()
+    if "ctc_targets" in batch:
+        return batch["ctc_targets"], batch["ctc_target_lengths"]
+    device = batch["tokens"].device
+    return tuple(value.to(device) for value in char_ctc_targets(batch["tokens"].cpu()))
+
+
+def guidance_direction(model, prediction, xt, time, batch, drop, cached=None):
+    """sg(out_cond - out_null) at the training (x_t, t), the model-guidance direction; 0 on CFG-dropped rows.
+
+    The null branch drops text, voice and prompt exactly like condition dropout (and the sampler's CFG null
+    branch). Output differences are the right quantity in either parameterization: EDM's `to_velocity` is
+    affine in the output with slope 1/sqrt(t^2 + (1-t)^2) and an offset that depends only on (x_t, t), the
+    same for both branches on target frames, so target + w (F_cond - F_null) is exactly the F-space image of
+    the velocity target v + w (v_cond - v_null). Without model dropout the conditional output is the training
+    forward itself (same inputs and weights); with dropout both branches are recomputed in eval mode so the
+    direction carries no dropout noise.
+    """
+    inputs = (xt, time, batch["prompt"], batch["prompt_mask"], batch["valid"])
+    inputs += (batch["tokens"], batch["segments"])
+    extra = {} if cached is None else {"cached": cached}
+    with torch.no_grad():
+        if model.training and getattr(model.cfg, "dropout", 0) > 0:
+            model.eval()
+            try:
+                cond = model(*inputs, drop=torch.zeros_like(drop), **extra)
+                null = model(*inputs, drop=torch.ones_like(drop), **extra)
+            finally:
+                model.train()
+        else:
+            cond = prediction.detach()
+            null = model(*inputs, drop=torch.ones_like(drop), **extra)
+    return (cond - null).masked_fill(drop[:, None, None], 0)
+
+
+def ctc_alignment_loss(logits, token_valid, tokens, drop, targets=None, target_lengths=None):
     """Per-example CTC between generator frames and transcript bytes; PAD (0) is the blank.
 
     Examples whose text was dropped for classifier-free guidance cannot be aligned and get zero.
+    Byte targets are padded [B,S] rows holding each transcript's bytes first: a stable sort of the
+    "not a byte" flag compacts them on the device, where per-row boolean indexing and a Python
+    list of lengths each waited for the GPU. Entries past a row's length are ignored by the loss.
+    `targets` (padded [B,T] character ids, blank 0) with `target_lengths` replace the byte targets.
     """
     from .text import BYTE_OFFSET
 
-    targets = [row[row >= BYTE_OFFSET] for row in tokens]
-    lengths = torch.tensor([len(row) for row in targets], device=logits.device)
+    if targets is None:
+        is_byte = tokens >= BYTE_OFFSET
+        lengths = is_byte.sum(1)
+        targets = tokens.gather(1, torch.sort((~is_byte).to(torch.uint8), dim=1, stable=True).indices)
+    else:
+        lengths = target_lengths.to(logits.device)
     loss = F.ctc_loss(
         logits.float().log_softmax(-1).transpose(0, 1),
-        torch.cat(targets),
+        targets,
         token_valid.sum(1),
         lengths,
         blank=0,
@@ -537,6 +803,36 @@ def guided_update(v_cond, v_null, x, t, mask, guidance, rescale=0.0, eta=1.0, no
     return (x1 - x) / one_minus_t
 
 
+LATE_OPTION_NAMES = dict(guidance="guidance_late", rescale="cfg_rescale_late", eta="apg_eta_late",
+                         norm="apg_norm_late", momentum="apg_momentum_late")
+
+
+def guidance_windows(early, split, start, until, **overrides):
+    """Settings of `sample`'s late guidance window: the early window's settings with the non-None `*_late` overrides.
+
+    Without a split there is a single window and the early settings are returned unchanged; late overrides would
+    then have no window to act on, so they are rejected instead of being silently ignored.
+    """
+    given = {k: v for k, v in overrides.items() if v is not None}
+    if split is None:
+        if given:
+            raise ValueError(f"{sorted(LATE_OPTION_NAMES[k] for k in given)} need guidance_split")
+        return early
+    if not math.isfinite(split) or not start <= split <= until:
+        raise ValueError("Need guidance_from <= guidance_split <= guidance_until")
+    late = {**early, **given}
+    if (
+        not math.isfinite(late["guidance"])
+        or late["guidance"] < 0
+        or not 0 <= late["rescale"] <= 1
+        or late["norm"] < 0
+        or not -1 < late["momentum"] < 1
+        or not math.isfinite(late["eta"])
+    ):
+        raise ValueError("Late window needs guidance >= 0, cfg_rescale in [0,1], apg_norm >= 0, apg_momentum in (-1,1)")
+    return late
+
+
 def text_only_rows(model, full_valid, prompt_mask, tokens, segments):
     """Inputs of the prompt-free branch of independent guidance: each example's target frames as their own sequence.
 
@@ -590,6 +886,12 @@ def sample(
     apg_momentum=0.0,
     speaker_guidance=None,
     text_only=None,
+    guidance_split=None,
+    guidance_late=None,
+    apg_eta_late=None,
+    apg_norm_late=None,
+    apg_momentum_late=None,
+    cfg_rescale_late=None,
 ):
     """Euler sampler with classifier-free guidance.
 
@@ -600,6 +902,17 @@ def sample(
     defaults give plain CFG. `speaker_guidance` enables independent text/speaker guidance with a third, prompt-free
     branch built by `text_only_rows` (pass it as `text_only`): v_null + g (v_text - v_null) + g_s (v_full - v_text),
     which equals plain CFG for g_s = g.
+
+    `guidance_split` cuts the guided interval into an early window [guidance_from, guidance_split), which uses the
+    settings above, and a late window [guidance_split, guidance_until), whose scale and update shape come from
+    `guidance_late`, `cfg_rescale_late`, `apg_eta_late`, `apg_norm_late` and `apg_momentum_late` (None: the early
+    value). Why: the guidance-interval study (Kynkaanniemi et al., arXiv 2404.07724) finds guidance harmful at high
+    noise and redundant at low noise, and here `guidance_until 0.5` kept WER while saving 15% of the compute. APG
+    (eta 0.5, momentum -0.3) and rescale 0.7 over the whole path cut the files touching the decoder's tanh ceiling
+    from 96% to 58%/22% at g=5 but raised WER 4.32 -> 4.96/5.16; the alignment is settled in the noisy early steps,
+    so APG/rescale confined to the late window should shape the amplitude without that WER cost (mechanistic, to be
+    measured). APG momentum keeps one running average over the steps whose window uses momentum: a split without
+    late overrides reproduces the single window exactly, and momentum used only late starts fresh at the split.
     """
     if steps < 1 or not -1 <= sway <= 0 or not math.isfinite(guidance) or guidance < 0:
         raise ValueError("Invalid sampler settings")
@@ -609,6 +922,10 @@ def sample(
         raise ValueError("cfg_rescale must lie in [0,1], apg_norm >= 0, apg_momentum in (-1,1)")
     if speaker_guidance is not None and (text_only is None or not math.isfinite(speaker_guidance)):
         raise ValueError("Independent speaker guidance needs the prompt-free branch (text_only_rows)")
+    early = dict(guidance=guidance, rescale=cfg_rescale, eta=apg_eta, norm=apg_norm, momentum=apg_momentum)
+    late = guidance_windows(early, guidance_split, guidance_from, guidance_until, guidance=guidance_late,
+                            rescale=cfg_rescale_late, eta=apg_eta_late, norm=apg_norm_late, momentum=apg_momentum_late)
+    split = guidance_until if guidance_split is None else guidance_split
     gen = torch.Generator(device=prompt.device).manual_seed(seed)
     audio_shapes(prompt, prompt, prompt_mask, valid, prompt.size(-1))
     mask = mask_values(valid, prompt_mask)
@@ -629,7 +946,7 @@ def sample(
         if condition_cache is None
         else condition_cache
     )
-    if guidance != 1:
+    if guidance != 1 or late["guidance"] != 1:
         # Conditioned and null branches share one forward pass. Joint dropout's null features are
         # exactly zero, so the text is not encoded a second time.
         zeros = torch.zeros_like
@@ -650,11 +967,13 @@ def sample(
         text_valid = text_only["valid"]
         branch = {k: text_only[k] for k in ("prompt", "prompt_mask", "tokens", "segments", "cached")}
     trajectory = [x.clone()] if return_trajectory else None
-    guided_steps = evaluations = 0
+    guided_steps = evaluations = late_steps = 0
     apg_state = {}
     for t0, t1 in zip(times[:-1], times[1:]):
         t = t0.expand(x.size(0))
-        if guidance == 1 or not guidance_from <= float(t0) < guidance_until:
+        window = early if float(t0) < split else late
+        scale = window["guidance"]
+        if scale == 1 or not guidance_from <= float(t0) < guidance_until:
             v = to_velocity(
                 model, model(x, t, prompt, prompt_mask, valid, tokens, segments, cached=cond), x, t
             )
@@ -664,14 +983,18 @@ def sample(
             v, u = to_velocity(model, model(both, t.repeat(2), **pair), both, t.repeat(2)).chunk(2)
             evaluations += 2
             if speaker_guidance is None:
-                v = guided_update(v, u, x, t, mask, guidance, cfg_rescale, apg_eta, apg_norm, apg_momentum, apg_state)
+                v = guided_update(
+                    v, u, x, t, mask, scale, window["rescale"], window["eta"], window["norm"], window["momentum"],
+                    apg_state,
+                )
             else:
                 rows = sanitize(torch.gather(x, 1, index), text_valid)
                 w = to_velocity(model, model(rows, t, valid=text_valid, **branch), rows, t)
                 w = torch.zeros_like(x).scatter_add(1, index, sanitize(w, text_valid))
-                v = u + guidance * (w - u) + speaker_guidance * (v - w)
+                v = u + scale * (w - u) + speaker_guidance * (v - w)
                 evaluations += 1
             guided_steps += 1
+            late_steps += guidance_split is not None and float(t0) >= split
         x = x + (t1 - t0) * sanitize(v, mask)
         x = sanitize(torch.where(prompt_mask[..., None], prompt, x), valid)
         if trajectory is not None:
@@ -686,6 +1009,8 @@ def sample(
             cfg_rescale=cfg_rescale,
             apg=dict(eta=apg_eta, norm=apg_norm, momentum=apg_momentum),
             speaker_guidance=speaker_guidance,
+            guidance_split=guidance_split,
+            late_window=None if guidance_split is None else dict(late, guided_steps=late_steps),
             time_grid=times.cpu().tolist(),
             solver="euler",
         )

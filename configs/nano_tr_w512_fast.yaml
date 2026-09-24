@@ -1,0 +1,70 @@
+# nano_tr_w512.yaml with the training throughput options on (src/dacvae_tts/speed.py). Model, objective,
+# data pairing and schedule are unchanged; only how the update is executed differs. Compare against the
+# baseline with scripts/benchmark_train_step.py (step time, peak memory), then train both and compare val
+# flow and Freya CER at 20k updates (within the seed spread). Frame budget 6000 as for the baseline.
+model:
+  width: 512
+  depth: 12
+  heads: 8
+  text_depth: 4
+  text_attention: 4
+  patch_size: 1
+  latent_dim: 128
+  positions: rope
+  qk_norm: true
+  prediction: edm
+  text_layout: joined
+  duration: rule
+  cond_dropout: 0.2
+  ctc_layer: 8
+  adaln_rank: 64
+train:
+  steps: 60000
+  batch_size: 96
+  accumulation: 1
+  learning_rate: 0.0008
+  warmup: 2000
+  weight_decay: 0.01
+  optimizer: muon
+  muon_momentum: 0.95
+  ema_decay: 0.9999
+  precision: bf16
+  workers: 4
+  prefetch_factor: 4
+  checkpoint_every: 1000
+  keep_every: 5000
+  validate_every: 1000
+  log_every: 100
+  # Keep the matmul/attention outputs of every block and recompute only its pointwise ops (LayerNorm,
+  # AdaLN, RoPE, GELU) instead of the whole block. Paired with compiled blocks the policy is applied at
+  # trace time; eager it costs a Python dispatch per op, so an eager run is better served by `true` or 2.
+  grad_checkpoint: selective
+  # Regional compilation: one compiled block step reused by all 12 blocks (seconds instead of the >15 min
+  # whole-generator compile). A compiler failure falls back to eager with full checkpointing for good.
+  compile: blocks
+  # Only the batch dimension is symbolic: one graph per padded (frames, text) length pair, bounded by the
+  # pad multiples below. If the warm-up compiles too many graphs, `auto` lets lengths go symbolic too.
+  compile_dynamic: batch
+  seed: 42
+  flow_reduction: frame
+  pairing: within
+  prompt_fraction_min: 0.1
+  prompt_fraction_max: 0.6
+  prompt_dropout: 0.3
+  time_sampling: logit_normal
+  batch_expansion: 4
+  ctc_weight: 0.1
+  contrastive_weight: 0.2
+  contrastive_margin: 0.1
+  # No per-step value checks that stall the host on the GPU; shapes are still checked. Nonfinite losses or
+  # gradients are caught at the next log/validation/checkpoint (at most log_every updates late), always
+  # before a checkpoint is written.
+  strict_checks: false
+  # Padded frames/tokens are masked everywhere (identical losses); coarser shapes mean fewer compiled
+  # graphs and aligned kernels. The frame budget counts the padded lengths.
+  pad_multiple: 64
+  text_pad_multiple: 32
+  # Draw the skip/repeat text negatives in the loader workers (deterministic per item, exact on resume)
+  # instead of copying the transcripts to the CPU inside every update.
+  loader_negatives: true
+  wandb_project: dacvae-tts-tr

@@ -15,16 +15,10 @@ alone has 107,671,171 parameters. Frame-budget limits can reduce the actual batc
 The tested `facebook/dacvae-watermarked` checkpoint is 48 kHz, 128 channels,
 25 latent frames/s; the adapter probes these properties instead of assuming them.
 
-The [comprehensive Turkish research report](docs/kapsamli-tts-arastirma-raporu.md)
-collects the model comparisons, architecture diagrams, numerical evidence, text
-encoder and AdaLN research, recommendations, and complete technical appendices.
-
-The [Flow-DiT architecture guide (Turkish)](docs/flow-dit-mimarileri-aciklamasi.md)
-explains rectified flow, flow matching, reference conditioning, and encoder–decoder
-designs with diagrams, equations, and examples from this implementation.
-
-The [research and architecture record](docs/research.md) explains the evidence,
-design choices, quality risks, and post-training experiments. Core capabilities:
+The [Turkish architecture and quality research report](arastirma-raporu-2026-09-24.md)
+reviews every block, layer and training technique against the 2024–2026 literature, with
+the evidence for each decision, and the [roadmap](yol-haritasi.md) links the resulting
+GitHub issues. Core capabilities:
 
 - Parallel conditional flow generation with cross-attention to English byte text.
 - Reference-audio prefix plus pooled voice conditioning; an optional ASR frontend
@@ -111,8 +105,8 @@ single-recording OOMs and other codec failures stop the job instead of dropping 
 The launcher respects an existing eight-device `CUDA_VISIBLE_DEVICES` assignment.
 Both launchers use `--codec-backend fast` with native convolutions; compilation and
 CUDA graphs are opt-in. The reference backend remains available for comparison.
-See [fast codec and CPU/GPU parallelism](docs/fast-codec-parallel.md) for provenance,
-measured speed, numerical checks, CPU DDP training and tuning controls. The fork's
+`src/dacvae_tts/fast_codec.py` documents the fast codec's provenance and its exactness
+checks (`tests/test_fast_codec_parallel.py`); the license is in `third_party/fast-dacvae/`. The fork's
 channels-last layout is experimental and was substantially slower in strict FP32
 on the tested GPU, so it is not the default.
 
@@ -137,8 +131,8 @@ Do not mix FP32/BF16 partitions; merge rejects them. A synthetic real-codec benc
 found about 5.4% relative latent RMS error with BF16, so validate codec reconstruction
 and speech metrics on real data before using it. No BF16 quality claim is made.
 
-The measured FP32 speedup and its limits, serial comparison command, and reproducible
-benchmark are in [preparation performance](docs/preparation-performance.md).
+`scripts/benchmark_prepare.py` and `scripts/benchmark_fast_codec.py` reproduce the
+preparation throughput measurements.
 
 For manually partitioned jobs, call `dacvae-tts prepare --manifest ... --output ...
 --shard-index 0 --num-shards 8`, then:
@@ -162,8 +156,8 @@ keep the partition directories and mount them at the same paths on every node.
 
 ## Nano recipe (`configs/nano.yaml`)
 
-`configs/nano.yaml` is a 49.9M-parameter configuration that turns on the changes motivated in
-[the improvement roadmap](docs/iyilestirme-yol-haritasi.md); every option is off in the Tiny/Small
+`configs/nano.yaml` is a 49.9M-parameter configuration whose choices are reviewed in
+[the research report](arastirma-raporu-2026-09-24.md); every option is off in the Tiny/Small
 configs, so the earlier baselines are untouched.
 
 - **No speaker labels needed.** `train.pairing: within` cuts the voice prompt from the start of the
@@ -253,8 +247,8 @@ modulation and encoder MLP projections; fused key/value and modulation rows are 
 separately) with AdamW for embeddings, convolution filters, boundary projections, output heads,
 biases and gains. Its updates are RMS-matched to AdamW, so `learning_rate` and `weight_decay` keep
 their meaning. `train.optimizer: adamw` or `--optimizer adamw` restores the previous plain AdamW.
-Muon has not been compared against AdamW on real speech metrics here; see
-[the improvement roadmap](docs/iyilestirme-yol-haritasi.md) for the small-scale loss comparison.
+Muon has not been compared against AdamW on real speech metrics here; the small-scale loss
+comparison is summarized in [the research report](arastirma-raporu-2026-09-24.md) (§3.7, §9).
 Post-training reuses the optimizer recorded in the checkpoint unless `--optimizer` is passed.
 
 Tiny defaults to 16 pairs/GPU × 2 accumulation × 8 GPUs; small uses 8 × 4 × 8.
@@ -320,8 +314,8 @@ dacvae-tts infer --checkpoint runs/tiny/last.pt \
 Omitting `reference_text` invokes optional English ASR (`small.en`, CPU by default).
 The TTS model still needs the transcript internally; this is not a transcript-free
 architecture. Supply `--reference-text "The exact words in the reference."` to bypass
-ASR. See [the runnable example](examples/voice_clone.py) and
-[inference, codec diagnostics and ablation commands](docs/experiments.md).
+ASR. See [the runnable example](../examples/voice_clone.py); `dacvae-tts codec-reconstruct`,
+`make-cases`, `run-eval` and `compare` cover codec diagnostics and bounded ablations.
 A trained checkpoint is required; the repository does not ship a trained voice model.
 
 Use a clean complete reference utterance, initially around 3–10 seconds. The learned
@@ -424,12 +418,9 @@ model-only comparison, and report step/duration/guidance changes in speed experi
 
 ## Current validation and limits
 
-The [implementation audit](docs/architecture-audit.md),
-[tensor contracts](docs/tensor-contracts.md) and
-[validation evidence](docs/validation-results.json) distinguish confirmed fixes,
-tested mechanics, optional architectural experiments and unrun speech evaluations.
-The original source/configuration and initialization snapshot are preserved under
-`baselines/2026-09-19`; default Tiny/Small architecture and loss weighting remain intact.
+Tensor shapes and masks are enforced at the module boundaries in `src/dacvae_tts/contracts.py`.
+The pre-nano source is available in git history (before commit `9ec06e2`); default Tiny/Small
+architecture and loss weighting remain intact.
 
 Automated tests cover masking, prompt preservation, deterministic inference, an
 overfit sanity check, distributed batching, exact pretraining resume, and two-rank

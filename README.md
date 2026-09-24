@@ -86,8 +86,8 @@ when `--dnsmos sig_bak_ovr.onnx` is given.
 Measured on a 40k-update checkpoint (901 h of podcast speech, one GPU): held-out WER 0.49
 (Whisper small.en), unseen-text sentences WER 11%, random word lists 6%, DNSMOS ≈ prompt level.
 The remaining errors are single-word repeats and drops; the contrastive term targets them and has
-not yet been evaluated at scale. Full numbers and the reasoning behind every choice:
-[docs/iyilestirme-yol-haritasi.md](docs/iyilestirme-yol-haritasi.md) (Turkish).
+not yet been evaluated at scale. The reasoning behind every choice, block by block:
+[docs/arastirma-raporu-2026-09-24.md](docs/arastirma-raporu-2026-09-24.md) (Turkish).
 
 ## Turkish model and demo
 
@@ -112,9 +112,10 @@ Results and decisions (Turkish): [docs/turkce-arastirma-2026-09-22.md](docs/turk
 
 - [docs/reference.md](docs/reference.md): the detailed reference (all commands, flags, Tiny/Small
   baselines, DDP, post-training, evaluation protocols, limits).
-- [docs/kapsamli-tts-arastirma-raporu.md](docs/kapsamli-tts-arastirma-raporu.md) and
-  [docs/flow-dit-mimarileri-aciklamasi.md](docs/flow-dit-mimarileri-aciklamasi.md): research report
-  and architecture guide (Turkish).
+- [docs/arastirma-raporu-2026-09-24.md](docs/arastirma-raporu-2026-09-24.md): block-by-block architecture,
+  training and quality research for small Turkish models (Turkish), with the evaluation caveats (SIM metric,
+  Freya comparability, confidence intervals).
+- [docs/yol-haritasi.md](docs/yol-haritasi.md): the roadmap and its GitHub issues (tracking issue #17).
 - `configs/tiny.yaml`, `configs/small.yaml`: the original baselines, untouched by the nano changes.
 
 The DACVAE codec keeps its upstream license; this repository ships no trained voice model.

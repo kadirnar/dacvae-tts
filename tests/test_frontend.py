@@ -15,6 +15,8 @@ from dacvae_tts.frontend import locative, prepare_text, speakable, spell, split_
         ("Dolar 34,5 ₺ oldu. Fiyatı $199.", "Dolar otuz dört virgül beş lira oldu. Fiyatı yüz doksan dokuz dolar."),
         ("Hava 25°C, gece -3 derece.", "Hava yirmi beş derece, gece eksi üç derece."),
         ("Dr. Ahmet ve Prof. Ayşe geldi.", "Doktor Ahmet ve Profesör Ayşe geldi."),
+        ("T.C. Sağlık Bakanlığı ve Koç Holding A.Ş. açıkladı.", "te ce Sağlık Bakanlığı ve Koç Holding anonim şirketi açıkladı."),
+        ("Yılmaz Ltd. Şti. kuruldu.", "Yılmaz limited şirketi kuruldu."),
         ("elma, armut vs. Sonra geldi.", "elma, armut vesaire. Sonra geldi."),
         ("ABD'de ve TBMM'nin açıklaması, NATO'nun tepkisi.", "a be dede ve te be me menin açıklaması, natonun tepkisi."),
         ("Ali & Veli, 2+2=4.", "Ali ve Veli, iki artı iki eşittir dört."),
@@ -81,3 +83,31 @@ def test_suffix_harmony_list_ordinals_and_letter_names():
     assert speakable("Saat 7.30'da çıktım.")[0] == "Saat yedi otuzda çıktım."
     assert speakable("Q3 geliri, A4 kağıt.")[0] == "kü üç geliri, a dört kağıt."
     assert speakable("#YapayZeka günü")[0] == "Yapay Zeka günü"
+
+
+def test_dort_softening_currency_suffixes_and_combining_marks():
+    from dacvae_tts.frontend import harmonize
+    from dacvae_tts.text import normalize
+
+    raw = "Toplantı 4'e ertelendi, %4'ü geldi, 2024'e kadar 14'ün katı."
+    text, _ = speakable(raw)
+    assert text == "Toplantı dörde ertelendi, yüzde dördü geldi, iki bin yirmi dörde kadar on dördün katı."
+    # Plain words: checkpoints of either Turkish version read the frontend output unchanged.
+    assert normalize(text, "turkish-v1") == normalize(text, "turkish-v2") == text
+    assert speakable(raw, "turkish-v1")[0] == (
+        "Toplantı dörte ertelendi, yüzde dörtü geldi, iki bin yirmi dörte kadar on dörtün katı."
+    )
+    assert speakable("Saat 14.04'e kadar, 4'te ve 4'üncü sırada.")[0] == (
+        "Saat on dört sıfır dörde kadar, dörtte ve dördüncü sırada."
+    )
+    # The suffix after a currency symbol was written for the number; it moves to the currency word.
+    assert speakable("$4'e, 4$'a, €4'ü, ₺4'ün, $5'in ve €2'ye aldım.")[0] == (
+        "dört dolara, dört dolara, dört avroyu, dört liranın, beş doların ve iki avroya aldım."
+    )
+    assert [harmonize("avro", "e"), harmonize("lira", "ün"), harmonize("avro", "ü"), harmonize("lira", "ye")] == \
+        ["ya", "nın", "yu", "ya"]
+    # A dot NFKC cannot attach (from a non-Turkish lower-casing of İ) is dropped, not turned into a word break.
+    text, changes = speakable("i̇stanbul'a gittim")
+    assert text == "istanbul'a gittim" and changes
+    with pytest.raises(ValueError):
+        speakable("Merhaba", "unicode-v1")

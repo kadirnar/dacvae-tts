@@ -9,14 +9,21 @@ import torch
 
 from .codec import Codec, backend_options, check_compatibility, normalize_loudness, read_audio
 from .contracts import normalization_stats, target_mask
-from .duration import DurationPredictor, auto_mode, clamp_scale, rule_frames
+from .duration import DurationPredictor, articulation_seconds, auto_mode, clamp_scale, rule_frames
 from .model import sample, text_only_rows
+from .quality import MOMENT_MATCH, latent_moments, match_moments
 from .text import BYTE_OFFSET, normalize, tokenize
 from .training import autocast, load_model
 
-DURATION_MODES = ("rule", "clamp", "syllable", "predictor", "auto")
+DURATION_MODES = ("rule", "clamp", "syllable", "predictor", "auto", "articulation")
 SAMPLER_OPTIONS = ("guidance_until", "guidance_from", "noise_scale", "cfg_rescale", "apg_eta", "apg_norm",
                    "apg_momentum", "speaker_guidance")
+# Two guidance windows (model.sample): the late window's settings, all None = the early window's.
+WINDOW_OPTIONS = ("guidance_split", "guidance_late", "apg_eta_late", "apg_norm_late", "apg_momentum_late",
+                  "cfg_rescale_late")
+SAMPLER_OPTIONS += WINDOW_OPTIONS
+# Applied after sampling (Synthesizer._finish): per-channel moment matching and the decoder's pre-tanh gain.
+OUTPUT_OPTIONS = ("moment_match", "pre_tanh_gain")
 
 
 @dataclass
@@ -25,6 +32,8 @@ class VoiceReference:
     transcript: str
     transcript_source: str
     timings: dict
+    # audio.speech_timing of the prompt waveform (`articulation` duration rule); None until measured
+    speech_timing: dict = None
 
 
 @dataclass
@@ -35,6 +44,8 @@ class SynthesisResult:
 
 
 class Synthesizer:
+    articulation_options = None  # keyword overrides of duration.articulation_seconds, e.g. {"comma_pause": 0.2}
+
     def __init__(
         self,
         checkpoint,
@@ -138,7 +149,47 @@ class Synthesizer:
             source = f"asr:{self.asr_model}"
         if not reference_text.strip():
             raise ValueError("A nonempty reference transcript is required internally")
-        return VoiceReference(latents, reference_text, source, timings)
+        return VoiceReference(latents, reference_text, source, timings, self.measure_speech_timing(ref_audio))
+
+    def measure_speech_timing(self, ref_audio):
+        """audio.speech_timing of a prompt file or (waveform, rate) pair; None if the file cannot be read again.
+
+        Measured on the original waveform (before loudness normalization; the thresholds are relative to the
+        prompt's own level). ~1 ms for a 10 s prompt, so it is done for every prepared reference.
+        """
+        import numpy as np
+
+        from .audio import speech_timing
+
+        try:
+            if isinstance(ref_audio, tuple):
+                audio, rate = ref_audio
+                audio = audio.detach().cpu().numpy() if torch.is_tensor(audio) else audio
+            else:
+                audio, rate = sf.read(ref_audio, dtype="float32", always_2d=True)
+                audio = audio.mean(axis=1)
+            audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+        if not len(audio) or not np.isfinite(audio).all():
+            return None
+        return {**speech_timing(audio, int(rate)), "source": "waveform"}
+
+    @torch.inference_mode()
+    def prompt_timing(self, reference):
+        """The prompt's speech timing for the `articulation` rule, measured once and kept on the VoiceReference.
+
+        References prepared from audio carry their waveform's timing. References built directly from cached latents
+        (scripts/eval_sentences.py) are decoded once: the codec reconstruction keeps pauses and edge silence.
+        """
+        from .audio import speech_timing
+
+        timing = getattr(reference, "speech_timing", None)
+        if timing is None:
+            audio = self.codec.decode(reference.latents.to(self.device).float() * self.std + self.mean)
+            timing = {**speech_timing(audio.float().cpu().numpy(), self.codec.sample_rate), "source": "decoded_latents"}
+            reference.speech_timing = timing
+        return timing
 
     def synthesize(
         self,
@@ -162,17 +213,21 @@ class Synthesizer:
         """Use text + ref_audio; no speaker ID, enrollment table, or per-voice fine-tuning.
 
         `sampler` takes the further options of `model.sample` (guidance_from, cfg_rescale, apg_eta, apg_norm,
-        apg_momentum, speaker_guidance); `duration_mode` is one of rule, clamp, syllable, predictor.
+        apg_momentum, speaker_guidance, and the late guidance window: guidance_split, guidance_late, apg_eta_late,
+        apg_norm_late, apg_momentum_late, cfg_rescale_late) and the output options of `_finish` (moment_match,
+        pre_tanh_gain); `duration_mode` is one of DURATION_MODES (duration.py explains them).
         """
         if (ref_audio is None) == (reference is None):
             raise ValueError("Provide exactly one of ref_audio or a prepared VoiceReference")
-        unknown = set(sampler) - set(SAMPLER_OPTIONS)
+        unknown = set(sampler) - set(SAMPLER_OPTIONS) - set(OUTPUT_OPTIONS)
         if unknown:
             raise TypeError(f"Unknown sampler options: {sorted(unknown)}")
         started = time.perf_counter()
         reused = reference is not None
         reference = reference or self.prepare_reference(ref_audio, reference_text)
-        batch = self.make_batch(reference.latents, reference.transcript, text, seconds, duration_scale, duration_mode)
+        timing = self._articulation_timing(reference, seconds, duration_mode)
+        batch = self.make_batch(reference.latents, reference.transcript, text, seconds, duration_scale, duration_mode,
+                                timing=timing)
         audio, _, metadata = self.generate(
             batch, steps, guidance, seed, sway, guidance_until, noise_scale, **sampler
         )
@@ -219,8 +274,20 @@ class Synthesizer:
             raise ValueError("Reference must be a complete .5–30 second utterance with an exact transcript")
         return (self.codec.encode(torch.from_numpy(audio.copy())) - self.mean) / self.std
 
-    def target_frames(self, reference_frames, reference_text, text, seconds=None, duration_scale=1.0, duration_mode="rule"):
-        """Number of target latent frames for `text` spoken in the voice of a prompt of `reference_frames` frames."""
+    def _articulation_timing(self, reference, seconds, duration_mode):
+        """Prompt timing when the `articulation` rule will use it (rule-duration model, no fixed length), else None."""
+        if duration_mode != "articulation" or seconds is not None or self.model.duration is not None:
+            return None
+        return self.prompt_timing(reference)
+
+    def target_frames(self, reference_frames, reference_text, text, seconds=None, duration_scale=1.0, duration_mode="rule",
+                      timing=None):
+        """Number of target latent frames for `text` spoken in the voice of a prompt of `reference_frames` frames.
+
+        `timing`: audio.speech_timing of the prompt (`prompt_timing`), used by `articulation` only; without it that
+        mode falls back to the byte rule and says so in the profile. `articulation_options` (instance attribute, a
+        dict) overrides the keyword defaults of duration.articulation_seconds (pauses, rate clamp, floor).
+        """
         if not math.isfinite(duration_scale) or duration_scale <= 0:
             raise ValueError("duration_scale must be finite and positive")
         if seconds is not None:
@@ -242,6 +309,14 @@ class Synthesizer:
             if self.duration_model is None or isinstance(self.duration_model, (str, Path)):
                 self.duration_model = DurationPredictor.load(self.duration_model)
             frames = self.duration_model.predict(reference_frames, reference_text, text)
+        elif duration_mode == "articulation":
+            needed, extra = articulation_seconds(timing, reference_text, text, **(self.articulation_options or {}))
+            profile.update(extra)
+            if needed is None:  # no usable prompt timing: the byte rule, flagged in the profile
+                frames = rule_frames(reference_frames, reference_text, text, "bytes")
+            else:
+                frames = needed * self.codec.sample_rate / self.codec.hop_length
+                profile["duration_rule"] = "prompt_syllables_per_speaking_second"
         else:
             frames = rule_frames(reference_frames, reference_text, text, "bytes")
             if duration_mode == "clamp":
@@ -251,7 +326,8 @@ class Synthesizer:
         return round(frames * duration_scale), profile
 
     @torch.inference_mode()
-    def make_batch(self, reference, reference_text, text, seconds=None, duration_scale=1.0, duration_mode="rule"):
+    def make_batch(self, reference, reference_text, text, seconds=None, duration_scale=1.0, duration_mode="rule",
+                   timing=None):
         if not math.isfinite(duration_scale) or duration_scale <= 0:
             raise ValueError("duration_scale must be finite and positive")
         reference = reference.to(self.device)
@@ -264,7 +340,7 @@ class Synthesizer:
             # Speaking-rate rule (F5-TTS): the target keeps the prompt's frames per transcript byte.
             # It also keeps length-normalized text/audio positions consistent across the boundary.
             frames, self.duration_profile = self.target_frames(
-                len(reference), reference_text, text, None, duration_scale, duration_mode
+                len(reference), reference_text, text, None, duration_scale, duration_mode, timing=timing
             )
         elif seconds is None:
             prompt = reference[None]
@@ -314,8 +390,42 @@ class Synthesizer:
             condition_cache=condition_cache, **sampler,
         )
 
+    @staticmethod
+    def _output_options(sampler):
+        """Remove the post-sampling options from `sampler` (in place) and validate them."""
+        from .codec import parse_pre_tanh_gain
+
+        output = {k: sampler.pop(k) for k in OUTPUT_OPTIONS if k in sampler}
+        output = {k: v for k, v in output.items() if v is not None}
+        if output.get("moment_match") not in (None, *MOMENT_MATCH):
+            raise ValueError(f"moment_match must be None or one of {MOMENT_MATCH}")
+        if "pre_tanh_gain" in output:
+            output["pre_tanh_gain"] = parse_pre_tanh_gain(output["pre_tanh_gain"])
+        return output
+
+    def _finish(self, target, reference, moment_match=None, pre_tanh_gain=None):
+        """Normalized target latents [T,C] -> (waveform, info) with the voice prompt's latents [P,C] as reference.
+
+        info always holds `latent_moments` (see quality.latent_moments). `moment_match` ("std"/"meanstd") rescales the
+        target's channels to the prompt's spread before decoding; `pre_tanh_gain` scales the codec decoder's output
+        tanh input (Codec.decode). Both default off, and then the decode call is exactly the previous one.
+        """
+        info = {}
+        if len(target) >= 2 and len(reference) >= 2:
+            info["latent_moments"] = latent_moments(target, reference)
+        if moment_match is not None:
+            target = match_moments(target, reference, moment_match)
+            info["moment_match"] = moment_match
+        latents = target * self.std + self.mean
+        if pre_tanh_gain is None:
+            return self.codec.decode(latents), info
+        decode_stats = {}
+        audio = self.codec.decode(latents, pre_tanh_gain=pre_tanh_gain, stats=decode_stats)
+        return audio, {**info, **decode_stats}
+
     @torch.inference_mode()
     def generate(self, batch, steps=16, guidance=1.5, seed=0, sway=-1, guidance_until=1.0, noise_scale=1.0, **sampler):
+        output = self._output_options(sampler)
         if batch["prompt"].size(0) != 1:
             raise ValueError(
                 "Waveform generation currently accepts a single request; sample() supports batches"
@@ -344,8 +454,10 @@ class Synthesizer:
             )
         target = result[0, target_mask(batch["valid"], batch["prompt_mask"])[0]]
         # Decode target alone: no reference audio leaks into the output waveform.
-        audio = self._measure(
-            lambda: self.codec.decode(target * self.std + self.mean), stages, "waveform_decode_seconds"
+        audio, finish = self._measure(
+            lambda: self._finish(target, batch["prompt"][0, batch["prompt_mask"][0]], **output),
+            stages,
+            "waveform_decode_seconds",
         )
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
@@ -368,6 +480,7 @@ class Synthesizer:
                 "codec_runtime": getattr(self.codec, "runtime", {"backend": "reference"}),
                 "profiled_stages": stages,
                 **sampler_stats,
+                **finish,
             },
         )
 
@@ -387,35 +500,54 @@ class Synthesizer:
         seed=42,
         sway=-1.0,
         max_rows=16,
+        selector=None,
+        duration_factors=None,
         **sampler,
     ):
         """Generate every text (e.g. the sentence chunks of a long input) `candidates` times in padded batches.
 
         All rows share the prepared `reference` (a VoiceReference). Returns (results, metadata) where results[i][k]
         is a dict with the float32 waveform (`audio`, numpy) of candidate k of text i and its duration. Candidates
-        of a text differ only in their initial noise, which is what best-of-N reranking needs.
+        of a text differ only in their initial noise, which is what best-of-N reranking needs. `selector`, e.g.
+        quality.CandidateScorer.select, is called as selector(text, waveforms, sample_rate) -> (best index,
+        per-candidate scores): each candidate then carries its `selection` scores and metadata["selected"] lists
+        the best index per text (results keep the candidate order).
+
+        `duration_factors` (e.g. [1.0, 0.9, 1.1]) makes the candidates duration-diverse as well: candidate k gets
+        target length x factors[k % len(factors)] (on top of `duration_scale`) and its own noise, so `candidates`
+        stays the number of rows per text; candidates=6 with three factors gives every length two noises. List the
+        neutral factor first: selectors that break ties by index then keep it. Each result records its
+        `duration_factor`, the metadata the per-candidate list. A uniform x0.9 or x1.15 hurt Freya-TR-Eval (the
+        LARoPE alignment prior expects the prompt's frames per byte), but the best length differs per sentence;
+        picking it per sentence by the decoded result is what a metric-optimized duration model learns (DMOSpeech 2,
+        arXiv 2507.14988). None (default) or [1.0] give exactly the plain candidates.
         """
         import numpy as np
 
-        unknown = set(sampler) - set(SAMPLER_OPTIONS)
+        unknown = set(sampler) - set(SAMPLER_OPTIONS) - set(OUTPUT_OPTIONS)
         if unknown:
             raise TypeError(f"Unknown sampler options: {sorted(unknown)}")
+        output = self._output_options(sampler)
         if not texts or candidates < 1 or max_rows < 1:
             raise ValueError("Need at least one text, one candidate and a positive batch size")
+        factors = (1.0,) if duration_factors is None else tuple(float(f) for f in duration_factors)
+        if not 1 <= len(factors) <= candidates or not all(math.isfinite(f) and f > 0 for f in factors):
+            raise ValueError("duration_factors needs 1..candidates finite positive factors (candidate k uses k mod n)")
         started = time.perf_counter()
         latents = reference.latents.to(self.device)
         layout = self.model.cfg.text_layout
+        timing = self._articulation_timing(reference, seconds, duration_mode)
         requests = []
         for text in texts:
-            frames, profile = self.target_frames(len(latents), reference.transcript, text, seconds, duration_scale,
-                                                 duration_mode)
-            if not 0.25 <= frames * self.codec.hop_length / self.codec.sample_rate <= 30:
+            options = [self.target_frames(len(latents), reference.transcript, text, seconds, duration_scale * factor,
+                                          duration_mode, timing=timing) for factor in factors]
+            if not all(0.25 <= frames * self.codec.hop_length / self.codec.sample_rate <= 30 for frames, _ in options):
                 raise ValueError(f"Target duration outside .25–30 s for: {text[:60]!r}; split the text")
             tokens, segments = tokenize(reference.transcript, text, version=self.text_version, layout=layout)
             only_tokens, only_segments = tokenize("", text, version=self.text_version, layout=layout)
             if tokens.numel() > 2048:
                 raise ValueError("Text too long; split into sentences before synthesis")
-            requests.append((frames, tokens, segments, only_tokens, only_segments, profile))
+            requests.append((options, tokens, segments, only_tokens, only_segments))
         rows = [(i, k) for i in range(len(texts)) for k in range(candidates)]
         results = [[None] * candidates for _ in texts]
         stats, generation = {}, 0.0
@@ -425,7 +557,8 @@ class Synthesizer:
         for start in range(0, len(rows), max_rows):
             chunk = rows[start : start + max_rows]
             reference_frames = len(latents)
-            totals = [reference_frames + requests[i][0] for i, _ in chunk]
+            lengths = [requests[i][0][k % len(factors)] for i, k in chunk]  # (frames, duration profile) per row
+            totals = [reference_frames + frames for frames, _ in lengths]
             width = max(totals)
             prompt = torch.zeros(len(chunk), width, self.codec.latent_dim, device=self.device)
             prompt[:, :reference_frames] = latents
@@ -446,14 +579,24 @@ class Synthesizer:
             generation += time.perf_counter() - tick
             for row, (i, k) in enumerate(chunk):
                 target = result[row, reference_frames : totals[row]]
-                audio = self.codec.decode(target.float() * self.std + self.mean)
+                audio, finish = self._finish(target.float(), latents, **output)
                 results[i][k] = {
                     "audio": audio.numpy().astype(np.float32),
                     "audio_seconds": audio.numel() / self.codec.sample_rate,
-                    "frames": int(requests[i][0]),
-                    "duration": requests[i][5],
+                    "frames": int(lengths[row][0]),
+                    "duration": lengths[row][1],
+                    **finish,
                 }
+                if duration_factors is not None:
+                    results[i][k]["duration_factor"] = factors[k % len(factors)]
         self._sync()
+        if selector is not None:
+            output["selected"] = []
+            for text, row in zip(texts, results):
+                best, scores = selector(text, [candidate["audio"] for candidate in row], self.codec.sample_rate)
+                for candidate, score in zip(row, scores):
+                    candidate["selection"] = score
+                output["selected"].append(int(best))
         metadata = {
             "texts": len(texts),
             "candidates": candidates,
@@ -468,7 +611,11 @@ class Synthesizer:
             "duration_mode": duration_mode,
             "duration_scale": duration_scale,
             **{k: v for k, v in stats.items() if k != "time_grid"},
+            **output,
         }
+        if duration_factors is not None:
+            metadata.update(duration_factors=list(factors),
+                            candidate_factors=[factors[k % len(factors)] for k in range(candidates)])
         return results, metadata
 
 
@@ -504,5 +651,6 @@ def infer(args):
         apg_norm=getattr(args, "apg_norm", 0.0),
         apg_momentum=getattr(args, "apg_momentum", 0.0),
         speaker_guidance=getattr(args, "speaker_guidance", None),
+        **{name: getattr(args, name) for name in (*WINDOW_OPTIONS, *OUTPUT_OPTIONS) if hasattr(args, name)},
     )
     print(json.dumps(result.metadata, indent=2))

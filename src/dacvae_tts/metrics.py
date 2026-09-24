@@ -19,6 +19,10 @@ def metric_text(text, version="english-unicode-v2"):
         from .turkish import metric_text_turkish
 
         return metric_text_turkish(text)
+    if version == "turkish-v2":  # opt-in; turkish-v1 stays the default for Turkish so scores remain comparable
+        from .turkish import metric_text_turkish_v2
+
+        return metric_text_turkish_v2(text)
     text = unicodedata.normalize("NFKC", text).lower().replace("’", "'")
     if version == "legacy-ascii-v1":
         text = re.sub(r"[^a-z0-9'\s]", " ", text)
@@ -133,7 +137,10 @@ class Evaluator:
         device="cpu",
         metric_normalization=None,
         language="en",
+        protocol=None,
     ):
+        """`protocol` (eval_protocol.ProtocolOptions, default None = v1 scoring, unchanged) enables the opt-in
+        protocol-v2 extras; see dacvae_tts.eval_protocol."""
         self.language = language
         if metric_normalization is None:
             # Turkish needs its own case folding (İ/ı) and number spelling; English keeps the old default.
@@ -164,6 +171,12 @@ class Evaluator:
             "metric_normalization": metric_normalization,
             "language": language,
         }
+        self.protocol = None
+        if protocol is not None and protocol.enabled:
+            from .eval_protocol import ProtocolScorer, whisper_snapshot
+
+            self.protocol = ProtocolScorer(protocol, device, self.dnsmos)
+            self.identity["protocol"] = {**self.protocol.identity, "asr_snapshot": whisper_snapshot(asr_model)}
 
     @torch.inference_mode()
     def embedding(self, audio):
@@ -171,15 +184,18 @@ class Evaluator:
         inputs = {key: value.to(self.device) for key, value in inputs.items()}
         return F.normalize(self.speaker(**inputs).embeddings.float(), dim=-1)
 
-    def score(self, audio_path, text, reference_path=None):
+    def score(self, audio_path, text, reference_path=None, original_prompt=None, codec_prompt=None):
+        """`reference_path` feeds the v1 `speaker_similarity`; `original_prompt`/`codec_prompt` (the prompt's
+        original recording / its codec resynthesis) are used only by an enabled protocol (sim_o / sim_r)."""
         audio = read_audio(audio_path, 16000)
-        segments, _ = self.asr.transcribe(
-            audio.numpy(),
-            language=self.language,
-            beam_size=5,
-            vad_filter=False,
-            condition_on_previous_text=False,
-        )
+        protocol = getattr(self, "protocol", None)  # instances built with Evaluator.__new__ have none
+        if protocol is None:
+            asr_audio, asr_info = audio, {}
+            decoding = dict(beam_size=5, vad_filter=False, condition_on_previous_text=False)
+        else:
+            asr_audio, asr_info = protocol.asr_audio(audio)
+            decoding = protocol.whisper_kwargs()
+        segments, _ = self.asr.transcribe(asr_audio.numpy(), language=self.language, **decoding)
         hypothesis = " ".join(segment.text for segment in segments)
         result = {
             **error_counts(text, hypothesis, self.metric_normalization),
@@ -193,6 +209,10 @@ class Evaluator:
         if self.speaker is not None and reference_path:
             ref = read_audio(reference_path, 16000)
             result["speaker_similarity"] = float((self.embedding(audio) * self.embedding(ref)).sum())
+        if protocol is not None:
+            result.update(asr_info)
+            result.update(protocol.score(audio_path, audio, text, hypothesis, self.metric_normalization,
+                                         original_prompt, codec_prompt))
         return result
 
 
@@ -207,10 +227,15 @@ def summarize(rows):
     for key in ("dnsmos_sig", "dnsmos_bak", "dnsmos_ovrl", "speaker_similarity", "rtf"):
         if all(key in row for row in rows):
             result[key] = float(np.mean([row[key] for row in rows]))
+    from .eval_protocol import summary_extras  # additive keys only: per-utterance means, S/D/I, v2 metrics
+
+    result.update(summary_extras(rows))
     return result
 
 
 def evaluate(args):
+    from .eval_protocol import manifest_prompts, protocol_from_args
+
     evaluator = Evaluator(
         args.asr_model,
         args.dnsmos_model,
@@ -218,7 +243,9 @@ def evaluate(args):
         args.device,
         getattr(args, "metric_normalization", None),
         getattr(args, "language", "en"),
+        protocol=protocol_from_args(args),
     )
+    reference_kind = getattr(args, "reference_kind", None)
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():
@@ -227,7 +254,8 @@ def evaluate(args):
     with open(out, "w") as stream:
         for row in jsonl(args.manifest):
             try:
-                result = {**row, **evaluator.score(row["audio"], row["text"], row.get("reference_audio"))}
+                prompts = manifest_prompts(row, reference_kind)
+                result = {**row, **evaluator.score(row["audio"], row["text"], row.get("reference_audio"), **prompts)}
                 rows.append(result)
             except (ValueError, OSError) as exc:
                 result = {**row, "error": str(exc)}

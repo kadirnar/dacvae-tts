@@ -1,7 +1,7 @@
 """Target-length rules and a small learned duration predictor for the rule-duration (joined-text) models.
 
-The nano/Turkish models have no duration head: the number of target frames comes from the voice prompt. Three
-ways to turn (prompt frames, prompt transcript, target text) into target frames are provided:
+The nano/Turkish models have no duration head: the number of target frames comes from the voice prompt. Ways to
+turn (prompt frames, prompt transcript, target text) into target frames:
 
 - `rule`: frames per UTF-8 byte of the prompt times target bytes (F5-TTS; what the models were evaluated with).
 - `clamp`: the rule, but prompts faster than `threshold` normalized characters per second are slowed towards
@@ -12,6 +12,20 @@ ways to turn (prompt frames, prompt transcript, target text) into target frames 
   prompt's speaking rate. It learns how strongly a prompt's rate carries over to a new sentence.
 - `auto`: the rule where it works and a correction where it does not. On Freya-TR-Eval the rule is best for prompts
   of 13-17 characters/s; slow prompts (long pauses) get the predictor and fast prompts the clamp.
+- `articulation`: the prompt's articulation rate, syllables per second of net speaking time measured on its
+  waveform (`audio.speech_timing`: edge silence cut, pauses >= 200 ms excluded), times the target's syllables, plus
+  a pause budget for the target's internal punctuation and a floor for very short texts. Frames per byte count the
+  prompt's pauses and edge silence as speech, so a pausy prompt gives every target, short ones most visibly, extra
+  frames that the model fills with lengthening or filler words; `auto`'s 13/17 chars/s switch only patches this.
+  Syllables are the unit because syllable-level rates transfer best across texts and languages (Cross-Lingual
+  F5-TTS 2, arXiv 2609.15184), and Turkish orthography is ~95% transparent, so vowels count syllables. F5-TTS does
+  the same clean-ups heuristically: it trims the prompt's edge silence (-42 dBFS), adds 50 ms, ends the prompt text
+  with ". " and slows texts of <= 10 bytes.
+
+A duration model is judged by the speech it produces, not by its duration error: in DMOSpeech 2 (arXiv 2507.14988)
+ground-truth durations give 1.821 WER, the F5 rate rule 2.028, a supervised predictor 3.750 (worse than the rule) and
+the same predictor optimized for WER/SIM 1.752. scripts/fit_duration_best_factor.py refits the predictor on the
+duration factor that decodes best instead of on corpus durations.
 """
 
 import json
@@ -60,6 +74,50 @@ def auto_mode(reference_frames, reference_text):
     """Which rule `auto` applies to this prompt: predictor (slow), rule (normal) or clamp (fast)."""
     rate = speaking_rate(reference_frames, reference_text)
     return "predictor" if rate < AUTO_SLOW else ("clamp" if rate > AUTO_FAST else "rule")
+
+
+def pause_budget(text, comma_pause=0.15, stop_pause=0.3):
+    """Seconds of pause the target's internal punctuation asks for: `comma_pause` per , ; : or spaced dash and
+    `stop_pause` per sentence-final . ! ? (or ellipsis) inside the text. Punctuation at the end adds nothing: outputs
+    are trimmed, and chunked long texts get their pauses when joined. Returns (seconds, commas, stops)."""
+    body = re.sub(r"[\s.!?,;:…\"'»”’)\]-]+$", "", text)
+    commas = len(re.findall(r"[,;:]|\s-\s", body))
+    stops = len(re.findall(r"[.!?…]+", body))
+    return commas * comma_pause + stops * stop_pause, commas, stops
+
+
+def articulation_seconds(timing, reference_text, text, min_rate=3.0, max_rate=8.5, comma_pause=0.15, stop_pause=0.3,
+                         min_seconds=0.5):
+    """Target seconds of the `articulation` rule and its profile: syllables / rate + pause budget, >= `min_seconds`.
+
+    `timing` is `audio.speech_timing` of the prompt waveform. The rate (prompt syllables per second of speaking time)
+    is clamped to [min_rate, max_rate] syllables/s, roughly 9-26 chars/s of Turkish, against a failed pause
+    detection; the cap also keeps >= 0.12 s per syllable. Pause defaults are conservative (short comma breaths, no
+    trailing pause), and the floor is for one- or two-word texts whose syllable time would be ~0.3 s (F5-TTS slows
+    texts of <= 10 bytes, FreyaTTS has a floor for short inputs). Returns (None, profile) when the prompt gives no
+    rate (no waveform, no speech detected, no vowel in its transcript); the caller then falls back to the byte rule.
+    """
+    syllables = units(reference_text)["syllables"]
+    speech = float(timing.get("speech_seconds", 0.0)) if timing else 0.0
+    profile = {"duration_prompt_timing": dict(timing) if timing else None, "duration_prompt_syllables": syllables}
+    if speech <= 0 or syllables < 1:
+        reason = "no prompt waveform" if not timing else ("no speech detected" if speech <= 0 else "no prompt vowels")
+        return None, {**profile, "duration_articulation_fallback": f"rule ({reason})"}
+    measured = syllables / speech
+    rate = min(max(measured, min_rate), max_rate)
+    pauses, commas, stops = pause_budget(text, comma_pause, stop_pause)
+    target = max(units(text)["syllables"], 1)
+    seconds = target / rate + pauses
+    profile.update(
+        duration_articulation_rate=rate,
+        duration_articulation_measured_rate=measured,
+        duration_target_syllables=target,
+        duration_pause_budget_seconds=pauses,
+        duration_pause_commas=commas,
+        duration_pause_stops=stops,
+        duration_floor_applied=seconds < min_seconds,
+    )
+    return max(seconds, min_seconds), profile
 
 
 def features(reference_frames, reference_text, text):
