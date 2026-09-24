@@ -5,6 +5,7 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 data/
+!scripts/data/
 runs/
 outputs/
 *.pt
