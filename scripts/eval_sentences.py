@@ -6,6 +6,18 @@ Turkish metric normalization score intelligibility; DNSMOS OVRL scores audio qua
 
   python scripts/eval_sentences.py --checkpoint runs/tr-nano/step-0060000.pt --cache data/tr55/merged \
       --sentences data/eval/freya_tr_eval.jsonl --output outputs/freya-nano --prompts 24 --guidance 3 --steps 32
+
+Evaluation protocol v2 (issue #3, opt-in; see dacvae_tts.eval_protocol). `speaker_similarity` keeps its old meaning
+(wavlm-base-plus-sv vs the codec-decoded prompt, a development metric). `--sim-o` adds the seed-tts-eval SIM:
+`sim_r` against the codec-decoded prompt WAV and, with `--prompt-audio`, `sim_o` against the ORIGINAL prompt
+recording (the published SIM-o). The originals come from the dataset: this script writes OUTPUT/cases.json, then
+
+  python scripts/export_case_audio.py --repo ORG/DATASET --cases outputs/freya-nano/cases.json \
+      --cache data/tr55/merged --output data/tr55/eval-audio
+  python scripts/eval_sentences.py ... --rescore --protocol-v2 --prompt-audio data/tr55/eval-audio \
+      --dnsmos models/sig_bak_ovr.onnx [--band-limit-8k] [--utmosv2]
+
+`--band-limit-8k` is the FreyaTTS scoring protocol (8 kHz resample before ASR only) for Freya-TR-Eval tables.
 """
 
 import argparse
@@ -21,6 +33,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from monitor import select_cases  # noqa: E402
 
+from dacvae_tts.eval_protocol import ProtocolScorer, add_protocol_args, protocol_from_args  # noqa: E402
 from dacvae_tts.inference import Synthesizer, VoiceReference  # noqa: E402
 from dacvae_tts.metrics import Evaluator, summarize  # noqa: E402
 
@@ -94,8 +107,32 @@ def audio_stats(path):
             "lufs": float(loudness) if np.isfinite(loudness) else -70.0}
 
 
-def score_hf(rows, out, args):
-    """Batched GPU scoring: transformers Whisper (greedy) for WER/CER, WavLM-SV similarity and DNSMOS per clip."""
+def original_prompt_finder(args, prompts, cases):
+    """prompt WAV name -> original recording (export_case_audio.py naming) or None; never the codec prompt."""
+    if not args.prompt_audio:
+        return lambda name: None
+    uids = {wav.name: case["prompt_uid"] for (_, wav, _), case in zip(prompts, cases)}
+
+    def find(name):
+        if name not in uids:  # rows of a previous pass with a different prompt set
+            return None
+        path = Path(args.prompt_audio) / (uids[name].replace("/", "_").replace(":", "_") + ".wav")
+        return path if path.exists() else None
+
+    missing = sorted(name for name in uids if find(name) is None)
+    if missing:
+        print(f"warning: {len(missing)} prompts have no original recording in {args.prompt_audio}; "
+              f"their rows get no sim_o", flush=True)
+    return find
+
+
+def score_hf(rows, out, args, protocol=None, originals=None):
+    """Batched GPU scoring: transformers Whisper (greedy) for WER/CER, WavLM-SV similarity and DNSMOS per clip.
+
+    With a protocol, ASR sees the protocol's input (trailing-silence trim / 8 kHz band limit) and each row gets the
+    protocol extras; decoding stays greedy (already deterministic, `--asr-deterministic` concerns faster-whisper).
+    Returns (rows, protocol identity or None).
+    """
     from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
     from dacvae_tts.codec import read_audio
@@ -112,12 +149,14 @@ def score_hf(rows, out, args):
     evaluator.extractor = AutoFeatureExtractor.from_pretrained(args.speaker_model)
     evaluator.speaker = AutoModelForAudioXVector.from_pretrained(args.speaker_model).to(device).eval()
     dnsmos = DNSMOS(args.dnsmos) if args.dnsmos else None
+    scorer = ProtocolScorer(protocol, device, dnsmos) if protocol is not None else None
     good = [r for r in rows if "error" not in r]
     audios = {r["audio"]: read_audio(r["audio"], 16000) for r in good}
+    asr_inputs = {k: scorer.asr_audio(a) if scorer else (a, {}) for k, a in audios.items()}
     hypotheses = {}
     for start in range(0, len(good), args.asr_batch):
         chunk = good[start : start + args.asr_batch]
-        features = processor([audios[r["audio"]].numpy() for r in chunk], sampling_rate=16000, return_tensors="pt").input_features
+        features = processor([asr_inputs[r["audio"]][0].numpy() for r in chunk], sampling_rate=16000, return_tensors="pt").input_features
         with torch.inference_mode():
             ids = whisper.generate(features.to(device, torch.float16), language=args.language, task="transcribe", num_beams=1, max_new_tokens=220)
         for r, text in zip(chunk, processor.batch_decode(ids, skip_special_tokens=True)):
@@ -140,8 +179,15 @@ def score_hf(rows, out, args):
         record = {**r, **counts, "hypothesis": hypotheses[r["audio"]], "speaker_similarity": similarity, "asr_backend": "hf-greedy"}
         if dnsmos is not None:
             record.update(dnsmos(audio.numpy()))
+        if scorer is not None:
+            original = originals(r["prompt"]) if originals else None
+            record.update(asr_inputs[r["audio"]][1])
+            record.update(scorer.score(r["audio"], audio, r["text"], hypotheses[r["audio"]], "turkish-v1",
+                                       original, out / r["prompt"]))
+            if original:
+                record["prompt_original"] = str(original)
         scored.append(record)
-    return scored
+    return scored, (scorer.identity if scorer is not None else None)
 
 
 def main():
@@ -183,12 +229,20 @@ def main():
     )
     parser.add_argument("--asr-batch", type=int, default=24)
     parser.add_argument("--rescore", action="store_true", help="Skip synthesis when the WAVs already exist; only score")
+    parser.add_argument(
+        "--prompt-audio",
+        help="Directory of ORIGINAL prompt recordings (export_case_audio.py --cases OUTPUT/cases.json); with a "
+        "protocol v2 speaker metric the rows get sim_o against them (sim_r is always vs the codec-decoded prompt)",
+    )
+    add_protocol_args(parser)
     args = parser.parse_args()
+    protocol = protocol_from_args(args)
 
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
     sentences = load_sentences(args.sentences, args.limit)
     data, cases = select_cases(args.cache, args.prompts, args.seed)
+    (out / "cases.json").write_text(json.dumps(cases, indent=1, ensure_ascii=False))  # input of export_case_audio.py
     wavs_exist = all((out / f"{s['id']}.wav").exists() for s in sentences)
     reuse = args.rescore and ((out / "results.jsonl").exists() or wavs_exist)
     tts = None if reuse else Synthesizer(args.checkpoint, device=args.device)
@@ -244,17 +298,23 @@ def main():
     print(f"synthesized {len(rows)} in {time.time() - started:.0f}s", flush=True)
     del tts
     torch.cuda.empty_cache()
+    originals = original_prompt_finder(args, prompts, cases)
     if args.asr_backend == "hf":
-        scored = score_hf(rows, out, args)
+        scored, protocol_identity = score_hf(rows, out, args, protocol, originals)
     else:
-        evaluator = Evaluator(args.asr_model, args.dnsmos, args.speaker_model, args.asr_device, language=args.language)
+        evaluator = Evaluator(args.asr_model, args.dnsmos, args.speaker_model, args.asr_device, language=args.language,
+                              protocol=protocol)
+        protocol_identity = evaluator.identity.get("protocol")
         scored = []
         for row in rows:
             if "error" in row:
                 scored.append(row)
                 continue
-            score = evaluator.score(row["audio"], row["text"], out / row["prompt"])
-            scored.append({**row, **{k: v for k, v in score.items() if k != "evaluator"}})
+            original = originals(row["prompt"])
+            score = evaluator.score(row["audio"], row["text"], out / row["prompt"], original_prompt=original,
+                                    codec_prompt=out / row["prompt"])
+            extra = {"prompt_original": str(original)} if protocol is not None and original else {}
+            scored.append({**row, **{k: v for k, v in score.items() if k != "evaluator"}, **extra})
     for row in scored:
         if "error" not in row:
             row.update(audio_stats(row["audio"]))
@@ -275,6 +335,8 @@ def main():
         selection_changed=sum(r.get("selected", 0) != 0 for r in good) if args.candidates > 1 else None,
         sentences=str(args.sentences), prompts=len(prompts),
     )
+    if protocol is not None:
+        summary.update(protocol=protocol_identity, prompt_audio=args.prompt_audio)
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))
 

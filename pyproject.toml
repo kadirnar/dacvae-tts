@@ -45,6 +45,7 @@ dacvae_tts = ["*.json"]
 
 [tool.setuptools.data-files]
 "share/dacvae-tts/licenses/fast-dacvae" = ["third_party/fast-dacvae/LICENSE"]
+"share/dacvae-tts/licenses/unispeech" = ["third_party/unispeech/LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
