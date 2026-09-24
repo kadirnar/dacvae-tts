@@ -80,8 +80,8 @@ class TrainConfig:
     checkpoint_every: int = 2000
     validate_every: int = 1000
     log_every: int = 50
-    grad_checkpoint: bool = False
-    compile: object = False  # False, True (whole objective) or "model" (generator only)
+    grad_checkpoint: object = False  # false, true (every block), selective, or N (every N-th block)
+    compile: object = False  # False, True (whole objective), "model" (generator only) or "blocks"
     seed: int = 42
     flow_reduction: str = "utterance"
     duration_weight: float = 0.1
@@ -98,6 +98,12 @@ class TrainConfig:
     contrastive_weight: float = 0.0  # skip/repeat text negatives (RobustSpeechFlow-style hinge)
     contrastive_margin: float = 0.1  # required loss gap, relative to the positive loss
     wandb_project: str = ""  # set (or pass --wandb-project) to mirror the JSONL logs to Weights & Biases
+    # Throughput options (speed.py). Every default reproduces the previous training numerics exactly.
+    strict_checks: bool = True  # false: skip value checks that stall the host (shapes still checked)
+    pad_multiple: int = 1  # round padded batch frames up to a multiple (masked; bounds compiled shapes)
+    text_pad_multiple: int = 1  # the same for transcript tokens
+    loader_negatives: bool = False  # draw the contrastive text negatives in the loader workers
+    compile_dynamic: str = "batch"  # compile: blocks -- batch (only batch dim symbolic) or auto
 
     def __post_init__(self):
         if self.worker_threads < 1 or self.prefetch_factor < 1:
@@ -133,12 +139,24 @@ class TrainConfig:
             or not 0 <= self.prompt_dropout <= 1
         ):
             raise ValueError("Invalid prompt fraction range or prompt dropout")
-        if self.compile not in {False, True, "model"}:
-            raise ValueError("compile must be false, true or model")
+        if self.compile not in {False, True, "model", "blocks"}:
+            raise ValueError("compile must be false, true, model or blocks")
         if self.contrastive_weight < 0 or self.contrastive_margin < 0:
             raise ValueError("contrastive settings must be nonnegative")
         if self.batch_expansion < 1 or self.keep_every < 0 or self.ctc_weight < 0:
             raise ValueError("batch_expansion must be positive and keep_every nonnegative")
+        interval = isinstance(self.grad_checkpoint, int) and not isinstance(self.grad_checkpoint, bool)
+        if not (
+            isinstance(self.grad_checkpoint, bool)
+            or self.grad_checkpoint == "selective"
+            or (interval and self.grad_checkpoint >= 1)
+        ):
+            raise ValueError("grad_checkpoint must be false, true, selective or a positive block interval")
+        multiples = (self.pad_multiple, self.text_pad_multiple)
+        if any(not isinstance(m, int) or isinstance(m, bool) or m < 1 for m in multiples):
+            raise ValueError("pad_multiple and text_pad_multiple must be positive integers")
+        if self.compile_dynamic not in {"batch", "auto"}:
+            raise ValueError("compile_dynamic must be batch or auto")
 
 
 @dataclass

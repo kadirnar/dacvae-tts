@@ -132,8 +132,8 @@ def main():
         "--compile",
         nargs="?",
         const="objective",
-        choices=["objective", "model"],
-        help="Compile the whole objective, or only the generator with --compile model",
+        choices=["objective", "model", "blocks"],
+        help="Compile the whole objective, only the generator (model) or each generator block (blocks)",
     )
     p.add_argument("--no-validation", action="store_true", help="For smoke tests only")
     p.add_argument(

@@ -22,6 +22,7 @@ from .diagnostics import ActivationProbe, gradient_contributions, gradient_group
 from .model import FlowTTS, flow_loss, reduce_flow
 from .optim import build_optimizer
 from .parallel import device_batches, loader_options
+from .speed import NonfiniteWatch, compile_blocks, training_loader
 from .text import BYTE_OFFSET, corrupt_transcript
 from .tracking import Tracker
 
@@ -53,6 +54,8 @@ class Objective(nn.Module):
 
     def negatives(self, batch):
         """Corrupted transcripts [B,S'] plus a mask of the examples that could be corrupted."""
+        if "negative_tokens" in batch:  # drawn by the loader workers (train.loader_negatives)
+            return batch["negative_tokens"], batch["negative_segments"], batch["negative_usable"]
         tokens, segments = batch["tokens"].cpu(), batch["segments"].cpu()
         rows, usable = [], []
         for row_tokens, row_segments in zip(tokens, segments):
@@ -262,8 +265,10 @@ def train(args):
             raise ValueError("Run merge on all prepared partitions before training")
         if cfg.model.latent_dim != data.channels:
             raise ValueError(f"Config latent_dim={cfg.model.latent_dim}, codec cache has {data.channels}")
+        # Defaults: (data, collate, data.costs). Padding/loader negatives change collate and costs.
+        items, train_collate, costs = training_loader(data, cfg.train)
         sampler = BucketBatchSampler(
-            data.costs,
+            costs,
             cfg.train.batch_size,
             rank,
             world,
@@ -274,9 +279,9 @@ def train(args):
         )
         loader_rng = torch.Generator().manual_seed(cfg.train.seed + rank)
         loader = DataLoader(
-            data,
+            items,
             batch_sampler=sampler,
-            collate_fn=collate,
+            collate_fn=train_collate,
             **loader_options(
                 cfg.train.workers,
                 device,
@@ -299,6 +304,7 @@ def train(args):
             )
         model = FlowTTS(cfg.model).to(device)
         model.grad_checkpoint = cfg.train.grad_checkpoint
+        model.strict_checks = cfg.train.strict_checks
         ema = copy.deepcopy(model).eval().requires_grad_(False)
         optimizer = build_optimizer(
             model,
@@ -351,11 +357,14 @@ def train(args):
         ).train()
         raw_objective = objective  # compile/DDP wrap the module; helper methods stay reachable here
         eager_forward = model.forward
+        eager_runner = model.block_runner
         compiled = bool(cfg.train.compile)
         if cfg.train.compile == "model":
             # Only the generator: the loss, CTC and batch expansion stay eager, which avoids
             # dynamic-shape failures in the compiler while keeping most of the speed-up.
             model.forward = torch.compile(model.forward, dynamic=True)
+        elif cfg.train.compile == "blocks":
+            compile_blocks(model, cfg.train.compile_dynamic)  # regional: one compiled block step
         elif cfg.train.compile:
             objective = torch.compile(objective, dynamic=True)
 
@@ -367,8 +376,8 @@ def train(args):
                 return module(batch)
             except Exception as error:
                 origin = type(error).__module__
-                # Under DDP only the generator-only mode can be swapped (the objective is wrapped).
-                swappable = cfg.train.compile == "model" or world == 1
+                # Under DDP only the generator/block modes can be swapped (the objective is wrapped).
+                swappable = cfg.train.compile in ("model", "blocks") or world == 1
                 if (
                     not compiled
                     or not swappable
@@ -376,6 +385,7 @@ def train(args):
                 ):
                     raise
                 model.forward = eager_forward
+                model.block_runner = eager_runner
                 objective = raw_objective
                 compiled = False
                 # Eager activations need roughly twice the memory of the compiled graph; recompute
@@ -433,6 +443,8 @@ def train(args):
                 flush=True,
             )
         sampler.epoch, sampler.start_batch = epoch, batch_offset
+        # strict_checks: false defers the loss/gradient finiteness checks to the next host sync.
+        watch = None if cfg.train.strict_checks else NonfiniteWatch(device)
         iterator = iter(loader)
         last_time = time.monotonic()
         inactive = {}
@@ -495,7 +507,11 @@ def train(args):
                             loss = loss + auxiliary.sum() * world / flow_examples
                     if probe is not None:
                         diagnostics["activation_max_abs"] = probe.close()
-                        if world == 1:
+                        if model.grad_checkpoint == "selective":
+                            diagnostics["gradient_contributions"] = (
+                                "Unavailable under selective checkpointing, which allows a single backward"
+                            )
+                        elif world == 1:
                             diagnostics.update(
                                 gradient_contributions(
                                     model,
@@ -507,7 +523,9 @@ def train(args):
                             diagnostics["gradient_contributions"] = (
                                 "Use a single-process diagnostic run; autograd.grad is not used inside DDP"
                             )
-                    if not torch.isfinite(loss):
+                    if watch is not None:
+                        watch.note("objective", loss, step)
+                    elif not torch.isfinite(loss):
                         raise FloatingPointError(f"Nonfinite objective at update {step + 1}")
                     loss.backward()
                 buckets += loss_buckets(losses["flow"], losses["times"], losses["frames"])
@@ -523,7 +541,9 @@ def train(args):
                     ]
                 )
             norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            if not torch.isfinite(norm):
+            if watch is not None:
+                watch.note("gradient", norm, step)
+            elif not torch.isfinite(norm):
                 raise FloatingPointError(f"Nonfinite gradient at update {step + 1}")
             if diagnose:
                 diagnostics["gradient_groups_after_clip"] = gradient_groups(model)
@@ -536,6 +556,8 @@ def train(args):
                 decay = min(cfg.train.ema_decay, (1 + step) / (10 + step))
                 torch._foreach_lerp_(list(ema.parameters()), list(model.parameters()), 1 - decay)
             if (step + 1) % cfg.train.log_every == 0 or step == start_step or diagnose:
+                if watch is not None:
+                    watch.check()
                 if world > 1:
                     dist.all_reduce(metrics)
                     dist.all_reduce(buckets)
@@ -568,6 +590,8 @@ def train(args):
                     tracker.log(record, step=step + 1, prefix="train/")
                 last_time = time.monotonic()
             if validation is not None and (step + 1) % cfg.train.validate_every == 0:
+                if watch is not None:
+                    watch.check()
                 val = validate(
                     ema,
                     validation,
@@ -590,6 +614,8 @@ def train(args):
                 or stopping
                 or keeping
             ):
+                if watch is not None:
+                    watch.check()  # never write a checkpoint after an unnoticed nonfinite update
                 states = [None] * world
                 state = rng_state(device)
                 if world > 1:

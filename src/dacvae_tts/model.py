@@ -5,11 +5,11 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.checkpoint import checkpoint
 
 from .config import ModelConfig
 from .contracts import audio_shapes, mask_values, sanitize, text_shapes
 from .reference import ReferencePool, TemporalReference
+from .speed import block_checkpoint, run_block
 from .text import BYTE_OFFSET, VOCAB_SIZE
 
 
@@ -202,6 +202,8 @@ class FlowTTS(nn.Module):
         # the generator route every transcript byte to its frames early, i.e. learn the alignment.
         self.ctc = nn.Linear(d, VOCAB_SIZE) if cfg.ctc_layer else None
         self.grad_checkpoint = False
+        self.strict_checks = True  # train.strict_checks: false skips value checks that wait for the GPU
+        self.block_runner = run_block  # train.compile: blocks swaps in a compiled runner (speed.py)
 
     def reference_summary(self, prompt, prompt_mask):
         prompt = sanitize(prompt, prompt_mask)
@@ -237,7 +239,7 @@ class FlowTTS(nn.Module):
         text_shapes(tokens, segments, prompt.size(0), prompt.device)
         text, _, voice = self.conditions(prompt, prompt_mask, tokens, segments) if cached is None else cached
         target_bytes = (segments == 1) & (tokens >= BYTE_OFFSET)
-        if (target_bytes.sum(1) == 0).any():
+        if self.strict_checks and (target_bytes.sum(1) == 0).any():
             raise ValueError("Duration prediction requires nonempty target text")
         ref_bytes = ((segments == 0) & (tokens >= BYTE_OFFSET)).sum(1).clamp_min(1)
         rate = (prompt_mask.sum(1).float().clamp_min(1) / ref_bytes).log().unsqueeze(1)
@@ -317,11 +319,7 @@ class FlowTTS(nn.Module):
         ctc_logits = None
         for number, block in enumerate(self.blocks, 1):
             args = (h, text, packed_valid, text_valid, cond, *angles, shared)
-            h = (
-                checkpoint(block, *args, use_reentrant=False)
-                if self.grad_checkpoint and self.training
-                else block(*args)
-            )
+            h = self.block_runner(block, args, block_checkpoint(self.grad_checkpoint, number, self.training))
             if return_ctc and number == self.cfg.ctc_layer:
                 ctc_logits = self.ctc(h)
         output = self.output(h)
@@ -333,7 +331,7 @@ class FlowTTS(nn.Module):
         return (velocity, ctc_logits, packed_valid) if return_ctc else velocity
 
 
-def per_example_mse(prediction, target, mask):
+def per_example_mse(prediction, target, mask, strict=True):
     if (
         prediction.shape != target.shape
         or prediction.ndim != 3
@@ -341,7 +339,7 @@ def per_example_mse(prediction, target, mask):
         or mask.dtype != torch.bool
     ):
         raise ValueError("MSE requires matching [B,L,C] predictions/targets and boolean [B,L] mask")
-    if (mask.sum(-1) == 0).any():
+    if strict and (mask.sum(-1) == 0).any():
         raise ValueError("Each example must contain at least one valid target frame")
     error = (sanitize(prediction.float(), mask) - sanitize(target.float(), mask)).square().mean(-1)
     return error.sum(-1) / mask.sum(-1)
@@ -391,14 +389,15 @@ def flow_loss(
 ):
     if not 0 <= dropout <= 1:
         raise ValueError("dropout must lie in [0,1]")
-    mask = mask_values(batch["valid"], batch["prompt_mask"])
+    strict = getattr(model, "strict_checks", True)
+    mask = mask_values(batch["valid"], batch["prompt_mask"], strict=strict)
     x1 = sanitize(batch["latents"], batch["valid"])
     b = x1.size(0)
     time = sample_time(b, x1.device, time_sampling) if time is None else time
     noise = torch.randn_like(x1) if noise is None else noise
     if time.shape != (b,) or noise.shape != x1.shape or time.device != x1.device or noise.device != x1.device:
         raise ValueError("Noise must match [B,L,C]; time must match [B], on the audio device")
-    if not torch.isfinite(time).all() or (time < 0).any() or (time > 1).any():
+    if strict and (not torch.isfinite(time).all() or (time < 0).any() or (time > 1).any()):
         raise ValueError("Flow time must be finite and lie in [0,1]")
     noise = sanitize(noise, batch["valid"])
     xt = (1 - time[:, None, None]) * noise + time[:, None, None] * x1
@@ -428,7 +427,7 @@ def flow_loss(
     if prediction_kind(model) == "edm":
         t = time[:, None, None]
         target = ((1 - t) * x1 - t * noise) / (t.square() + (1 - t).square()).sqrt()
-    losses = per_example_mse(pred, target, mask)
+    losses = per_example_mse(pred, target, mask, strict)
     if return_details:
         counts = mask.sum(1)
         rms = (sanitize(pred.float(), mask).square().sum((1, 2)) / (counts * pred.size(-1))).sqrt()
@@ -450,14 +449,18 @@ def ctc_alignment_loss(logits, token_valid, tokens, drop):
     """Per-example CTC between generator frames and transcript bytes; PAD (0) is the blank.
 
     Examples whose text was dropped for classifier-free guidance cannot be aligned and get zero.
+    Targets are padded [B,S] rows holding each transcript's bytes first: a stable sort of the
+    "not a byte" flag compacts them on the device, where per-row boolean indexing and a Python
+    list of lengths each waited for the GPU. Entries past a row's length are ignored by the loss.
     """
     from .text import BYTE_OFFSET
 
-    targets = [row[row >= BYTE_OFFSET] for row in tokens]
-    lengths = torch.tensor([len(row) for row in targets], device=logits.device)
+    is_byte = tokens >= BYTE_OFFSET
+    lengths = is_byte.sum(1)
+    targets = tokens.gather(1, torch.sort((~is_byte).to(torch.uint8), dim=1, stable=True).indices)
     loss = F.ctc_loss(
         logits.float().log_softmax(-1).transpose(0, 1),
-        torch.cat(targets),
+        targets,
         token_valid.sum(1),
         lengths,
         blank=0,
