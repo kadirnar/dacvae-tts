@@ -454,6 +454,7 @@ class Synthesizer:
         seed=42,
         sway=-1.0,
         max_rows=16,
+        duration_factors=None,
         **sampler,
     ):
         """Generate every text (e.g. the sentence chunks of a long input) `candidates` times in padded batches.
@@ -461,6 +462,15 @@ class Synthesizer:
         All rows share the prepared `reference` (a VoiceReference). Returns (results, metadata) where results[i][k]
         is a dict with the float32 waveform (`audio`, numpy) of candidate k of text i and its duration. Candidates
         of a text differ only in their initial noise, which is what best-of-N reranking needs.
+
+        `duration_factors` (e.g. [1.0, 0.9, 1.1]) makes the candidates duration-diverse as well: candidate k gets
+        target length x factors[k % len(factors)] (on top of `duration_scale`) and its own noise, so `candidates`
+        stays the number of rows per text; candidates=6 with three factors gives every length two noises. List the
+        neutral factor first: selectors that break ties by index then keep it. Each result records its
+        `duration_factor`, the metadata the per-candidate list. A uniform x0.9 or x1.15 hurt Freya-TR-Eval (the
+        LARoPE alignment prior expects the prompt's frames per byte), but the best length differs per sentence;
+        picking it per sentence by the decoded result is what a metric-optimized duration model learns (DMOSpeech 2,
+        arXiv 2507.14988). None (default) or [1.0] give exactly the plain candidates.
         """
         import numpy as np
 
@@ -469,21 +479,24 @@ class Synthesizer:
             raise TypeError(f"Unknown sampler options: {sorted(unknown)}")
         if not texts or candidates < 1 or max_rows < 1:
             raise ValueError("Need at least one text, one candidate and a positive batch size")
+        factors = (1.0,) if duration_factors is None else tuple(float(f) for f in duration_factors)
+        if not 1 <= len(factors) <= candidates or not all(math.isfinite(f) and f > 0 for f in factors):
+            raise ValueError("duration_factors needs 1..candidates finite positive factors (candidate k uses k mod n)")
         started = time.perf_counter()
         latents = reference.latents.to(self.device)
         layout = self.model.cfg.text_layout
         timing = self._articulation_timing(reference, seconds, duration_mode)
         requests = []
         for text in texts:
-            frames, profile = self.target_frames(len(latents), reference.transcript, text, seconds, duration_scale,
-                                                 duration_mode, timing=timing)
-            if not 0.25 <= frames * self.codec.hop_length / self.codec.sample_rate <= 30:
+            options = [self.target_frames(len(latents), reference.transcript, text, seconds, duration_scale * factor,
+                                          duration_mode, timing=timing) for factor in factors]
+            if not all(0.25 <= frames * self.codec.hop_length / self.codec.sample_rate <= 30 for frames, _ in options):
                 raise ValueError(f"Target duration outside .25–30 s for: {text[:60]!r}; split the text")
             tokens, segments = tokenize(reference.transcript, text, version=self.text_version, layout=layout)
             only_tokens, only_segments = tokenize("", text, version=self.text_version, layout=layout)
             if tokens.numel() > 2048:
                 raise ValueError("Text too long; split into sentences before synthesis")
-            requests.append((frames, tokens, segments, only_tokens, only_segments, profile))
+            requests.append((options, tokens, segments, only_tokens, only_segments))
         rows = [(i, k) for i in range(len(texts)) for k in range(candidates)]
         results = [[None] * candidates for _ in texts]
         stats, generation = {}, 0.0
@@ -493,7 +506,8 @@ class Synthesizer:
         for start in range(0, len(rows), max_rows):
             chunk = rows[start : start + max_rows]
             reference_frames = len(latents)
-            totals = [reference_frames + requests[i][0] for i, _ in chunk]
+            lengths = [requests[i][0][k % len(factors)] for i, k in chunk]  # (frames, duration profile) per row
+            totals = [reference_frames + frames for frames, _ in lengths]
             width = max(totals)
             prompt = torch.zeros(len(chunk), width, self.codec.latent_dim, device=self.device)
             prompt[:, :reference_frames] = latents
@@ -518,9 +532,11 @@ class Synthesizer:
                 results[i][k] = {
                     "audio": audio.numpy().astype(np.float32),
                     "audio_seconds": audio.numel() / self.codec.sample_rate,
-                    "frames": int(requests[i][0]),
-                    "duration": requests[i][5],
+                    "frames": int(lengths[row][0]),
+                    "duration": lengths[row][1],
                 }
+                if duration_factors is not None:
+                    results[i][k]["duration_factor"] = factors[k % len(factors)]
         self._sync()
         metadata = {
             "texts": len(texts),
@@ -537,6 +553,9 @@ class Synthesizer:
             "duration_scale": duration_scale,
             **{k: v for k, v in stats.items() if k != "time_grid"},
         }
+        if duration_factors is not None:
+            metadata.update(duration_factors=list(factors),
+                            candidate_factors=[factors[k % len(factors)] for k in range(candidates)])
         return results, metadata
 
 

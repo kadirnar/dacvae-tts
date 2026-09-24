@@ -220,3 +220,31 @@ def test_articulation_through_synthesizer_decodes_cached_prompts(monkeypatch, ca
     # an unreadable/absent file keeps the old behaviour: no timing, articulation falls back to decoding
     monkeypatch.setattr(tts, "reference", lambda path: gated_latents(tts, pattern))
     assert tts.prepare_reference(tmp_path / "missing.wav", TRANSCRIPT).speech_timing is None
+
+
+def test_duration_factors_cycle_over_candidates(monkeypatch, cache, tmp_path):
+    tts = tiny_synthesizer(monkeypatch, cache, tmp_path)
+    voice = VoiceReference(torch.randn(60, 4), "Hızlı hızlı konuşan bir referans kaydı burada duruyor.", "test", {})
+    texts = ["Merhaba dünya.", "Bu biraz daha uzun ikinci bir cümle."]
+    plain, plain_meta = tts.synthesize_many(texts, voice, candidates=3, steps=2, guidance=2.0, max_rows=4)
+    same, same_meta = tts.synthesize_many(texts, voice, candidates=3, steps=2, guidance=2.0, max_rows=4,
+                                          duration_factors=[1.0])
+    for a, b in zip(sum(plain, []), sum(same, [])):
+        assert np.array_equal(a["audio"], b["audio"]) and a["frames"] == b["frames"] and a["duration"] == b["duration"]
+    assert "duration_factor" not in plain[0][0] and "candidate_factors" not in plain_meta
+    assert same_meta["candidate_factors"] == [1.0, 1.0, 1.0]
+    factors = [1.0, 0.9, 1.1]
+    diverse, meta = tts.synthesize_many(texts, voice, candidates=6, steps=2, guidance=2.0, max_rows=4,
+                                        duration_factors=factors, duration_mode="clamp")
+    assert meta["duration_factors"] == factors and meta["candidate_factors"] == factors * 2 and meta["rows"] == 12
+    for text, row in zip(texts, diverse):
+        assert [r["duration_factor"] for r in row] == factors * 2
+        for r in row:
+            expected = tts.target_frames(60, voice.transcript, text, duration_scale=r["duration_factor"],
+                                         duration_mode="clamp")[0]
+            assert r["frames"] == expected and r["audio"].shape == (expected * 512,)
+        assert row[1]["frames"] < row[0]["frames"] < row[2]["frames"]
+        assert not np.array_equal(row[0]["audio"], row[3]["audio"])  # same length, different noise
+    for bad in ([1.0, 0.9, 1.1, 1.2], [1.0, 0.0], [float("nan")], []):
+        with pytest.raises(ValueError, match="duration_factors"):
+            tts.synthesize_many(texts, voice, candidates=3, steps=1, duration_factors=bad)
