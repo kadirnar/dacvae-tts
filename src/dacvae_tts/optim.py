@@ -38,6 +38,7 @@ BOUNDARY = {
     "duration.2.weight",
     "ctc.weight",
     "speaker_condition.weight",  # frozen speaker embedding in (zero-init): an input boundary like `input`
+    "speaker_context.input.weight",  # raw context latents in
 }
 # Per-head attention gate logits [heads, D] are a small zero-init output head, not a hidden map: Muon would
 # give every head an equally large update from the first step, whatever its gradient. AdamW, like the heads.

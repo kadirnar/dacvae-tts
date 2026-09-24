@@ -25,7 +25,7 @@ from .contracts import sanitize, target_mask
 from .data import BucketBatchSampler, LatentDataset, collate, move_batch
 from .data import load_silence as raw_silence
 from .diagnostics import ActivationProbe, gradient_contributions, gradient_groups, loss_buckets
-from .model import FlowTTS, flow_loss, flow_target, reduce_flow
+from .model import FlowTTS, condition_inputs, flow_loss, flow_target, reduce_flow
 from .negatives import (
     augmented_negatives,
     delta_record,
@@ -152,13 +152,16 @@ class Objective(nn.Module):
         return terms
 
     def forward(self, batch):
-        speaker = batch.get("speaker_condition")  # speaker-embedding condition (model.speaker_condition_dim)
+        # Optional voice conditions (speaker embedding, speaker context), encoded once like the text.
+        voice_inputs = condition_inputs(batch)
         cached = self.model.conditions(
-            batch["prompt"], batch["prompt_mask"], batch["tokens"], batch["segments"], speaker=speaker
+            batch["prompt"], batch["prompt_mask"], batch["tokens"], batch["segments"], **voice_inputs
         )
         expanded, shared = batch, cached
         if self.expansion > 1 and self.training:
-            expanded = {key: value.repeat_interleave(self.expansion, 0) for key, value in batch.items()}
+            # The context clips are only read through `cached`: not repeated for the flow draws.
+            expanded = {key: value.repeat_interleave(self.expansion, 0) for key, value in batch.items()
+                        if key not in ("context", "context_mask")}
             shared = tuple(value.repeat_interleave(self.expansion, 0) for value in cached)
         repa = self.training and self.repa_weight > 0 and self.repa_active
         tla = self.training and self.tla_weight > 0
@@ -203,7 +206,7 @@ class Objective(nn.Module):
                 0,
                 details["times"][::copies],
                 details["noise"][::copies],
-                cached=self.model.conditions(batch["prompt"], batch["prompt_mask"], tokens, segments, speaker=speaker),
+                cached=self.model.conditions(batch["prompt"], batch["prompt_mask"], tokens, segments, **voice_inputs),
             )
             positive = flow[::copies]
             hinge = F.relu(positive + self.contrastive_margin * positive.detach() - negative)
@@ -537,11 +540,36 @@ def pair_options(cfg):
         "prompt_cut",
     )
     options = {**{name: getattr(cfg.train, name) for name in names}, "ctc_targets": cfg.model.ctc_targets}
+    if cfg.train.speaker_context_prob:  # off: no context keywords, as for tempo below
+        options.update({name: getattr(cfg.train, name) for name in (
+            "speaker_context_prob", "speaker_context_min_seconds", "speaker_context_max_seconds",
+            "speaker_context_max_utterances")})
     if cfg.train.tempo_prompt_prob:  # off: no tempo keywords at all, the dataset is built exactly as before
         options.update(tempo_prompt_prob=cfg.train.tempo_prompt_prob,
                        tempo_prompt_factors=cfg.train.tempo_prompt_factors,
                        tempo_prompt_pairs=cfg.train.tempo_prompt_pairs)
     return options
+
+
+CONTEXT_FIELDS = ("speaker_context", "speaker_context_width", "speaker_context_layers", "speaker_context_heads",
+                  "speaker_context_patch")
+
+
+def warm_start_config(warm, target):
+    """The warm-start checkpoint's model config as it may differ from `target`: dropout, and the speaker context
+    fields when the checkpoint has none (the zero-init context branch starts as that model)."""
+    changes = {"dropout": target.dropout}
+    if warm.speaker_context == "none":
+        changes.update({name: getattr(target, name) for name in CONTEXT_FIELDS})
+    return dataclasses.replace(warm, **changes)
+
+
+def warm_start(module, state):
+    """load_state_dict for --init-from: strict, except that a new speaker context branch may be missing."""
+    missing, unexpected = module.load_state_dict(state, strict=False)
+    stray = [key for key in missing if not key.startswith("speaker_context.")]
+    if unexpected or stray:
+        raise ValueError(f"--init-from weights do not match the model: missing {stray}, unexpected {unexpected}")
 
 
 def speaker_sources(cfg, cache):
@@ -677,13 +705,15 @@ def train(args):
                 # a run can continue on a larger cache than the one that produced the checkpoint.
                 warm = torch.load(args.init_from, map_location="cpu", weights_only=True)
                 warm_model = Config.from_dict(warm["config"]).model
-                # Dropout has no parameters, so a run may switch it on or off when warm starting.
-                if dataclasses.replace(warm_model, dropout=cfg.model.dropout) != cfg.model:
-                    raise ValueError("--init-from requires an identical model configuration (except dropout)")
-                model.load_state_dict(warm["model"])
-                ema.load_state_dict(warm["ema"])
+                # Dropout has no parameters, so a run may switch it on or off when warm starting; a zero-init speaker
+                # context may be added to a checkpoint without one (it starts as that checkpoint's model).
+                if warm_start_config(warm_model, cfg.model) != cfg.model:
+                    raise ValueError("--init-from requires an identical model configuration (except dropout and an "
+                                     "added speaker context)")
+                warm_start(model, warm["model"])
+                warm_start(ema, warm["ema"])
                 for key, (_, average) in averages.items():
-                    average.load_state_dict(warm.get(key, warm["ema"]))
+                    warm_start(average, warm.get(key, warm["ema"]))
             torch.manual_seed(cfg.train.seed + rank)
             random.seed(cfg.train.seed + rank)
         silence = None

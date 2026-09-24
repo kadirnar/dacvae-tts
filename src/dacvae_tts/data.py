@@ -114,6 +114,7 @@ def load_silence(directory, meta):
 # Independent random streams per (seed, epoch, index): toggling one pair option never moves the draws
 # of another, and every stream stays clear of the original seed range seed + epoch * rows + index.
 CROSS_STREAM, TAIL_STREAM, LONG_STREAM, TEMPO_STREAM, SPEAKER_STREAM = 1 << 48, 2 << 48, 3 << 48, 4 << 48, 5 << 48
+CONTEXT_STREAM = 6 << 48
 QUIET_CUT_SECONDS = 0.3
 
 
@@ -345,6 +346,10 @@ class LatentDataset(Dataset):
         tempo_prompt_prob=0.0,
         tempo_prompt_factors=(),
         tempo_prompt_pairs="all",
+        speaker_context_prob=0.0,
+        speaker_context_min_seconds=3.0,
+        speaker_context_max_seconds=30.0,
+        speaker_context_max_utterances=8,
     ):
         """Validate the options and widen `costs` to an upper bound of every prompt+target they can form.
 
@@ -381,6 +386,15 @@ class LatentDataset(Dataset):
             several = self.group_end - self.group_start >= 2
             self.costs = self.costs + np.where(several, self.cross_prompt_frames, 0).astype(self.costs.dtype)
         self.configure_tempo(tempo_prompt_prob, tempo_prompt_factors, tempo_prompt_pairs)
+        if not 0 <= speaker_context_prob <= 1 or speaker_context_max_utterances < 1 or not (
+            0 < speaker_context_min_seconds <= speaker_context_max_seconds
+        ):
+            raise ValueError("Invalid speaker context options")
+        if speaker_context_prob and self.pairing != "within":
+            raise ValueError("Speaker contexts are drawn for within pairing")
+        self.context_prob, self.context_utterances = speaker_context_prob, speaker_context_max_utterances
+        self.context_frames = (int(speaker_context_min_seconds * frame_rate),
+                               int(speaker_context_max_seconds * frame_rate))
 
     def configure_tempo(self, probability, factors, pairs):
         """Prompt tempo perturbation: with `probability`, an item's prompt is the same speech at one of `factors`
@@ -411,6 +425,33 @@ class LatentDataset(Dataset):
             cut = np.minimum(self.lengths - 1, np.ceil(self.lengths * top).astype(np.int64) + window)
             self.costs = self.costs + np.maximum(np.ceil(cut * 1000 / slowest).astype(np.int64) - cut, 0).astype(
                 self.costs.dtype)
+
+    def context_plan(self, epoch, index):
+        """Rows forming this row's speaker context in `epoch`, or (): other utterances of its label, whole clips in
+        random order up to a length drawn in [min, max] frames (at most `max_utterances`; clips that would pass the
+        maximum are skipped); fewer than min frames give none. A pure function of (seed, epoch, index) on its own
+        stream, independent of prompt dropout; off draws nothing."""
+        if not self.context_prob:
+            return ()
+        start, end = int(self.group_start[index]), int(self.group_end[index])
+        if end - start < 2:
+            return ()
+        rng = random.Random(self.seed + epoch * len(self) + index + CONTEXT_STREAM)
+        if rng.random() >= self.context_prob:
+            return ()
+        low, high = self.context_frames
+        goal = rng.randint(low, high)
+        chosen, total = [], 0
+        for other in rng.sample(range(start, end - 1), end - start - 1):
+            other += other >= index
+            length = int(self.lengths[other])
+            if total + length > high:
+                continue
+            chosen.append(other)
+            total += length
+            if total >= goal or len(chosen) >= self.context_utterances:
+                break
+        return tuple(chosen) if total >= low else ()
 
     def tempo_plan(self, epoch, index):
         """Tempo (per mille) of this row's prompt in `epoch`, or None: a pure function of (seed, epoch, index)."""
@@ -563,9 +604,15 @@ class LatentDataset(Dataset):
         return vector if similarity >= self.speaker_min_cosine else own
 
     def finish_item(self, item, epoch, index):
-        """Tail silence, the speaker condition, the CTC label and text unit flags; the item itself when all are off."""
+        """Tail silence, the speaker condition and context, the CTC label and text unit flags; the item itself when
+        all are off."""
         if self.speaker_store is not None:
             item = {**item, "speaker_condition": self.speaker_vector(epoch, index, item)}
+        if self.context_prob:
+            rows = self.context_plan(epoch, index)
+            context = [self.row(r)["latents"] for r in rows]
+            item = {**item, "context": torch.cat(context) if context else torch.zeros(0, self.channels),
+                    "context_uid": "|".join(self.uid(r) for r in rows)}
         if self.ctc_targets == "chars":
             item = {**item, "ctc_targets": "chars"}
         if self.text_units != "bytes":
@@ -640,6 +687,15 @@ def collate(items):
         "segments": pad_sequence(segments, batch_first=True),
         **collate_teacher(items),
     }
+    carried = [("context" in item) for item in items]
+    if any(carried):
+        # Speaker contexts of different lengths (empty ones too), padded with a mask; at least one frame wide.
+        if not all(carried):
+            raise ValueError("Either every item or none carries a speaker context")
+        contexts = [item["context"] for item in items]
+        width = max(1, max(len(c) for c in contexts))
+        batch["context"] = torch.stack([torch.cat([c, c.new_zeros(width - len(c), c.size(1))]) for c in contexts])
+        batch["context_mask"] = torch.arange(width)[None] < torch.tensor([len(c) for c in contexts])[:, None]
     present = [("speaker_condition" in item) for item in items]
     if any(present):
         if not all(present):

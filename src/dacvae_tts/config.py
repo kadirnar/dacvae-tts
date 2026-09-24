@@ -51,6 +51,17 @@ class ModelConfig:
     # prompt (Koel-TTS unseen SIM: in-context 0.637, SV vector 0.619; MiniMax-Speech: encoder + prompt 0.746 vs prompt
     # 0.726, a frozen SV vector raised WER). 0 is off. Training reads a speaker store (train.speaker_condition).
     speaker_condition_dim: int = 0
+    # Multi-clip speaker context (`vector`): a small transformer over the latents of further recordings of the voice
+    # (other utterances of the speaker in training, extra clips + the prompt at inference; no positions, so clip order
+    # does not matter) -> attention pooling -> a zero-init vector added to the voice condition. Irodori-TTS: CAM++
+    # SIM one clip 0.661 -> 30 s 0.752 -> 120 s 0.775 (766M, per-block speaker K/V); XTTS averages its reference
+    # latents over clips; Koel-TTS saw a cross-attention encoder overfit seen speakers, hence one vector. ~2.2M
+    # parameters at the defaults (+3.4 % at width 512); starts as the baseline, so it can warm-start from a checkpoint.
+    speaker_context: str = "none"
+    speaker_context_width: int = 256
+    speaker_context_layers: int = 3
+    speaker_context_heads: int = 4
+    speaker_context_patch: int = 4  # latent frames per context token (25 fps -> 6.25 tokens/s)
     # Training-only teacher heads (alignment.py); absent from the module and its checkpoints when off.
     repa_layer: int = 0  # speech-REPA: block predicting teacher SSL frames; 0 off, 10-11 with CTC at 8
     repa_dim: int = 0  # width of the stored teacher frames (after the extraction PCA, e.g. 256)
@@ -125,6 +136,14 @@ class ModelConfig:
             raise ValueError("dropout must lie in [0,1)")
         if self.speaker_condition_dim < 0:
             raise ValueError("speaker_condition_dim must be 0 (off) or the embedding width")
+        if self.speaker_context not in {"none", "vector"}:
+            raise ValueError("speaker_context must be none or vector")
+        if self.speaker_context != "none" and (
+            min(self.speaker_context_width, self.speaker_context_layers, self.speaker_context_heads,
+                self.speaker_context_patch) < 1
+            or self.speaker_context_width % self.speaker_context_heads
+        ):
+            raise ValueError("speaker_context needs positive width/layers/heads/patch, width divisible by heads")
 
 
 def teacher_blocks(value, depth):
@@ -244,6 +263,15 @@ class TrainConfig:
     speaker_condition: str = ""
     speaker_condition_source: str = "other"
     speaker_condition_min_cosine: float = 0.0
+    # Speaker context (model.speaker_context): with this probability an item gets a context of other utterances of
+    # its label, whole clips in random order up to a length drawn from [min, max] seconds (at most max_utterances;
+    # below min: none), drawn independently of prompt dropout (prompt-free rows then learn from the context alone).
+    # The other items keep an empty context, so single-clip inference stays in distribution (Irodori v4's single clip
+    # fell from 0.678 to 0.661 when every item had a long reference).
+    speaker_context_prob: float = 0.0
+    speaker_context_min_seconds: float = 3.0
+    speaker_context_max_seconds: float = 30.0
+    speaker_context_max_utterances: int = 8
     tla_entropy: float = 0.01  # weight of the negative entropy of the time-dependent block weights
     # Schedule and regularization options (issue #14); every default reproduces the original recipe exactly.
     # wsd: warmup, constant LR, then a decay over the last `decay_fraction` of the updates. A 20% 1-sqrt
@@ -372,6 +400,12 @@ class TrainConfig:
             raise ValueError("tempo_prompt_pairs: cross stretches cross prompts only; set cross_prompt_prob > 0")
         if min(self.repa_weight, self.repa_stop_step, self.tla_weight, self.tla_entropy) < 0:
             raise ValueError("Teacher loss weights and repa_stop_step must be nonnegative")
+        if not 0 <= self.speaker_context_prob <= 1 or self.speaker_context_max_utterances < 1 or not (
+            0 < self.speaker_context_min_seconds <= self.speaker_context_max_seconds
+        ):
+            raise ValueError("speaker_context_prob in [0,1], positive max_utterances, 0 < min_seconds <= max_seconds")
+        if self.speaker_context_prob and self.pairing != "within":
+            raise ValueError("speaker_context_prob draws contexts for within pairing")
         if self.speaker_condition_source not in {"other", "same"} or not -1 <= self.speaker_condition_min_cosine <= 1:
             raise ValueError("speaker_condition_source must be other or same; min_cosine in [-1,1]")
         if self.speaker_condition and self.tla_weight and self.speaker_condition == self.speaker_embeddings:
@@ -434,6 +468,8 @@ class Config:
             self.train.tla_weight and not self.model.tla_layers
         ):
             raise ValueError("repa_weight needs model.repa_layer and tla_weight needs model.tla_layers")
+        if (self.model.speaker_context != "none") != bool(self.train.speaker_context_prob):
+            raise ValueError("model.speaker_context and train.speaker_context_prob > 0 go together")
         if bool(self.model.speaker_condition_dim) != bool(self.train.speaker_condition):
             raise ValueError("model.speaker_condition_dim and train.speaker_condition (a speaker store) go together")
         if self.train.model_guidance_weight and not self.model.cond_dropout:

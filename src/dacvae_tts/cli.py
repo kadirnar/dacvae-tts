@@ -146,6 +146,8 @@ def main():
     p.add_argument(
         "--reference-text", help="Optional; omitted transcripts use ASR, not a transcript-free TTS model"
     )
+    p.add_argument("--context-audio", nargs="+", help="More recordings of the voice (no transcripts) for models with a "
+                   "speaker context (model.speaker_context); the context is the prompt plus these clips")
     p.add_argument(
         "--asr-model",
         help="faster-whisper model of the reference ASR (default: small.en, or large-v3-turbo for a Turkish "

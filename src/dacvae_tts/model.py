@@ -139,6 +139,43 @@ class TextEncoder(nn.Module):
         return self.norm(x) * valid[..., None], valid
 
 
+class SpeakerContext(nn.Module):
+    """Multi-clip speaker context -> one vector [B,D] for the voice condition (model.speaker_context: vector).
+
+    Latents [B,L,C] (the clips back to back, masked) are patched `speaker_context_patch` frames per token, projected
+    to `speaker_context_width`, mixed by `speaker_context_layers` bidirectional self-attention blocks without
+    positions (a set of patches: the clip order does not matter), attention-pooled and normalized; the zero-init
+    output projection starts the model as the baseline. Rows without context contribute exactly zero.
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        width, self.patch = cfg.speaker_context_width, cfg.speaker_context_patch
+        inner = type("ContextConfig", (), dict(width=width, heads=cfg.speaker_context_heads, qk_norm=cfg.qk_norm,
+                                               ff_mult=cfg.ff_mult))
+        self.input = nn.Linear(cfg.latent_dim * self.patch, width)
+        self.blocks = nn.ModuleList([TextBlock(inner) for _ in range(cfg.speaker_context_layers)])
+        self.pool = ReferencePool(width, "attention")
+        self.norm = nn.LayerNorm(width)
+        self.output = nn.Linear(width, cfg.width)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(self, context, mask):
+        b, length, channels = context.shape
+        pad = (-length) % self.patch
+        context = F.pad(sanitize(context, mask), (0, 0, 0, pad))
+        valid = F.pad(mask, (0, pad)).reshape(b, -1, self.patch).all(-1)  # a token needs all its frames
+        present = valid.any(1)
+        attend = valid.clone()
+        attend[:, 0] |= ~present  # empty rows attend to one token (no NaN); their result is zeroed below
+        x = self.input(context.reshape(b, -1, channels * self.patch)) * attend[..., None]
+        for block in self.blocks:
+            x = block(x, attend, None)
+        pooled = self.pool(x, valid)
+        return self.output(self.norm(pooled)) * present[:, None].to(pooled.dtype)
+
+
 class SwiGLU(nn.Module):
     """silu(gate) * value from one fused projection; its two row halves are separate maps for Muon."""
 
@@ -365,13 +402,16 @@ class FlowTTS(nn.Module):
         self.tla = (
             SpeakerAlignment(d, cfg.tla_dim, len(cfg.tla_layers), cfg.tla_hidden) if cfg.tla_layers else None
         )
+        # Multi-clip speaker context: created last, so every other weight equals the baseline's for a seed.
+        self.speaker_context = SpeakerContext(cfg) if cfg.speaker_context == "vector" else None
         self.grad_checkpoint = False
         self.strict_checks = True  # train.strict_checks: false skips value checks that wait for the GPU
         self.block_runner = run_block  # train.compile: blocks swaps in a compiled runner (speed.py)
 
-    def reference_summary(self, prompt, prompt_mask, speaker=None):
+    def reference_summary(self, prompt, prompt_mask, speaker=None, context=None, context_mask=None):
         """Global voice vector [B,D] of the prompt; plus the projected speaker embedding `speaker` [B,E] for models
-        with `speaker_condition_dim` (rows without a prompt or with a zero embedding get none)."""
+        with `speaker_condition_dim` (rows without a prompt or with a zero embedding get none), and the speaker
+        context vector of `context` [B,L,C] / `context_mask` [B,L] for models with `speaker_context` (None: none)."""
         prompt = sanitize(prompt, prompt_mask)
         features = (
             self.ref(prompt, prompt_mask) if self.cfg.reference_encoder == "temporal" else self.ref(prompt)
@@ -391,15 +431,22 @@ class FlowTTS(nn.Module):
             present = (prompt_mask.any(1) & speaker.ne(0).any(-1))[:, None]
             unit = F.normalize(speaker.float(), dim=-1) * width**0.5 * present  # unit-variance entries
             voice = voice + self.speaker_condition(unit.to(voice.dtype))
+        if self.speaker_context is not None and context is not None:
+            if context.ndim != 3 or context.shape[0] != prompt.size(0) or context_mask.shape != context.shape[:2]:
+                raise ValueError("Speaker context must be [B,L,C] latents with a [B,L] mask")
+            voice = voice + self.speaker_context(context, context_mask)
+        elif context is not None:
+            raise ValueError("This model has no speaker context (model.speaker_context: none)")
         return voice
 
-    def conditions(self, prompt, prompt_mask, tokens, segments, drop=None, speaker=None):
+    def conditions(self, prompt, prompt_mask, tokens, segments, drop=None, speaker=None, context=None,
+                   context_mask=None):
         if self.strict_checks and self.cfg.text_units == "chars":
             low, high = CONTINUATION  # UTF-8 continuation bytes never occur in character-unit rows
             if ((tokens >= low) & (tokens <= high)).any():
                 raise ValueError("UTF-8 byte ids given to a character-unit model (text.to_units converts them)")
         text, text_valid = self.text(tokens, segments)
-        voice = self.reference_summary(prompt, prompt_mask, speaker)
+        voice = self.reference_summary(prompt, prompt_mask, speaker, context, context_mask)
         if drop is not None:
             text = text.masked_fill(drop[:, None, None], 0)
             voice = voice.masked_fill(drop[:, None], 0)
@@ -452,6 +499,8 @@ class FlowTTS(nn.Module):
         return_ctc=False,
         return_hidden=(),
         speaker=None,
+        context=None,
+        context_mask=None,
     ):
         """Velocity [B,L,C]; with `return_ctc`, (velocity, CTC logits, packed mask). A nonempty
         `return_hidden` (1-based block indices) wraps that result as (result, {block: [B,N,D]}) for
@@ -469,7 +518,7 @@ class FlowTTS(nn.Module):
         b, length, channels = x.shape
         p = self.cfg.patch_size
         if cached is None:
-            cached = self.conditions(prompt, prompt_mask, tokens, segments, drop, speaker)
+            cached = self.conditions(prompt, prompt_mask, tokens, segments, drop, speaker, context, context_mask)
         text, text_valid, voice = cached
         if (
             text.shape != (*tokens.shape, self.cfg.width)
@@ -652,7 +701,7 @@ def flow_loss(
         batch["segments"],
         drop=drop,
         **({} if cached is None else {"cached": cached}),
-        **({"speaker": batch["speaker_condition"]} if cached is None and "speaker_condition" in batch else {}),
+        **(condition_inputs(batch) if cached is None else {}),
         **({"return_ctc": True} if with_ctc else {}),
         **({"return_hidden": tuple(hidden_layers)} if with_hidden else {}),
     )
@@ -691,6 +740,16 @@ def flow_loss(
     return losses
 
 
+def condition_inputs(batch):
+    """Keyword arguments of the optional voice conditions a batch carries (speaker embedding, speaker context)."""
+    extra = {}
+    if "speaker_condition" in batch:
+        extra["speaker"] = batch["speaker_condition"]
+    if "context" in batch:
+        extra.update(context=batch["context"], context_mask=batch["context_mask"])
+    return extra
+
+
 def ctc_labels(model, batch):
     """(targets [B,T], lengths [B]) of a character CTC head, () for the byte head.
 
@@ -718,9 +777,7 @@ def guidance_direction(model, prediction, xt, time, batch, drop, cached=None):
     """
     inputs = (xt, time, batch["prompt"], batch["prompt_mask"], batch["valid"])
     inputs += (batch["tokens"], batch["segments"])
-    extra = {} if cached is None else {"cached": cached}
-    if cached is None and "speaker_condition" in batch:
-        extra["speaker"] = batch["speaker_condition"]
+    extra = {"cached": cached} if cached is not None else condition_inputs(batch)
     with torch.no_grad():
         if model.training and getattr(model.cfg, "dropout", 0) > 0:
             model.eval()
@@ -930,6 +987,8 @@ def sample(
     apg_momentum_late=None,
     cfg_rescale_late=None,
     speaker=None,
+    context=None,
+    context_mask=None,
 ):
     """Euler sampler with classifier-free guidance.
 
@@ -987,7 +1046,8 @@ def sample(
     x = sanitize(torch.where(prompt_mask[..., None], prompt, x), valid)
     times = time_grid(steps, sway, x.device, times)
     cond = (
-        model.conditions(prompt, prompt_mask, tokens, segments, speaker=speaker)
+        model.conditions(prompt, prompt_mask, tokens, segments, speaker=speaker, context=context,
+                         context_mask=context_mask)
         if condition_cache is None
         else condition_cache
     )
