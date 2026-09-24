@@ -345,3 +345,14 @@ def test_metric_v2_equals_v1_on_plain_sentences():
     if freya.exists():  # the full Freya-TR-Eval set: no digits, circumflexes, hyphens or acronyms
         rows = [json.loads(line)["text"] for line in freya.read_text().splitlines() if line.strip()]
         assert all(metric_text_turkish_v2(r) == metric_text_turkish(r) for r in rows)
+
+
+def test_v2_reads_ordinal_ranges_and_keeps_minus_for_signs_only():
+    # Found auditing the 42,591 tr-dataset-12 transcripts: "9.-10. yüzyıllarda" became "dokuz.eksi onuncu" in v2
+    # (the minus rule fired after the ordinal's full stop) and stays "dokuz.-onuncu" in the frozen v1.
+    assert normalize("9.-10. yüzyıllarda", "turkish-v2") == "dokuzuncu onuncu yüzyıllarda"
+    assert normalize("1.-2. dereceden akraba", "turkish-v2") == "birinci ikinci dereceden akraba"
+    assert normalize("9.-10. yüzyıllarda", "turkish-v1") == "dokuz.-onuncu yüzyıllarda"
+    assert normalize("Sıcaklık -5 derece", "turkish-v2") == "Sıcaklık eksi beş derece"
+    assert normalize("Hava (-3) derece", "turkish-v2") == "Hava (eksi üç) derece"
+    assert normalize("3-4 kişi", "turkish-v2") == "üç dört kişi"

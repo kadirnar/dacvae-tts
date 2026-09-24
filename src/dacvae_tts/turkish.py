@@ -119,9 +119,10 @@ LETTER = "a-zA-ZçğıöşüâîûÇĞİÖŞÜÂÎÛ"
 UPPER = "A-ZÇĞİÖŞÜÂÎÛ"
 MONTHS = ["ocak", "şubat", "mart", "nisan", "mayıs", "haziran", "temmuz", "ağustos", "eylül", "ekim", "kasım", "aralık"]
 # Shared by the synthesis frontend and the turkish-v2 training text: 23.09.2026 / 23/09/2026 / 23-09-2026 and a minus
-# sign before a number ("-5 derece"; a hyphen after a word or digit is a range or a compound: 3-4, COVID-19).
+# sign before a number ("-5 derece"; a hyphen after a word or digit is a range or a compound: 3-4, COVID-19, and
+# after an ordinal's full stop it is an ordinal range: 9.-10. yüzyıllarda).
 DATE = re.compile(r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{4})\b")
-MINUS = re.compile(r"(?<![\w\d])-(?=\d)")
+MINUS = re.compile(r"(?<![\w\d])(?<!\d\.)-(?=\d)")
 
 
 def spoken_date(match):
@@ -181,7 +182,8 @@ def normalize_numbers(text, v2=False):
     - an ordinal suffix followed by further suffixes is still an ordinal: 2'incisi -> ikincisi, 7'inciye ->
       yedinciye, 6'ıncısı -> altıncısı (v1 only reads a bare ordinal suffix: ikiincisi, altııncısı);
     - a suffix-initial d after a number word ending in a voiceless consonant (ç f h k p s ş t) becomes t, the
-      common misspelling of the locative/ablative: 5'de -> beşte, 3'den -> üçten, 40'da -> kırkta (v1: beşde).
+      common misspelling of the locative/ablative: 5'de -> beşte, 3'den -> üçten, 40'da -> kırkta (v1: beşde);
+    - an ordinal range reads as two ordinals: 9.-10. yüzyıllarda -> dokuzuncu onuncu yüzyıllarda (v1: dokuz.-onuncu).
     """
     # 50% / %50 / % 50 -> yüzde 50
     text = re.sub(r"%\s?(\d+(?:[.,]\d+)?)", r"yüzde \1", text)
@@ -195,6 +197,12 @@ def normalize_numbers(text, v2=False):
     text = re.sub(r"(\d+)\.(\d+)", r"\1 nokta \2", text)
     # ranges 3-4 -> 3 4
     text = re.sub(r"(\d+)\s?[-–]\s?(\d+)", r"\1 \2", text)
+    if v2:  # ordinal ranges "9.-10. yüzyıllarda" -> "dokuzuncu onuncu yüzyıllarda" (v1: "dokuz.-onuncu")
+        text = re.sub(
+            r"\b(\d+)\.\s?[-–]\s?(\d+)\.(?=\s+[a-zçğıöşü])",
+            lambda m: f"{ordinal_words(int(m.group(1)))} {ordinal_words(int(m.group(2)))}",
+            text,
+        )
     # ordinals "12. nesil" -> "on ikinci nesil" (only when a lower-case word follows)
     text = re.sub(r"\b(\d+)\.(?=\s+[a-zçğıöşü])", lambda m: ordinal_words(int(m.group(1))), text)
     # split letters glued to digits: 350D -> 350 D ; USB3 -> USB 3
