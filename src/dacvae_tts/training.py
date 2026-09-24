@@ -22,7 +22,7 @@ from .diagnostics import ActivationProbe, gradient_contributions, gradient_group
 from .model import FlowTTS, flow_loss, reduce_flow
 from .optim import build_optimizer
 from .parallel import device_batches, loader_options
-from .speed import NonfiniteWatch
+from .speed import NonfiniteWatch, training_loader
 from .text import BYTE_OFFSET, corrupt_transcript
 from .tracking import Tracker
 
@@ -54,6 +54,8 @@ class Objective(nn.Module):
 
     def negatives(self, batch):
         """Corrupted transcripts [B,S'] plus a mask of the examples that could be corrupted."""
+        if "negative_tokens" in batch:  # drawn by the loader workers (train.loader_negatives)
+            return batch["negative_tokens"], batch["negative_segments"], batch["negative_usable"]
         tokens, segments = batch["tokens"].cpu(), batch["segments"].cpu()
         rows, usable = [], []
         for row_tokens, row_segments in zip(tokens, segments):
@@ -263,8 +265,10 @@ def train(args):
             raise ValueError("Run merge on all prepared partitions before training")
         if cfg.model.latent_dim != data.channels:
             raise ValueError(f"Config latent_dim={cfg.model.latent_dim}, codec cache has {data.channels}")
+        # Defaults: (data, collate, data.costs). Padding/loader negatives change collate and costs.
+        items, train_collate, costs = training_loader(data, cfg.train)
         sampler = BucketBatchSampler(
-            data.costs,
+            costs,
             cfg.train.batch_size,
             rank,
             world,
@@ -275,9 +279,9 @@ def train(args):
         )
         loader_rng = torch.Generator().manual_seed(cfg.train.seed + rank)
         loader = DataLoader(
-            data,
+            items,
             batch_sampler=sampler,
-            collate_fn=collate,
+            collate_fn=train_collate,
             **loader_options(
                 cfg.train.workers,
                 device,

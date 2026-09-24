@@ -1,7 +1,13 @@
 """Training throughput options (speed.py): off they are bit-identical, on they keep the objective."""
 
+import json
+import os
+import random
+import subprocess
+import sys
 import types
 
+import numpy as np
 import pytest
 import torch
 import yaml
@@ -9,13 +15,21 @@ from torch import nn
 from torch.nn import functional as F
 
 from dacvae_tts import model as model_module
-from dacvae_tts.config import ModelConfig
+from dacvae_tts.config import ModelConfig, TrainConfig
 from dacvae_tts.contracts import mask_values
-from dacvae_tts.data import collate
+from dacvae_tts.data import BucketBatchSampler, collate
 from dacvae_tts.model import FlowTTS, ctc_alignment_loss, flow_loss, per_example_mse
-from dacvae_tts.speed import NonfiniteWatch
-from dacvae_tts.text import BYTE_OFFSET
-from dacvae_tts.training import Objective
+from dacvae_tts.speed import (
+    NegativeSeeds,
+    NonfiniteWatch,
+    TrainCollate,
+    corrupt_rows,
+    pad_lengths,
+    padded_costs,
+    training_loader,
+)
+from dacvae_tts.text import BYTE_OFFSET, corrupt_transcript
+from dacvae_tts.training import Objective, load_model
 
 
 def legacy_ctc_alignment_loss(logits, token_valid, tokens, drop):
@@ -238,3 +252,177 @@ def test_deferred_nonfinite_check_stops_before_the_checkpoint(cache, tmp_path, m
         training.train(training_args(config, cache, output))
     assert calls["count"] == 6  # detected at the update-3 checkpoint, not at update 2
     assert not (output / "last.pt").exists()
+
+
+def test_relaxed_step_has_no_python_visible_host_syncs(monkeypatch):
+    """Without value checks and with loader negatives the step never asks the device for a value.
+
+    Counted: truth tests, item/tolist/int/float conversions, copies to the CPU and boolean-mask
+    indexing (which needs the number of selected elements). What remains is inside F.ctc_loss, which
+    copies the length tensors to the host.
+    """
+    model, _ = build()
+    batch = TrainCollate(negatives=True)(
+        [dict(item, negative_seed=f"test:{row}") for row, item in enumerate(items())]
+    )
+    calls = []
+    original_getitem = torch.Tensor.__getitem__
+
+    def counted(name, function):
+        def wrapper(self, *args, **kwargs):
+            calls.append(name)
+            return function(self, *args, **kwargs)
+
+        return wrapper
+
+    def getitem(self, index):
+        parts = index if isinstance(index, tuple) else (index,)
+        if any(isinstance(p, torch.Tensor) and p.dtype == torch.bool for p in parts):
+            calls.append("boolean index")
+        return original_getitem(self, index)
+
+    def run(strict):
+        calls.clear()
+        with monkeypatch.context() as patch:
+            for name in ("__bool__", "item", "tolist", "__int__", "__float__", "cpu"):
+                patch.setattr(torch.Tensor, name, counted(name, getattr(torch.Tensor, name)))
+            patch.setattr(torch.Tensor, "__getitem__", getitem)
+            update(model, batch, strict_checks=strict, grad_checkpoint=True)
+        return list(calls)
+
+    assert run(strict=True)  # the value checks do synchronize
+    assert run(strict=False) == []
+
+
+@pytest.mark.parametrize("patch_size", [1, 2])
+def test_length_padding_keeps_losses(patch_size):
+    model, batch = build("segments", patch_size)
+    padded = pad_lengths(batch, 16, 8)
+    assert padded["latents"].size(1) % 16 == 0 and padded["tokens"].size(1) % 8 == 0
+    assert padded["latents"].size(1) > batch["latents"].size(1)
+    assert padded["tokens"].size(1) > batch["tokens"].size(1)
+    extra = slice(batch["latents"].size(1), None)
+    assert not padded["valid"][:, extra].any() and not padded["prompt_mask"][:, extra].any()
+    assert (padded["tokens"][:, batch["tokens"].size(1) :] == 0).all()
+    time = torch.tensor([0.2, 0.5, 0.9])
+    noise = torch.randn_like(batch["latents"])
+    padded_noise = F.pad(noise, (0, 0, 0, padded["latents"].size(1) - noise.size(1)))
+    model.train()
+    first = flow_loss(model, batch, 0, time, noise, return_details=True)
+    second = flow_loss(model, padded, 0, time, padded_noise, return_details=True)
+    for key in ("flow", "ctc", "prediction_rms"):
+        assert torch.allclose(first[key], second[key], rtol=1e-5, atol=1e-6), key
+    assert (first["ctc"] > 0).all() or patch_size > 1
+    assert torch.equal(first["frames"], second["frames"])
+    duration = model.predict_duration(
+        batch["prompt"], batch["prompt_mask"], batch["tokens"], batch["segments"]
+    )
+    padded_duration = model.predict_duration(
+        padded["prompt"], padded["prompt_mask"], padded["tokens"], padded["segments"]
+    )
+    assert torch.allclose(duration, padded_duration, rtol=1e-5, atol=1e-6)
+
+
+def test_train_collate_pads_and_draws_deterministic_negatives():
+    rows = [dict(item, negative_seed=f"negatives:42:0:{i}") for i, item in enumerate(items())]
+    first, second = TrainCollate(16, 8, True)(rows), TrainCollate(16, 8, True)(rows)
+    plain = collate(rows)
+    assert first.keys() == second.keys() >= {"negative_tokens", "negative_segments", "negative_usable"}
+    for key in first:
+        assert torch.equal(first[key], second[key]), key
+    assert first["negative_tokens"].size(1) % 8 == 0 and first["negative_usable"].all()
+    for i, row in enumerate(rows):
+        expected, expected_segments = corrupt_transcript(
+            plain["tokens"][i], plain["segments"][i], random.Random(row["negative_seed"])
+        )
+        assert torch.equal(first["negative_tokens"][i, : len(expected)], expected)
+        assert torch.equal(first["negative_segments"][i, : len(expected)], expected_segments)
+        assert (first["negative_tokens"][i, len(expected) :] == 0).all()
+    reseeded = TrainCollate(16, 8, True)([dict(r, negative_seed=r["negative_seed"] + "x") for r in rows])
+    assert not torch.equal(reseeded["negative_tokens"], first["negative_tokens"])
+    # The objective takes them from the batch instead of corrupting the transcripts itself.
+    objective = Objective(build()[0], contrastive_weight=0.2)
+    objective.rng = None  # the fallback path would fail without its generator
+    negatives = objective.negatives(first)
+    assert negatives[0] is first["negative_tokens"] and negatives[2] is first["negative_usable"]
+
+
+def test_corrupt_rows_matches_the_objective_fallback():
+    _, batch = build()
+    objective = Objective(build()[0], contrastive_weight=0.2)
+    expected = objective.negatives(batch)
+    shared = random.Random(0)  # Objective's generator, shared by all rows
+    result = corrupt_rows(batch["tokens"], batch["segments"], [shared] * len(batch["tokens"]))
+    for a, b in zip(expected, result):
+        assert torch.equal(a, b)
+
+
+def test_negative_seeds_are_unique_per_epoch_and_row():
+    class Rows:
+        epoch, costs = 7, np.array([3, 4, 5])
+
+        def __len__(self):
+            return 3
+
+        def __getitem__(self, index):
+            return {"index": index}
+
+    wrapped = NegativeSeeds(Rows(), 42)
+    assert len(wrapped) == 3
+    assert wrapped[(3, 1)] == {"index": (3, 1), "negative_seed": "negatives:42:3:1"}
+    assert wrapped[2]["negative_seed"] == "negatives:42:7:2"
+    train = TrainConfig()
+    assert training_loader(Rows(), train)[1] is collate  # defaults: the plain collate
+    train.loader_negatives = True
+    assert training_loader(Rows(), train)[1] is collate  # no contrastive term: nothing to draw
+    train.contrastive_weight, train.pad_multiple = 0.2, 4
+    loader_items, collate_fn, costs = training_loader(Rows(), train)
+    assert isinstance(loader_items, NegativeSeeds) and collate_fn.negatives
+    assert costs.tolist() == [4, 4, 8]
+
+
+def test_padded_costs_bound_the_padded_batch_frames():
+    rng = np.random.default_rng(0)
+    costs = rng.integers(5, 60, 500)
+    assert padded_costs(costs, 1) is costs
+    padded = padded_costs(costs, 16)
+    assert (padded % 16 == 0).all() and (padded >= costs).all() and (padded - costs < 16).all()
+    sampler = BucketBatchSampler(padded, 32, frame_budget=256, bucket_size=128)
+    for batch in sampler.batches():
+        length = max(costs[i] for i in batch)
+        assert len(batch) * (-(-length // 16) * 16) <= 256
+
+
+def test_pad_multiples_are_validated():
+    TrainConfig(pad_multiple=64, text_pad_multiple=32)
+    for options in (dict(pad_multiple=0), dict(text_pad_multiple=True), dict(pad_multiple=2.0)):
+        with pytest.raises(ValueError, match="pad_multiple"):
+            TrainConfig(**options)
+
+
+def test_speed_options_train_and_resume_exactly(cache, tmp_path):
+    """Loader negatives are seeded per item, so unlike the objective's shared generator they survive
+    an interruption; spawned workers exercise the picklable collate and dataset wrapper."""
+    config = speed_config(tmp_path, workers=2, pad_multiple=8, text_pad_multiple=8, loader_negatives=True)
+    base = ["-m", "dacvae_tts", "train", "--config", str(config), "--cache", str(cache), "--device", "cpu"]
+    env = {**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
+    full, resumed = tmp_path / "full", tmp_path / "resumed"
+
+    def run(args):
+        subprocess.run(
+            [sys.executable, *args], check=True, capture_output=True, text=True, timeout=300, env=env
+        )
+
+    run([*base, "--output", str(full)])
+    run([*base, "--output", str(resumed), "--stop-after", "2"])
+    run([*base, "--output", str(resumed), "--resume", str(resumed / "last.pt")])
+    _, a = load_model(full / "last.pt")
+    _, b = load_model(resumed / "last.pt")
+    assert a["step"] == b["step"] == 4
+    for key in a["model"]:
+        assert torch.equal(a["model"][key], b["model"][key]), key
+        assert torch.equal(a["ema"][key], b["ema"][key]), key
+    records = [json.loads(line) for line in (full / "train.jsonl").read_text().splitlines()]
+    assert [r["step"] for r in records if "flow" in r] == [1, 2, 3, 4]
+    assert all(r["contrastive"] >= 0 and np.isfinite(r["loss"]) for r in records if "flow" in r)
+    assert any(r.get("validation_loss") is not None for r in records)

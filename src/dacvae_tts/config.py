@@ -100,6 +100,9 @@ class TrainConfig:
     wandb_project: str = ""  # set (or pass --wandb-project) to mirror the JSONL logs to Weights & Biases
     # Throughput options (speed.py). Every default reproduces the previous training numerics exactly.
     strict_checks: bool = True  # false: skip value checks that stall the host (shapes still checked)
+    pad_multiple: int = 1  # round padded batch frames up to a multiple (masked; bounds compiled shapes)
+    text_pad_multiple: int = 1  # the same for transcript tokens
+    loader_negatives: bool = False  # draw the contrastive text negatives in the loader workers
 
     def __post_init__(self):
         if self.worker_threads < 1 or self.prefetch_factor < 1:
@@ -141,6 +144,9 @@ class TrainConfig:
             raise ValueError("contrastive settings must be nonnegative")
         if self.batch_expansion < 1 or self.keep_every < 0 or self.ctc_weight < 0:
             raise ValueError("batch_expansion must be positive and keep_every nonnegative")
+        multiples = (self.pad_multiple, self.text_pad_multiple)
+        if any(not isinstance(m, int) or isinstance(m, bool) or m < 1 for m in multiples):
+            raise ValueError("pad_multiple and text_pad_multiple must be positive integers")
 
 
 @dataclass
