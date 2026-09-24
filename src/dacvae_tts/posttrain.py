@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from .codec import backend_options, check_compatibility
 from .data import LatentDataset, collate, jsonl, move_batch
 from .inference import Synthesizer
-from .model import flow_loss, per_example_mse, sample
+from .model import flow_loss, per_example_mse, sample, to_velocity
 from .optim import build_optimizer
 from .parallel import loader_options
 from .training import Objective, atomic_save, autocast, distributed_device, load_model
@@ -323,7 +323,10 @@ class DistillObjective(nn.Module):
             t0, t1 = obj["times"][index : index + 2].to(device)
             start, end = obj["states"][index : index + 2].to(device)
             condition = move_batch(obj["condition"], device)
-            prediction = self.model(start[None], t0[None], **condition)
+            # The target is the teacher's average velocity over the interval; an EDM model outputs the
+            # preconditioned F, so map it to a velocity exactly as the sampler does before regressing.
+            output = self.model(start[None], t0[None], **condition)
+            prediction = to_velocity(self.model, output, start[None], t0[None])
             target = (end - start) / (t1 - t0)
             mask = condition["valid"] & ~condition["prompt_mask"]
             losses.append(per_example_mse(prediction, target[None], mask).mean())

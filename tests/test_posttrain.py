@@ -34,6 +34,28 @@ def test_preference_and_distill_backward(cache):
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
 
 
+def test_distill_regresses_the_velocity_of_an_edm_model(cache):
+    # EDM models output the preconditioned F, not the velocity the trajectory target is built from: the
+    # teacher's own unguided trajectory must score ~0 at every step (raw F scored 0.92/0.77/0.25/0.08).
+    data = LatentDataset(cache)
+    batch = collate([data[0], data[1]])
+    model = FlowTTS(ModelConfig(latent_dim=4, width=16, depth=1, heads=2, text_depth=1, prediction="edm"))
+    torch.nn.init.normal_(model.output[-1].weight, std=0.05)  # zero init would make F trivially 0
+    model.eval()
+    condition = {k: v[:1] for k, v in batch.items() if k != "latents"}
+    _, times, states = sample(model, **condition, steps=4, guidance=1.0, return_trajectory=True)
+    objective = DistillObjective(model, replay_weight=0.0)
+    for index in range(len(times) - 1):
+        # A two-state trajectory pins the scored step, which is otherwise drawn at random.
+        obj = {
+            "times": times[index : index + 2].clone(),
+            "states": states[index : index + 2, 0].clone(),
+            "condition": {k: v.clone() for k, v in condition.items()},
+        }
+        with torch.no_grad():
+            assert objective([obj], batch).item() < 1e-10
+
+
 def test_preference_and_distill_cli(cache, tmp_path):
     import os
     import subprocess
