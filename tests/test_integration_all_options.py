@@ -431,3 +431,245 @@ def test_grpo_optimizes_a_dropout_checkpoint_on_policy(cache, tmp_path, monkeypa
     records = [json.loads(line) for line in (tmp_path / "grpo" / "grpo-log.jsonl").read_text().splitlines()]
     steps = [record for record in records if "reward" in record and record.get("optimizer_steps")]
     assert steps and all(r["clip_fraction"] == 0 and abs(r["approx_kl"]) < 1e-6 for r in steps)
+
+
+# ------------------------------------------------------------------------------------------------------------
+# (a) Every option off: the model, the configuration and the objective of main (8f01f08).
+
+# The configuration fields of main 8f01f08: checkpoints written there carry exactly these keys.
+MAIN_MODEL_FIELDS = (
+    "latent_dim", "width", "depth", "heads", "text_depth", "patch_size", "ff_mult", "cond_dropout",
+    "reference_encoder", "reference_pooling", "reference_paths", "duration_features", "positions", "qk_norm",
+    "text_attention", "prediction", "text_layout", "duration", "ctc_layer", "adaln_rank",
+)
+MAIN_TRAIN_FIELDS = (
+    "steps", "batch_size", "accumulation", "learning_rate", "warmup", "weight_decay", "optimizer", "muon_momentum",
+    "ema_decay", "precision", "workers", "worker_threads", "prefetch_factor", "loader_start_method", "cuda_prefetch",
+    "checkpoint_every", "validate_every", "log_every", "grad_checkpoint", "compile", "seed", "flow_reduction",
+    "duration_weight", "speaker_balance", "diagnostics_every", "pairing", "prompt_fraction_min",
+    "prompt_fraction_max", "prompt_dropout", "time_sampling", "batch_expansion", "keep_every", "ctc_weight",
+    "contrastive_weight", "contrastive_margin", "wandb_project",
+)
+# Every model option added by the branches, explicitly off (#9 block options, #11, #10, #14).
+MODEL_OFF = dict(
+    long_skip=False, value_residual=False, ffn_conv_kernel=0, attn_gate="none", ffn_activation="gelu",
+    final_adaln=False, cond_text_pool=False, ctc_targets="bytes", repa_layer=0, repa_dim=0, tla_layers=(),
+    tla_dim=0, tla_hidden=256, dropout=0.0,
+)
+# Every training option added by the branches, explicitly off (#7, #8, #11, #10, #14).
+TRAIN_OFF = dict(
+    strict_checks=True, pad_multiple=1, text_pad_multiple=1, loader_negatives=False, compile_dynamic="batch",
+    contrastive_mode="text_hinge", contrastive_random_weight=0.2, contrastive_aug_weight=0.2,
+    contrastive_span_min=3, contrastive_span_max=125, contrastive_repeat_coverage=(0.2, 0.4),
+    contrastive_skip_coverage=(0.4, 0.8), contrastive_negative_cap=0.0, cross_prompt_prob=0.0,
+    cross_prompt_max_utterances=3, cross_prompt_max_seconds=12.0, long_prompt_prob=0.0,
+    prompt_fraction_long_max=0.85, tail_silence_prob=0.0, tail_silence_max_seconds=0.8, prompt_cut="random",
+    teacher_features="", repa_weight=0.0, repa_stop_step=0, repa_frames="all", speaker_embeddings="",
+    tla_weight=0.0, tla_entropy=0.01, lr_schedule="cosine", decay_fraction=0.2, decay_shape="1-sqrt",
+    min_lr_ratio=0.1, decay_cache=None, final_time_sampling=None, final_time_sampling_start="decay",
+    ema_decays=[], model_guidance_weight=0.0,
+)
+
+
+def test_new_options_are_exactly_the_listed_ones_and_default_off():
+    """The integrated configuration is main's plus the branch options above, all of which default to off,
+    so a main checkpoint's configuration loads, resumes (config equality) and warm starts unchanged."""
+    import dataclasses
+
+    from dacvae_tts.config import Config
+
+    model_fields = {f.name for f in dataclasses.fields(ModelConfig)}
+    train_fields = {f.name for f in dataclasses.fields(TrainConfig)}
+    assert model_fields == set(MAIN_MODEL_FIELDS) | set(MODEL_OFF)
+    assert train_fields == set(MAIN_TRAIN_FIELDS) | set(TRAIN_OFF)
+    assert ModelConfig(**MODEL_OFF) == ModelConfig() and TrainConfig(**TRAIN_OFF) == TrainConfig()
+    defaults = Config().to_dict()
+    old = {
+        "model": {key: defaults["model"][key] for key in MAIN_MODEL_FIELDS},
+        "train": {key: defaults["train"][key] for key in MAIN_TRAIN_FIELDS},
+    }
+    assert Config.from_dict(old) == Config() and Config.from_dict(old).to_dict() == defaults
+
+
+def test_all_options_off_is_the_main_model():
+    """Reuses test_block_options' pins captured on 8f01f08 (state_dict layout hash and an RNG-free forward
+    fingerprint) with every option of every branch explicitly off."""
+    import pytest
+    from test_block_options import PREVIOUS, fingerprint, layout_hash
+
+    for overrides, keys, layout, expected in PREVIOUS:
+        model = FlowTTS(ModelConfig(**overrides, **MODEL_OFF))
+        assert len(model.state_dict()) == keys and layout_hash(model) == layout
+        assert fingerprint(model) == pytest.approx(expected, rel=1e-5, abs=1e-5)
+
+
+def test_all_options_off_objective_is_the_main_objective():
+    """Objective built with every branch argument at its off value (as train() builds it) equals the verbatim
+    main 8f01f08 Objective.forward kept by test_latent_negatives, outputs and gradients, bit for bit."""
+    from test_latent_negatives import NANO, batch_of, legacy_forward, randomized
+
+    model = randomized(FlowTTS(ModelConfig(**NANO, **MODEL_OFF))).train()
+    batch = batch_of("joined")
+    options = dict(
+        expansion=2, ctc_weight=0.1, contrastive_weight=0.2, contrastive_margin=0.1, contrastive_mode="text_hinge",
+        random_weight=0.2, aug_weight=0.2, span=(3, 125), repeat_coverage=(0.2, 0.4), skip_coverage=(0.4, 0.8),
+        negative_cap=0.0, silence=None, repa_weight=0.0, repa_frames="all", tla_weight=0.0, tla_entropy=0.01,
+        guidance_weight=0.0,
+    )
+    results = []
+    for build in (lambda: legacy_forward(Objective(model, **options).train(), batch),
+                  lambda: Objective(model, **options).train()(batch)):
+        model.zero_grad(set_to_none=True)
+        torch.manual_seed(11)
+        losses = build()
+        (losses["loss"].sum() + 0.2 * losses["contrastive"].sum() + 0.1 * losses["ctc"].sum()).backward()
+        results.append((losses, {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}))
+    (reference, reference_grads), (losses, grads) = results
+    assert losses.keys() == reference.keys() and grads.keys() == reference_grads.keys()
+    for key in reference:
+        assert torch.equal(losses[key], reference[key]), key
+    for key in reference_grads:
+        assert torch.equal(grads[key], reference_grads[key]), key
+
+
+# ------------------------------------------------------------------------------------------------------------
+# (b) A broad, compatible combination of the options of every branch, through the objective and through train().
+
+COMBINED_MODEL = dict(
+    latent_dim=4, width=32, heads=2, depth=3, text_depth=1, text_attention=1, positions="rope", qk_norm=True,
+    prediction="edm", text_layout="joined", duration="rule", ctc_layer=1, adaln_rank=8,
+    long_skip=True, value_residual=True, ffn_conv_kernel=3, attn_gate="head", ffn_activation="swiglu",
+    final_adaln=True, cond_text_pool=True,                                   # #9
+    ctc_targets="chars",                                                      # #11
+    repa_layer=3, repa_dim=3, tla_layers="all", tla_dim=3, tla_hidden=8,     # #10 (fake stores: 3-d)
+    dropout=0.1,                                                              # #14
+)
+COMBINED_PAIRS = dict(cross_prompt_prob=0.5, cross_prompt_max_seconds=0.5, long_prompt_prob=0.3,
+                      tail_silence_prob=0.5, prompt_cut="quiet")             # #11
+
+
+def test_every_enabled_head_receives_gradients(cache):
+    """One objective step with #9 block options, #10 REPA + TLA-SA, #11 char CTC and pair data, #8 latent_delta,
+    #14 dropout and model guidance, and #7 padding/selective checkpointing: finite, and every parameter (the
+    zero-init ones randomized, as after some training) gets a nonzero gradient."""
+    from dacvae_tts.speed import TrainCollate
+
+    write_silence(cache)
+    # The fixture's 7-11 frame utterances are shorter than their 15-letter CTC targets; up to 1 s of tail silence
+    # makes most rows CTC-feasible, so the character head receives a gradient.
+    pairs = dict(COMBINED_PAIRS, tail_silence_prob=1.0, tail_silence_max_seconds=1.0)
+    data = teacher_dataset(cache, ctc_targets="chars", **pairs)
+    batch = TrainCollate(8, 8)([data[(0, index)] for index in range(6)])
+    assert {"teacher", "teacher_valid", "speaker_embedding", "ctc_targets"} <= batch.keys()
+    torch.manual_seed(0)
+    model = FlowTTS(ModelConfig(**COMBINED_MODEL))
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if not parameter.abs().sum():
+                parameter.normal_(0, 0.05)
+            if name.endswith("value_mix"):
+                parameter.copy_(torch.tensor([0.8, 0.3]))
+    model.grad_checkpoint, model.strict_checks = "selective", False
+    objective = Objective(model, expansion=2, ctc_weight=0.1, contrastive_mode="latent_delta", silence=data.silence,
+                          repa_weight=1.0, tla_weight=0.5, guidance_weight=0.5).train()
+    torch.manual_seed(1)
+    losses = objective(batch)
+    for key in ("flow", "ctc", "latent_delta", "negative_random", "negative_aug", "repa", "tla", "tla_entropy"):
+        assert torch.isfinite(losses[key]).all() and losses[key].abs().sum() > 0, key
+    total = losses["loss"].mean() + objective.auxiliary(losses).mean() + losses["latent_delta"].mean()
+    total.backward()
+    silent = [name for name, p in model.named_parameters() if p.grad is None or not p.grad.abs().sum() > 0]
+    assert not silent, silent
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+def test_combined_options_train_end_to_end(cache, tmp_path):
+    """train() on CPU with the options of every training-side branch at once, including the WSD decay switch
+    to a second cache: finite logs with every term, validation of both EMA tracks, and checkpoints that hold the
+    teacher heads and the extra EMA track and reload."""
+    import json
+    import math
+    import shutil
+    import types
+
+    import yaml
+    from test_teacher import build_stores
+
+    from dacvae_tts import training
+    from dacvae_tts.training import load_model
+
+    write_silence(cache)
+    build_stores(cache)
+    decay = tmp_path / "decay"
+    shutil.copytree(cache, decay)  # the decay cache brings its own silence.pt and teacher stores
+    train = dict(
+        steps=4, warmup=1, batch_size=2, accumulation=2, workers=0, precision="fp32", log_every=1,
+        checkpoint_every=2, validate_every=2, diagnostics_every=2, pairing="within", prompt_dropout=0.2,
+        time_sampling="logit_normal", batch_expansion=2, ctc_weight=0.1, contrastive_weight=0.2,
+        strict_checks=False, pad_multiple=8, text_pad_multiple=8, loader_negatives=True,
+        grad_checkpoint="selective",                                                             # #7
+        contrastive_mode="latent_delta",                                                         # #8
+        **COMBINED_PAIRS,                                                                        # #11
+        teacher_features="teacher/frames", repa_weight=1.0, speaker_embeddings="teacher/speakers",
+        tla_weight=0.5,                                                                          # #10
+        lr_schedule="wsd", decay_fraction=0.5, min_lr_ratio=0.0, decay_cache=str(decay),
+        final_time_sampling="uniform", ema_decays=[0.9, 0.5],                                   # #14
+    )
+    config = tmp_path / "combined.yaml"
+    config.write_text(yaml.safe_dump({"model": dict(COMBINED_MODEL, tla_layers="all"), "train": train}))
+    names = "steps batch_size accumulation workers precision learning_rate optimizer worker_threads".split()
+    names += "prefetch_factor loader_start_method cuda_prefetch compile stop_after init_from resume".split()
+    args = types.SimpleNamespace(**dict.fromkeys(names), config=str(config), cache=str(cache),
+                                 output=str(tmp_path / "run"), device="cpu", frame_budget=0, no_validation=False)
+    training.train(args)
+
+    records = [json.loads(line) for line in (tmp_path / "run" / "train.jsonl").read_text().splitlines()]
+    steps = [r for r in records if "flow" in r]
+    assert [r["step"] for r in steps] == [1, 2, 3, 4]
+    for record in steps:
+        for key in ("loss", "flow", "ctc", "latent_delta", "negative_random", "repa", "tla", "tla_entropy"):
+            assert math.isfinite(record[key]), (record["step"], key)
+        assert record["repa"] > 0 and record["tla"] > 0 and record["latent_delta"] < 0
+    assert steps[-1]["lr"] < steps[1]["lr"]  # WSD decay over the last half
+    validations = [r for r in records if "validation_loss" in r]
+    assert [r["step"] for r in validations] == [2, 4]
+    assert all("ema_0_9/validation_flow" in r and "ema_0_5/validation_flow" in r for r in validations)
+    assert all(math.isfinite(r["validation_flow"]) for r in validations)
+    model, saved = load_model(tmp_path / "run" / "last.pt", ema=0.9)
+    assert {"ema_0.9", "ema_0.5"} <= saved.keys() and saved["step"] == 4
+    assert any(k.startswith("repa.") for k in saved["model"]) and any(k.startswith("tla.") for k in saved["ema"])
+    assert model.cfg.ctc_targets == "chars" and model.cfg.dropout == 0.1
+
+
+def test_combined_experiment_config():
+    """configs/experiments/tr_w512_combined.yaml is run C plus the evidence-backed options only: the #9 block
+    options and #14's dropout/model guidance stay at their off values."""
+    from pathlib import Path
+
+    import yaml
+
+    from dacvae_tts.config import Config
+
+    configs = Path(__file__).resolve().parents[1] / "configs"
+    combined = Config.load(configs / "experiments" / "tr_w512_combined.yaml")
+    base = Config.load(configs / "nano_tr_w512.yaml")
+    changed = {
+        (section, key)
+        for section in ("model", "train")
+        for key, value in combined.to_dict()[section].items()
+        if base.to_dict()[section][key] != value
+    }
+    assert changed == {
+        ("model", key) for key in ("ctc_targets", "repa_layer", "repa_dim", "tla_layers", "tla_dim")
+    } | {
+        ("train", key) for key in (
+            "grad_checkpoint", "compile", "strict_checks", "pad_multiple", "text_pad_multiple", "loader_negatives",
+            "contrastive_mode", "cross_prompt_prob", "long_prompt_prob", "tail_silence_prob", "prompt_cut",
+            "teacher_features", "repa_weight", "speaker_embeddings", "tla_weight", "lr_schedule", "min_lr_ratio",
+            "final_time_sampling", "ema_decays",
+        )
+    }
+    raw = yaml.safe_load((configs / "experiments" / "tr_w512_combined.yaml").read_text())
+    assert not set(raw["model"]) & {"long_skip", "value_residual", "ffn_conv_kernel", "attn_gate", "ffn_activation",
+                                    "final_adaln", "cond_text_pool", "dropout"}
+    assert "model_guidance_weight" not in raw["train"] and "decay_cache" not in raw["train"]
