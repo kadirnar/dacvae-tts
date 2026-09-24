@@ -26,6 +26,8 @@ class ModelConfig:
     duration: str = "head"
     ctc_layer: int = 0
     adaln_rank: int = 0  # 0: one D->9D modulation per block; r>0: shared modulation + rank-r per block
+    # DiT block options (issue #9), all off by default: off, the model and its state_dict are unchanged.
+    long_skip: bool = False  # input embedding -> output head skip, h_L + Linear0(LN([h_0, h_L])); +~2D^2
 
     def __post_init__(self):
         if min(self.latent_dim, self.width, self.depth, self.heads, self.patch_size) < 1:

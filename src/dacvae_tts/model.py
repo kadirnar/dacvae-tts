@@ -201,6 +201,16 @@ class FlowTTS(nn.Module):
         # Auxiliary CTC head on intermediate frames (A-DMA, arXiv:2505.19595): training only. It makes
         # the generator route every transcript byte to its frames early, i.e. learn the alignment.
         self.ctc = nn.Linear(d, VOCAB_SIZE) if cfg.ctc_layer else None
+        # Input -> output long skip: the input embedding re-enters just before the output head, fused with the
+        # last block by LN + Linear over [h_0, h_L] (the pre-norm matches their scales; the head's LayerNorm
+        # then normalizes the sum, Hunyuan-DiT's fix for loss spikes after skip fusion). DiTTo, a
+        # cross-attention DiT like this one: WER 3.30 -> 2.93, SIM 0.573 -> 0.588; EzAudio: faster
+        # convergence. Counter-evidence is in-context only (F5 4.17 -> 5.17). Zero-init: starts as baseline.
+        self.skip = None
+        if cfg.long_skip:
+            self.skip = nn.Sequential(nn.LayerNorm(2 * d), nn.Linear(2 * d, d))
+            nn.init.zeros_(self.skip[-1].weight)
+            nn.init.zeros_(self.skip[-1].bias)
         self.grad_checkpoint = False
 
     def reference_summary(self, prompt, prompt_mask):
@@ -315,6 +325,7 @@ class FlowTTS(nn.Module):
         cond = time_embedding + voice
         shared = self.ada_shared(cond) if self.ada_shared is not None else None
         ctc_logits = None
+        first = h  # input embedding h_0, for the optional long skip
         for number, block in enumerate(self.blocks, 1):
             args = (h, text, packed_valid, text_valid, cond, *angles, shared)
             h = (
@@ -324,6 +335,8 @@ class FlowTTS(nn.Module):
             )
             if return_ctc and number == self.cfg.ctc_layer:
                 ctc_logits = self.ctc(h)
+        if self.skip is not None:
+            h = h + self.skip(torch.cat([first, h], -1))
         output = self.output(h)
         expected_packs = (length + pad) // p
         if output.shape != (b, expected_packs, channels * p):
