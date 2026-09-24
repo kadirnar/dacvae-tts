@@ -7,6 +7,7 @@ import random
 import subprocess
 import sys
 import types
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -34,6 +35,7 @@ from dacvae_tts.speed import (
 from dacvae_tts.text import BYTE_OFFSET, corrupt_transcript
 from dacvae_tts.training import Objective, load_model
 
+ROOT = Path(__file__).resolve().parents[1]
 SPEED_OPTIONS = {
     "grad_checkpoint",
     "compile",
@@ -540,3 +542,89 @@ def test_blocks_compiler_failure_falls_back_to_eager(cache, tmp_path, monkeypatc
     assert saved["step"] == 4 and calls["count"] == 2  # compiled blocks abandoned after the failure
     assert Config.from_dict(saved["config"]).train.compile == "blocks"
     assert any("activation checkpointing" in line for line in capsys.readouterr().out.splitlines())
+
+
+def test_fast_recipe_only_changes_speed_options():
+    base, fast = (
+        Config.load(ROOT / "configs/nano_tr_w512.yaml"),
+        Config.load(ROOT / "configs/nano_tr_w512_fast.yaml"),
+    )
+    assert base.model == fast.model
+    changed = {k for k, v in dataclasses.asdict(fast.train).items() if getattr(base.train, k) != v}
+    assert changed == SPEED_OPTIONS - {"compile_dynamic"}
+    assert fast.train.grad_checkpoint == "selective" and fast.train.compile == "blocks"
+
+
+def test_benchmark_script_cpu_smoke(tmp_path):
+    config = tmp_path / "tiny.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "model": dict(
+                    latent_dim=8,
+                    width=16,
+                    depth=2,
+                    heads=2,
+                    text_depth=1,
+                    text_layout="joined",
+                    duration="rule",
+                    ctc_layer=1,
+                ),
+                "train": dict(
+                    batch_size=8,
+                    precision="fp32",
+                    grad_checkpoint=True,
+                    pairing="within",
+                    batch_expansion=2,
+                    ctc_weight=0.1,
+                    contrastive_weight=0.2,
+                ),
+            }
+        )
+    )
+    output = tmp_path / "bench.jsonl"
+    command = [
+        sys.executable,
+        str(ROOT / "scripts/benchmark_train_step.py"),
+        "--config",
+        str(config),
+        "--device",
+        "cpu",
+        "--frames",
+        "20",
+        "40",
+        "--text",
+        "10",
+        "30",
+        "--frame-budget",
+        "300",
+        "--pool",
+        "64",
+        "--batches",
+        "2",
+        "--warmup",
+        "0",
+        "--steps",
+        "1",
+        "--repeats",
+        "1",
+        "--variants",
+        "baseline,loader_negatives,selective,every2",
+        "--set",
+        "custom:strict_checks=false,grad_checkpoint=false",
+        "--output",
+        str(output),
+    ]
+    subprocess.run(command, check=True, capture_output=True, text=True, timeout=300)
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [r["variant"] for r in records] == [
+        "baseline",
+        "loader_negatives",
+        "selective",
+        "every2",
+        "custom",
+    ]
+    for record in records:
+        assert "error" not in record, record
+        assert record["step_seconds"] > 0 and record["frames_per_second"] > 0
+    assert records[0]["padding_fraction"] < records[1]["padding_fraction"]  # pad multiples 64/32
