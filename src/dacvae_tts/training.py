@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import sqlite3
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -405,12 +406,34 @@ def training_batches(data, cfg, rank, world, frame_budget, device):
     return sampler, loader
 
 
+def check_held_out(decay_index, main_index):
+    """No training row of the decay cache may be a val/test row or speaker of the main cache.
+
+    Each cache is split on its own when merged: a main cache split by voice clusters (--split-map) or split
+    keys and a decay cache merged with plain label hashing or another seed would otherwise train on the
+    main cache's held-out voices during the decay, and validation (on the main cache) would score them.
+    """
+    uids, speakers = set(), set()
+    with sqlite3.connect(main_index) as db:
+        for uid, speaker in db.execute("SELECT uid, speaker FROM samples WHERE split != 'train'"):
+            uids.add(uid)
+            speakers.add(speaker)
+    with sqlite3.connect(decay_index) as db:
+        for uid, speaker in db.execute("SELECT uid, speaker FROM samples WHERE split = 'train'"):
+            if uid in uids or speaker in speakers:
+                raise ValueError(
+                    f"Decay-cache training row {uid} (speaker {speaker}) is held out (val/test) in the main "
+                    "cache; merge both caches with the same --split-map/--split-key and seed"
+                )
+
+
 def decay_phase_loader(cache, reference, cfg, rank, world, frame_budget, device):
     """Sampler and loader over the WSD decay cache, built exactly like the main training loader (the same
     pair, teacher and throughput options; see `training_dataset` and `training_batches`).
 
     Latents are normalized with the main cache's statistics, so the latent space does not shift at the
-    switch and the checkpoint's mean/std stay valid for inference; the codec metadata must match. The
+    switch and the checkpoint's mean/std stay valid for inference; the codec metadata and the text
+    normalization must match, and no decay-cache training row may be held out in the main cache. The
     encoded-silence frame of tail silence / quiet cuts (#11) is re-standardized with the same statistics.
     Teacher stores given as relative paths are looked up in the decay cache, which needs its own
     extraction (or absolute store paths covering its rows).
@@ -419,6 +442,10 @@ def decay_phase_loader(cache, reference, cfg, rank, world, frame_budget, device)
     if not data.meta.get("merged"):
         raise ValueError("Run merge on the decay cache before training")
     check_compatibility(data.meta, reference.meta)
+    normalization = [meta.get("text_normalization", "unicode-v1") for meta in (data.meta, reference.meta)]
+    if normalization[0] != normalization[1]:
+        raise ValueError("The decay cache has a different text_normalization than the main cache")
+    check_held_out(data.db_path, reference.db_path)
     if data.channels != reference.channels:
         raise ValueError("The decay cache has a different latent width")
     data.mean, data.std = reference.mean, reference.std

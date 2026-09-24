@@ -204,6 +204,36 @@ def test_decay_loader_checks_the_codec_and_keeps_the_main_normalization(cache, d
         decay_phase_loader(str(decay_cache), main, cfg, 0, 1, 0, torch.device("cpu"))
 
 
+@pytest.mark.parametrize(
+    "leak",
+    [
+        # Split on its own (plain label hashing, another seed): a whole held-out speaker becomes training data.
+        "UPDATE samples SET split='train' WHERE speaker='val-1'",
+        # Rows the main cache does not have, of a speaker it holds out (e.g. other clips of that voice).
+        "UPDATE samples SET uid='hq-' || uid, split='train' WHERE speaker='test-2'",
+    ],
+    ids=["resplit_speaker", "held_out_voice"],
+)
+def test_decay_loader_rejects_the_main_caches_held_out_rows(cache, decay_cache, tmp_path, leak):
+    cfg = Config.from_dict(yaml.safe_load(config_file(tmp_path, lr_schedule="wsd").read_text()))
+    main = LatentDataset(cache, "train")
+    with sqlite3.connect(decay_cache / "index.sqlite") as db:
+        db.execute(leak)
+    with pytest.raises(ValueError, match="held out"):
+        decay_phase_loader(str(decay_cache), main, cfg, 0, 1, 0, torch.device("cpu"))
+
+
+def test_decay_loader_requires_the_main_text_normalization(cache, decay_cache, tmp_path):
+    cfg = Config.from_dict(yaml.safe_load(config_file(tmp_path, lr_schedule="wsd").read_text()))
+    main = LatentDataset(cache, "train")
+    meta = json.loads((decay_cache / "metadata.json").read_text())
+    (decay_cache / "metadata.json").write_text(json.dumps({**meta, "text_normalization": "unicode-v1"}))
+    decay_phase_loader(str(decay_cache), main, cfg, 0, 1, 0, torch.device("cpu"))  # the implicit default
+    (decay_cache / "metadata.json").write_text(json.dumps({**meta, "text_normalization": "turkish-v2"}))
+    with pytest.raises(ValueError, match="text_normalization"):
+        decay_phase_loader(str(decay_cache), main, cfg, 0, 1, 0, torch.device("cpu"))
+
+
 def test_options_resume_exactly_across_the_decay_switch(cache, decay_cache, tmp_path, monkeypatch):
     """WSD + decay cache + uniform-t cooldown + dropout + an EMA track + model guidance, interrupted before,
     exactly at and after the decay start (update 3 of 6), must equal the uninterrupted run."""
