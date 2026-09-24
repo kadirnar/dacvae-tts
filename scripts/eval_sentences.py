@@ -45,7 +45,13 @@ from dacvae_tts.eval_protocol import (  # noqa: E402
     utmos_models,
 )
 from dacvae_tts.inference import OUTPUT_OPTIONS, WINDOW_OPTIONS, Synthesizer, VoiceReference  # noqa: E402
-from dacvae_tts.metrics import Evaluator, row_identity, summarize  # noqa: E402
+from dacvae_tts.metrics import (  # noqa: E402
+    METRIC_NORMALIZATIONS,
+    Evaluator,
+    default_metric_normalization,
+    row_identity,
+    summarize,
+)
 from dacvae_tts.quality import (  # noqa: E402
     METRIC_FAMILY,
     CandidateScorer,
@@ -183,8 +189,9 @@ def score_hf(rows, out, args, protocol=None, originals=None):
     evaluator.speaker = AutoModelForAudioXVector.from_pretrained(args.speaker_model).to(device).eval()
     dnsmos = DNSMOS(args.dnsmos) if args.dnsmos else None
     scorer = ProtocolScorer(protocol, device, dnsmos) if protocol is not None else None
+    normalization = args.metric_normalization or default_metric_normalization(args.language)
     identity = row_identity({  # the same compact identity the faster-whisper rows carry
-        "asr_backend": "hf-greedy", "asr_model": name, "language": args.language, "metric_normalization": "turkish-v1",
+        "asr_backend": "hf-greedy", "asr_model": name, "language": args.language, "metric_normalization": normalization,
         "decoding": {"num_beams": 1, "max_new_tokens": 220}, "compute_type": "float16", "device": str(device),
         "speaker_model": args.speaker_model, "protocol_options": scorer.identity["options"] if scorer else None,
     })
@@ -207,7 +214,7 @@ def score_hf(rows, out, args, protocol=None, originals=None):
             continue
         audio = audios[r["audio"]]
         try:
-            counts = error_counts(r["text"], hypotheses[r["audio"]], "turkish-v1")
+            counts = error_counts(r["text"], hypotheses[r["audio"]], normalization)
         except ValueError as error:
             scored.append({**r, "error": str(error)})
             continue
@@ -221,7 +228,7 @@ def score_hf(rows, out, args, protocol=None, originals=None):
         if scorer is not None:
             original = originals(r["prompt"]) if originals else None
             record.update(asr_inputs[r["audio"]][1])
-            record.update(scorer.score(r["audio"], audio, r["text"], hypotheses[r["audio"]], "turkish-v1",
+            record.update(scorer.score(r["audio"], audio, r["text"], hypotheses[r["audio"]], normalization,
                                        original, out / r["prompt"]))
             if original:
                 record["prompt_original"] = str(original)
@@ -276,6 +283,11 @@ def main():
         help="Speaker model of --select-by sim; must differ from the SIM judge --speaker-model (arXiv 2607.08256)")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--language", default="tr")
+    parser.add_argument(
+        "--metric-normalization", choices=METRIC_NORMALIZATIONS,
+        help="WER/CER text normalization of both --asr-backend paths (default: turkish-v1 for --language tr, else "
+             "english-unicode-v2)",
+    )
     parser.add_argument("--asr-model", default="large-v3")
     parser.add_argument("--asr-device", default="cuda")
     parser.add_argument("--dnsmos")
@@ -392,8 +404,8 @@ def main():
     if args.asr_backend == "hf":
         scored, protocol_identity = score_hf(rows, out, args, protocol, originals)
     else:
-        evaluator = Evaluator(args.asr_model, args.dnsmos, args.speaker_model, args.asr_device, language=args.language,
-                              protocol=protocol)
+        evaluator = Evaluator(args.asr_model, args.dnsmos, args.speaker_model, args.asr_device,
+                              metric_normalization=args.metric_normalization, language=args.language, protocol=protocol)
         protocol_identity = evaluator.identity.get("protocol")
         scored = []
         for row in rows:
@@ -421,6 +433,7 @@ def main():
         checkpoint=args.checkpoint, steps=args.steps, guidance=args.guidance, guidance_until=args.guidance_until,
         noise_scale=args.noise_scale, sway=args.sway, duration_scale=args.duration_scale, asr_model=args.asr_model,
         asr_backend=args.asr_backend, chars_per_second=args.chars_per_second, duration_mode=args.duration_mode,
+        metric_normalization=args.metric_normalization or default_metric_normalization(args.language),
         candidates=args.candidates, selector=args.selector if args.candidates > 1 else None, **sampler,
         selection_changed=sum(r.get("selected", 0) != 0 for r in good) if args.candidates > 1 else None,
         select_by=args.select_by if args.candidates > 1 else None, selection_judge_overlap=selection_bias,

@@ -14,6 +14,13 @@ from .codec import file_digest, read_audio
 from .data import jsonl
 from .eval_protocol import WHISPER_V1
 
+METRIC_NORMALIZATIONS = ("english-unicode-v2", "legacy-ascii-v1", "turkish-v1", "turkish-v2")
+
+
+def default_metric_normalization(language):
+    """Turkish needs its own case folding (İ/ı) and number spelling; other languages keep the old default."""
+    return "turkish-v1" if language == "tr" else "english-unicode-v2"
+
 
 def metric_text(text, version="english-unicode-v2"):
     if version == "turkish-v1":
@@ -166,8 +173,7 @@ class Evaluator:
         protocol-v2 extras; see dacvae_tts.eval_protocol."""
         self.language = language
         if metric_normalization is None:
-            # Turkish needs its own case folding (İ/ı) and number spelling; English keeps the old default.
-            metric_normalization = "turkish-v1" if language == "tr" else "english-unicode-v2"
+            metric_normalization = default_metric_normalization(language)
         from faster_whisper import WhisperModel
 
         compute_type = "float16" if device == "cuda" else "int8"

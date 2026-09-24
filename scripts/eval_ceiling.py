@@ -25,7 +25,7 @@ from monitor import select_cases  # noqa: E402
 from dacvae_tts.codec import Codec  # noqa: E402
 from dacvae_tts.data import load_stats  # noqa: E402
 from dacvae_tts.eval_protocol import add_protocol_args, protocol_from_args  # noqa: E402
-from dacvae_tts.metrics import Evaluator, summarize  # noqa: E402
+from dacvae_tts.metrics import METRIC_NORMALIZATIONS, Evaluator, summarize  # noqa: E402
 
 
 def main():
@@ -35,6 +35,10 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", required=True)
     parser.add_argument("--language", default="tr")
+    parser.add_argument(
+        "--metric-normalization", choices=METRIC_NORMALIZATIONS,
+        help="WER/CER text normalization (default: turkish-v1 for --language tr, else english-unicode-v2)",
+    )
     parser.add_argument("--asr-model", default="large-v3")
     parser.add_argument("--asr-device", default="cuda")
     parser.add_argument("--dnsmos")
@@ -55,8 +59,8 @@ def main():
     stats = load_stats(args.cache)
     mean, std = stats["mean"].to(args.device), stats["std"].to(args.device)
     codec = Codec(meta["checkpoint"], args.device, loudness=meta.get("loudness_lufs"))
-    evaluator = Evaluator(args.asr_model, args.dnsmos, "microsoft/wavlm-base-plus-sv", args.asr_device, language=args.language,
-                          protocol=protocol)
+    evaluator = Evaluator(args.asr_model, args.dnsmos, "microsoft/wavlm-base-plus-sv", args.asr_device,
+                          metric_normalization=args.metric_normalization, language=args.language, protocol=protocol)
 
     def original(uid):
         path = Path(args.prompt_audio) / (uid.replace("/", "_").replace(":", "_") + ".wav") if args.prompt_audio else None
@@ -83,6 +87,7 @@ def main():
     (out / "results.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
     summary = summarize(rows)
     summary["per_case_wer_median"] = float(np.median([r["wer"] for r in rows]))
+    summary["metric_normalization"] = evaluator.metric_normalization
     if protocol is not None:
         summary.update(protocol=evaluator.identity["protocol"], audio="original" if args.real_audio else "codec")
     (out / "summary.json").write_text(json.dumps(summary, indent=2))

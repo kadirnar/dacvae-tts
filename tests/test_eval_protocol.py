@@ -415,3 +415,113 @@ def test_eval_sentences_rescore_with_protocol(fake_whisper, tmp_path, monkeypatc
     assert summary["protocol"]["band_limit_rate"] == 8000 and summary["prompt_audio"] == str(originals)
     assert {"sim_o", "sim_r", "wer_mean", "cer_mean", "bandwidth_hz", "per_sentence_wer_mean"} <= summary.keys()
     assert json.loads((out / "cases.json").read_text()) == cases
+
+
+@pytest.fixture
+def fake_transformers(monkeypatch):
+    """transformers stand-ins for eval_sentences.score_hf: Whisper transcribes every clip as FakeWhisper.text (the
+    clip lengths it was given go to `clips`), x-vectors are the clip's first samples."""
+    clips = []
+
+    class Processor:
+        @classmethod
+        def from_pretrained(cls, name, **kwargs):
+            return cls()
+
+        def __call__(self, audios, sampling_rate, return_tensors):
+            clips.extend(len(a) / sampling_rate for a in audios)
+            return SimpleNamespace(input_features=torch.zeros(len(audios), 1))
+
+        def batch_decode(self, ids, skip_special_tokens=True):
+            return [FakeWhisper.text] * len(ids)
+
+    class Model:
+        @classmethod
+        def from_pretrained(cls, name, **kwargs):
+            return cls()
+
+        def to(self, *args, **kwargs):
+            return self
+
+        def eval(self):
+            return self
+
+        def generate(self, features, **kwargs):
+            FakeWhisper.calls.append((features.shape[0], kwargs))
+            return torch.zeros(features.shape[0], 1, dtype=torch.long)
+
+    class Extractor(Processor):
+        def __call__(self, audio, sampling_rate, return_tensors, padding):
+            return {"input_values": torch.as_tensor(audio[:8] + 1.0)[None]}
+
+    class XVector(Model):
+        def __call__(self, input_values):
+            return SimpleNamespace(embeddings=input_values)
+
+    monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(
+        WhisperForConditionalGeneration=Model, WhisperProcessor=Processor, AutoFeatureExtractor=Extractor,
+        AutoModelForAudioXVector=XVector,
+    ))
+    return clips
+
+
+EVAL_CASES = [{"speaker": "spk", "prompt_uid": "shard/a.parquet:7", "prompt_text": "Önceki cümle.", "prompt_index": 0,
+               "uid": "shard/a.parquet:8", "text": "Hedef.", "target_index": 1, "ground_truth_seconds": 1.0}]
+
+
+def run_eval_sentences(tmp_path, monkeypatch, *flags, texts=("Bir iki üç.", "Dört beş."), output="out",
+                       cases=EVAL_CASES, seconds=None):
+    """scripts/eval_sentences.py --rescore over WAVs of a first pass (one prompt); returns (rows, summary, out)."""
+    import importlib.util
+    from pathlib import Path
+
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location("eval_sentences_under_test", scripts / "eval_sentences.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    data = SimpleNamespace(row=lambda index: {"latents": torch.zeros(5, 4)})
+    monkeypatch.setattr(module, "select_cases", lambda cache, count, seed, exclude=(): (data, cases))
+    out = tmp_path / output
+    out.mkdir(exist_ok=True)
+    sentences = tmp_path / f"{output}.jsonl"
+    sentences.write_text("".join(json.dumps({"id": f"s{i}", "text": t}, ensure_ascii=False) + "\n"
+                                 for i, t in enumerate(texts)))
+    for i in range(len(texts)):
+        if not (out / f"s{i}.wav").exists():
+            write(out / f"s{i}.wav", speech_like(48000, seconds or 1.0, seed=i), 48000)
+            (out / f"s{i}.json").write_text(json.dumps({"audio_seconds": 2.0, "rtf": 0.1}))
+    if not (out / "prompt-00.wav").exists():
+        write(out / "prompt-00.wav", speech_like(48000, seed=5), 48000)
+    monkeypatch.setattr(sys, "argv", [
+        "eval_sentences.py", "--checkpoint", "unused.pt", "--cache", "unused", "--sentences", str(sentences),
+        "--output", str(out), "--prompts", "1", "--rescore", "--asr-device", "cpu", "--device", "cpu", *flags,
+    ])
+    module.main()
+    rows = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()]
+    return rows, json.loads((out / "summary.json").read_text()), out
+
+
+def test_eval_sentences_metric_normalization_reaches_both_asr_paths(fake_whisper, fake_transformers, tmp_path,
+                                                                  monkeypatch):
+    fake_whisper.text = "Saat dörde kadar."
+    texts = ("Saat 4'e kadar.",)  # turkish-v1 reads the reference as "dörte", turkish-v2 as "dörde"
+    rows, summary, _ = run_eval_sentences(tmp_path, monkeypatch, "--speaker-model", "", texts=texts, output="v1")
+    assert rows[0]["wer"] > 0 and rows[0]["evaluator"]["metric_normalization"] == "turkish-v1"
+    assert summary["metric_normalization"] == "turkish-v1"  # the default for --language tr is unchanged
+    rows, summary, _ = run_eval_sentences(tmp_path, monkeypatch, "--speaker-model", "", "--metric-normalization",
+                                          "turkish-v2", texts=texts, output="v2")
+    assert rows[0]["wer"] == 0 and rows[0]["evaluator"]["metric_normalization"] == "turkish-v2"
+    rows, summary, _ = run_eval_sentences(tmp_path, monkeypatch, "--asr-backend", "hf", "--metric-normalization",
+                                          "turkish-v2", texts=texts, output="hf-v2")
+    assert rows[0]["asr_backend"] == "hf-greedy" and rows[0]["wer"] == 0
+    assert rows[0]["evaluator"]["metric_normalization"] == summary["metric_normalization"] == "turkish-v2"
+    rows, summary, _ = run_eval_sentences(tmp_path, monkeypatch, "--asr-backend", "hf", texts=texts, output="hf")
+    assert rows[0]["wer"] > 0 and rows[0]["evaluator"]["metric_normalization"] == "turkish-v1"
+    # score_hf used turkish-v1 for every --language; it now follows the language like the faster-whisper path.
+    fake_whisper.text = "Hello there."
+    rows, summary, _ = run_eval_sentences(tmp_path, monkeypatch, "--asr-backend", "hf", "--language", "en",
+                                          texts=("Hello there.",), output="hf-en")
+    assert rows[0]["evaluator"]["metric_normalization"] == summary["metric_normalization"] == "english-unicode-v2"
+    assert fake_whisper.calls[-1][1]["language"] == "en"
+
