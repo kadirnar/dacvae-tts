@@ -13,7 +13,7 @@ seed-tts-eval's WavLM-Large ECAPA-TDNN) against the original prompt wav as `sim_
 
 import argparse
 import json
-import re
+import string
 import time
 from pathlib import Path
 
@@ -24,11 +24,24 @@ from dacvae_tts.codec import read_audio
 from dacvae_tts.inference import Synthesizer
 from dacvae_tts.metrics import word_edit_counts
 
+# seed-tts-eval run_wer.py deletes every character of zhon.hanzi.punctuation + string.punctuation except the ASCII
+# apostrophe (so "twenty-one" is one word and "don’t" becomes "dont"), lower-cases, and jiwer splits at whitespace.
+# zhon.hanzi.punctuation (zhon 2.x), copied to avoid the dependency: CJK/fullwidth marks, dashes, curly quotes, ….
+HANZI_PUNCTUATION = (
+    "\uFF02\uFF03\uFF04\uFF05\uFF06\uFF07\uFF08\uFF09\uFF0A\uFF0B\uFF0C\uFF0D"
+    "\uFF0F\uFF1A\uFF1B\uFF1C\uFF1D\uFF1E\uFF20\uFF3B\uFF3C\uFF3D\uFF3E\uFF3F"
+    "\uFF40\uFF5B\uFF5C\uFF5D\uFF5E\uFF5F\uFF60\uFF62\uFF63\uFF64\u3000\u3001\u3003"
+    "\u3008\u3009\u300A\u300B\u300C\u300D\u300E\u300F\u3010\u3011"
+    "\u3014\u3015\u3016\u3017\u3018\u3019\u301A\u301B\u301C\u301D\u301E\u301F"
+    "\u3030\u303E\u303F\u2013\u2014\u2018\u2019\u201B\u201C\u201D\u201E\u201F\u2026\u2027\uFE4F"
+    "\uFE51\uFE54\u00B7\uFF0E\uFF01\uFF1F\uFF61\u3002"
+)
+SEED_PUNCTUATION = str.maketrans("", "", HANZI_PUNCTUATION + string.punctuation.replace("'", ""))
+
 
 def seed_normalize(text):
-    text = text.lower().replace("’", "'")
-    text = re.sub(r"[^\w\s']", " ", text)
-    return " ".join(text.split())
+    """seed-tts-eval English WER text: punctuation deleted (not replaced by a space), apostrophes kept, lower case."""
+    return " ".join(text.translate(SEED_PUNCTUATION).lower().split())
 
 
 def main():

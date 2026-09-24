@@ -69,6 +69,23 @@ branch'ler `main` üzerine rebase edilir; çakışmalar çoğunlukla yan yana ek
 | 60k güncelleme süresi (tek 4090) | 9,5 saat | ≤ 5 saat |
 | Parametre (çıkarım) | 66,5M | ≤ 68M |
 
+## İkinci tur (24 Eylül 2026): inceleme, eğitimsiz kanıtlar, yeni seçenekler
+
+Ayrıntı: [inceleme-ve-mimari-2026-09-24.md](inceleme-ve-mimari-2026-09-24.md). Özet:
+
+- Kod incelemesi: ~37 doğrulanmış hata düzeltildi. Aralarında distill'in EDM hedefi, DDP compile geri dönüşü, MPS'te
+  çıkarım çökmesi, post-training düzeni ve GRPO avantaj tabanı var.
+- #4: güven aralıkları varsayılan olarak konuşmacı jackknife-t'ye geçti. Eski yöntem, gerçek fark 0 iken %10–13
+  oranında kazanç/kayıp diyordu. Yeniden analizde clamp berabere çıkıyor, best-of-3 ise kazanç.
+- #5: turkish-v2'deki hatalar düzeltildi ve 42.591 transkript ile 9.400 puanlanmış cümlede doğrulandı.
+- #6: Freya prompt konuşmacılarının 6/10'u train'de akustik olarak var. Sızıntısız ölçüm için `--prompt-set` ve
+  `make_prompt_set.py` eklendi.
+- Aşağıdaki "gelecek iş" maddelerinden dördü kodlandı (varsayılan kapalı, A/B config'leriyle):
+  - karakter birimleri,
+  - prompt tempo pertürbasyonu,
+  - dondurulmuş konuşmacı gömmesi → adaLN,
+  - çok klipli konuşmacı bağlamı.
+
 ## Gelecek iş (issue açılmadı)
 
 CFG-kaynaşık MeanFlow/IntMeanFlow damıtmasıyla 4 adımlı çıkarım; donmuş CAM++ embedding → adaLN ve uzun (≥20 s) çok

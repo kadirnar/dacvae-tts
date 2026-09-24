@@ -12,17 +12,28 @@ from torch.nn import functional as F
 
 from .codec import file_digest, read_audio
 from .data import jsonl
+from .eval_protocol import WHISPER_V1
+
+METRIC_NORMALIZATIONS = ("english-unicode-v2", "legacy-ascii-v1", "turkish-v1", "turkish-v2")
 
 
-def metric_text(text, version="english-unicode-v2"):
+def default_metric_normalization(language):
+    """Turkish needs its own case folding (İ/ı) and number spelling; other languages keep the old default."""
+    return "turkish-v1" if language == "tr" else "english-unicode-v2"
+
+
+def metric_text(text, version="english-unicode-v2", apostrophe=None):
+    """WER/CER text of a normalization version. `apostrophe` (None: the version's own rule, Turkish deletes and
+    English keeps them) replaces the apostrophes that survive the normalization; " " is the Freya-TR-Eval convention
+    (`freya_error_counts`)."""
     if version == "turkish-v1":
         from .turkish import metric_text_turkish
 
-        return metric_text_turkish(text)
+        return metric_text_turkish(text, apostrophe or "")
     if version == "turkish-v2":  # opt-in; turkish-v1 stays the default for Turkish so scores remain comparable
         from .turkish import metric_text_turkish_v2
 
-        return metric_text_turkish_v2(text)
+        return metric_text_turkish_v2(text, apostrophe or "")
     text = unicodedata.normalize("NFKC", text).lower().replace("’", "'")
     if version == "legacy-ascii-v1":
         text = re.sub(r"[^a-z0-9'\s]", " ", text)
@@ -33,6 +44,8 @@ def metric_text(text, version="english-unicode-v2"):
         )
     else:
         raise ValueError("Unsupported metric normalization version")
+    if apostrophe is not None:
+        text = text.replace("'", apostrophe)
     return " ".join(text.split())
 
 
@@ -83,6 +96,31 @@ def error_counts(reference, hypothesis, normalization="english-unicode-v2"):
     }
 
 
+def freya_error_counts(reference, hypothesis, normalization="turkish-v1"):
+    """WER/CER under the Freya-TR-Eval (FreyaTTS) scoring convention, next to our own `error_counts`.
+
+    Freya's scoring turns apostrophes into spaces (İstanbul'da -> istanbul da: two words) and counts spaces in
+    CER; ours deletes apostrophes (one word, istanbulda) and computes CER without spaces. Everything else is the
+    given normalization (Turkish casing, numbers spelled out), so this reproduces those two conventions, not
+    FreyaTTS's code: compare with published Freya-TR-Eval tables using freya_wer/freya_cer and 8 kHz band-limited
+    ASR input (`--band-limit-8k`), keeping in mind that the ASR model and decoding may still differ.
+    """
+    ref = metric_text(reference, normalization, apostrophe=" ")
+    hyp = metric_text(hypothesis, normalization, apostrophe=" ")
+    if not ref:
+        raise ValueError("Reference transcript is empty after metric normalization")
+    words, edits = ref.split(), word_edit_counts(ref.split(), hyp.split())[0]
+    chars = edit_distance(ref, hyp)
+    return {
+        "freya_word_edits": edits,
+        "freya_words": len(words),
+        "freya_char_edits": chars,
+        "freya_chars": len(ref),
+        "freya_wer": edits / len(words),
+        "freya_cer": chars / len(ref),
+    }
+
+
 class DNSMOS:
     """Official non-personalized SIG/BAK/OVRL ONNX model, 9.01s windows / 1s hop.
 
@@ -128,6 +166,28 @@ class DNSMOS:
         return dict(zip(("dnsmos_sig", "dnsmos_bak", "dnsmos_ovrl"), map(float, scores)))
 
 
+# What changes a row's WER/CER/SIM for the same audio: kept in every result row (`row_identity`) so that
+# comparison.compare_evaluations can refuse to pair runs scored differently; the full identity (library versions,
+# model revisions, hashes) goes to the summary.
+ROW_IDENTITY_KEYS = (
+    "asr_backend", "asr_model", "language", "metric_normalization", "decoding", "compute_type", "device",
+    "speaker_model",
+)
+
+
+def row_identity(identity):
+    """Compact scorer identity of an Evaluator identity (or of a compact one: the projection is idempotent).
+
+    Protocol v2 contributes its options (`protocol_options`, e.g. band_limit_8k, sim_o); None/missing values stay
+    None, so rows written before these fields existed compare as "unknown", not as equal.
+    """
+    if not isinstance(identity, dict):
+        return None
+    protocol = identity.get("protocol")
+    options = protocol.get("options") if isinstance(protocol, dict) else identity.get("protocol_options")
+    return {**{key: identity.get(key) for key in ROW_IDENTITY_KEYS}, "protocol_options": options}
+
+
 class Evaluator:
     def __init__(
         self,
@@ -143,13 +203,11 @@ class Evaluator:
         protocol-v2 extras; see dacvae_tts.eval_protocol."""
         self.language = language
         if metric_normalization is None:
-            # Turkish needs its own case folding (İ/ı) and number spelling; English keeps the old default.
-            metric_normalization = "turkish-v1" if language == "tr" else "english-unicode-v2"
+            metric_normalization = default_metric_normalization(language)
         from faster_whisper import WhisperModel
 
-        self.asr = WhisperModel(
-            asr_model, device=device, compute_type="float16" if device == "cuda" else "int8"
-        )
+        compute_type = "float16" if device == "cuda" else "int8"
+        self.asr = WhisperModel(asr_model, device=device, compute_type=compute_type)
         self.dnsmos = DNSMOS(dnsmos_model) if dnsmos_model else None
         self.device = torch.device(device)
         self.speaker_name = speaker_model
@@ -170,6 +228,10 @@ class Evaluator:
             "dnsmos_sha256": file_digest(dnsmos_model) if dnsmos_model else None,
             "metric_normalization": metric_normalization,
             "language": language,
+            # int8 on the CPU and float16 on CUDA transcribe (slightly) differently.
+            "asr_backend": "faster-whisper",
+            "device": str(device),
+            "compute_type": compute_type,
         }
         self.protocol = None
         if protocol is not None and protocol.enabled:
@@ -177,6 +239,8 @@ class Evaluator:
 
             self.protocol = ProtocolScorer(protocol, device, self.dnsmos)
             self.identity["protocol"] = {**self.protocol.identity, "asr_snapshot": whisper_snapshot(asr_model)}
+        self.identity["decoding"] = self.protocol.whisper_kwargs() if self.protocol else dict(WHISPER_V1)
+        self.row_identity = row_identity(self.identity)
 
     @torch.inference_mode()
     def embedding(self, audio):
@@ -191,7 +255,7 @@ class Evaluator:
         protocol = getattr(self, "protocol", None)  # instances built with Evaluator.__new__ have none
         if protocol is None:
             asr_audio, asr_info = audio, {}
-            decoding = dict(beam_size=5, vad_filter=False, condition_on_previous_text=False)
+            decoding = dict(WHISPER_V1)
         else:
             asr_audio, asr_info = protocol.asr_audio(audio)
             decoding = protocol.whisper_kwargs()

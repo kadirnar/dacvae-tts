@@ -27,6 +27,7 @@ ORDINAL = {
 LATIN_EXTRA = set("çğıöşüâîûÇĞİÖŞÜÂÎÛ")
 PUNCTUATION = set(".,;:!?'\"-()")
 VOWELS = set("aeıioöuüâîû")
+VOICELESS = set("çfhkpsşt")  # a suffix-initial d assimilates to t after these (beşte, kırktan)
 # Abbreviations with a fixed spoken form. The synthesis frontend expands all of them; the training normalization
 # `turkish-v2` and the `turkish-v2` metric text only expand SAFE_ABBREVIATIONS (below).
 ABBREVIATIONS = {
@@ -116,6 +117,20 @@ def _int_words(s):
 
 LETTER = "a-zA-ZçğıöşüâîûÇĞİÖŞÜÂÎÛ"
 UPPER = "A-ZÇĞİÖŞÜÂÎÛ"
+MONTHS = ["ocak", "şubat", "mart", "nisan", "mayıs", "haziran", "temmuz", "ağustos", "eylül", "ekim", "kasım", "aralık"]
+# Shared by the synthesis frontend and the turkish-v2 training text: 23.09.2026 / 23/09/2026 / 23-09-2026 and a minus
+# sign before a number ("-5 derece"; a hyphen after a word or digit is a range or a compound: 3-4, COVID-19, and
+# after an ordinal's full stop it is an ordinal range: 9.-10. yüzyıllarda).
+DATE = re.compile(r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{4})\b")
+MINUS = re.compile(r"(?<![\w\d])(?<!\d\.)-(?=\d)")
+
+
+def spoken_date(match):
+    """DATE match -> "23 eylül 2026" (the year keeps its suffix: 2026'da); an impossible day or month stays."""
+    day, month = int(match.group(1)), int(match.group(2))
+    if not (1 <= day <= 31 and 1 <= month <= 12):
+        return match.group(0)
+    return f"{day} {MONTHS[month - 1]} {match.group(3)}"
 
 
 def abbreviation_rules(table):
@@ -125,14 +140,21 @@ def abbreviation_rules(table):
     longer expansions stay lower-case ("A.Ş." -> "anonim şirketi"). The full stop of an abbreviation that ends the
     text, or of a lower-case one before a capitalized word, also ends the sentence ("armut vs. Sonra" -> "armut
     vesaire. Sonra").
+
+    Abbreviations are often written without a space: the parts of a multi-word one may be joined ("Öğr.Gör." ->
+    "öğretim görevlisi") and a capital letter right after the full stop starts the next word, which gets a space
+    ("Prof.Dr. Ahmet" -> "Profesör Doktor Ahmet", not "ProfesörDr."). A lower-case letter there is a suffix, which
+    Turkish attaches to such abbreviations without an apostrophe ("16. yy.da" -> "yüzyılda"), so it stays attached.
     """
     rules = []
     for abbreviation, word in sorted(table.items(), key=lambda item: -len(item[0])):
-        a = re.escape(abbreviation)
+        a = r"\s*".join(re.escape(part) for part in abbreviation.split(" "))
         word = tr_title(word) if abbreviation[0].isupper() and " " not in word else word
         rules.append((rf"(?<![{LETTER}]){a}(?=\s*$)", word + "."))
         if abbreviation[0].islower():
             rules.append((rf"(?<![{LETTER}]){a}(?=\s+[{UPPER}])", word + "."))
+            rules.append((rf"(?<![{LETTER}]){a}(?=[{UPPER}])", word + ". "))
+        rules.append((rf"(?<![{LETTER}]){a}(?=[{UPPER}])", word + " "))
         rules.append((rf"(?<![{LETTER}]){a}", word))
     return rules
 
@@ -149,13 +171,19 @@ def expand_safe_abbreviations(text):
     return text
 
 
-def normalize_numbers(text, soften=False):
+def normalize_numbers(text, v2=False):
     """Spell out the numeric expressions Turkish podcast transcripts contain.
 
-    `soften` (turkish-v2) voices the final t of "dört" before a vowel-initial suffix, as Turkish does: 4'e -> dörde,
-    14'ün -> on dördün, %4'ü -> yüzde dördü, 2024'e -> iki bin yirmi dörde (without it: dörte, on dörtün). No other
-    number word changes (üçe, kırka, sekize are right as written) and ordinals are dördüncü either way; the suffix
-    vowels were written for "dört" already, so its harmony stays correct.
+    `v2` (turkish-v2 training and metric text) repairs the apostrophe suffixes that turkish-v1 appends verbatim:
+    - "dört" voices its final t before a vowel-initial suffix, as Turkish does: 4'e -> dörde, 14'ün -> on dördün,
+      %4'ü -> yüzde dördü, 2024'e -> iki bin yirmi dörde (v1: dörte, on dörtün). No other number word changes
+      (üçe, kırka, sekize are right as written) and ordinals are dördüncü either way; the suffix vowels were
+      written for "dört" already, so its harmony stays correct;
+    - an ordinal suffix followed by further suffixes is still an ordinal: 2'incisi -> ikincisi, 7'inciye ->
+      yedinciye, 6'ıncısı -> altıncısı (v1 only reads a bare ordinal suffix: ikiincisi, altııncısı);
+    - a suffix-initial d after a number word ending in a voiceless consonant (ç f h k p s ş t) becomes t, the
+      common misspelling of the locative/ablative: 5'de -> beşte, 3'den -> üçten, 40'da -> kırkta (v1: beşde);
+    - an ordinal range reads as two ordinals: 9.-10. yüzyıllarda -> dokuzuncu onuncu yüzyıllarda (v1: dokuz.-onuncu).
     """
     # 50% / %50 / % 50 -> yüzde 50
     text = re.sub(r"%\s?(\d+(?:[.,]\d+)?)", r"yüzde \1", text)
@@ -169,6 +197,12 @@ def normalize_numbers(text, soften=False):
     text = re.sub(r"(\d+)\.(\d+)", r"\1 nokta \2", text)
     # ranges 3-4 -> 3 4
     text = re.sub(r"(\d+)\s?[-–]\s?(\d+)", r"\1 \2", text)
+    if v2:  # ordinal ranges "9.-10. yüzyıllarda" -> "dokuzuncu onuncu yüzyıllarda" (v1: "dokuz.-onuncu")
+        text = re.sub(
+            r"\b(\d+)\.\s?[-–]\s?(\d+)\.(?=\s+[a-zçğıöşü])",
+            lambda m: f"{ordinal_words(int(m.group(1)))} {ordinal_words(int(m.group(2)))}",
+            text,
+        )
     # ordinals "12. nesil" -> "on ikinci nesil" (only when a lower-case word follows)
     text = re.sub(r"\b(\d+)\.(?=\s+[a-zçğıöşü])", lambda m: ordinal_words(int(m.group(1))), text)
     # split letters glued to digits: 350D -> 350 D ; USB3 -> USB 3
@@ -177,11 +211,14 @@ def normalize_numbers(text, soften=False):
     # apostrophe suffixes 2010'da -> iki bin onda ; 3'üncü -> üçüncü
     def suffixed(m):
         number, suffix = m.group(1), m.group(2)
-        if re.fullmatch(r"[iıuü]?nc[iıuü]", suffix):
-            return ordinal_words(int(number))
+        ordinal = (re.match if v2 else re.fullmatch)(r"[iıuü]?nc[iıuü]", suffix)
+        if ordinal:
+            return ordinal_words(int(number)) + suffix[ordinal.end():]
         words = _int_words(number)
-        if soften and words.endswith("dört") and tr_lower(suffix[0]) in VOWELS:
+        if v2 and words.endswith("dört") and tr_lower(suffix[0]) in VOWELS:
             words = words[:-1] + "d"
+        if v2 and words[-1] in VOICELESS and suffix[0] in "dD":
+            suffix = ("t" if suffix[0] == "d" else "T") + suffix[1:]
         return words + suffix
 
     text = re.sub(rf"(\d+)['’]([{LETTER}]+)", suffixed, text)
@@ -203,8 +240,10 @@ def check_script(text):
 def normalize_turkish(text, version="turkish-v1"):
     """Turkish transcript -> model text: NFKC, numbers as words, script check, whitespace.
 
-    `turkish-v2` also expands SAFE_ABBREVIATIONS (T.C. -> te ce, A.Ş. -> anonim şirketi) and softens "dört" before
-    a vowel suffix (4'e -> dörde); everything else is byte-identical to `turkish-v1`.
+    `turkish-v2` also expands SAFE_ABBREVIATIONS (T.C. -> te ce, A.Ş. -> anonim şirketi), reads dates, clock times
+    and minus signs as the synthesis frontend does (`dates_clocks_and_signs`: 14:00'te -> on dörtte, 15.07.2016 ->
+    on beş temmuz iki bin on altı, -5 -> eksi beş), softens "dört" before a vowel suffix (4'e -> dörde) and reads
+    ordinals with further suffixes (2'incisi -> ikincisi); everything else is byte-identical to `turkish-v1`.
     """
     if version not in {"turkish-v1", "turkish-v2"}:
         raise ValueError(f"Unknown Turkish normalization version: {version}")
@@ -214,7 +253,8 @@ def normalize_turkish(text, version="turkish-v1"):
     text = text.replace("‘", "'").replace("’", "'").replace("–", "-").replace("—", "-").replace("…", "...")
     if v2:
         text = expand_safe_abbreviations(text)
-    text = normalize_numbers(text, soften=v2)
+        text = dates_clocks_and_signs(text)
+    text = normalize_numbers(text, v2=v2)
     text = re.sub(r"\s+([.,;:!?])", r"\1", text)  # "kelime ." -> "kelime."
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
@@ -227,16 +267,17 @@ def normalize_turkish_v2(text):
     return normalize_turkish(text, "turkish-v2")
 
 
-def metric_text_turkish(text):
+def metric_text_turkish(text, apostrophe=""):
     """WER/CER normalization for Turkish: numbers spelled out, Turkish lower-case, letters only.
 
     Metric version `turkish-v1`, frozen so that published scores stay comparable; metric_text_turkish_v2 fixes
-    its mistakes.
+    its mistakes. `apostrophe` replaces the apostrophes left after the numbers are spelled out (deleted by default,
+    İsveç'ten -> isveçten; " " is the Freya-TR-Eval convention, isveç ten).
     """
     text = unicodedata.normalize("NFKC", text)
     text = normalize_numbers(text)
     text = tr_lower(text)
-    text = "".join(c if c.isalnum() or c.isspace() else ("" if c in "'’" else " ") for c in text)
+    text = "".join(c if c.isalnum() or c.isspace() else (apostrophe if c in "'’" else " ") for c in text)
     text = "".join(c for c in text if unicodedata.category(c) != "Mn")
     return " ".join(text.split())
 
@@ -269,7 +310,7 @@ LATIN_I_ACRONYMS = {
 # Roman numerals written with I, V and X only (1-39): C, L, D and M also spell acronyms and initials (CD, MI, DC).
 ROMAN = r"(?=[IVX])X{0,3}(?:IX|IV|V?I{0,3})"
 _METRIC_RULES = {
-    "hyphen": re.compile(rf"(?<=[{LETTER}])-(?=[{LETTER}])"),
+    "hyphen_pair": re.compile(rf"(?<![{LETTER}])([{LETTER}]+)-([{LETTER}]+)(?![{LETTER}])"),
     # XIX. yüzyıl, XIX yüzyıl, V. yüzyıl; "II. Dünya", "XVI.yüzyıl"; a single letter only before a capitalized word
     # ("I. Dünya", "V. Murat", but "Bay X. geldi" stays); standalone numerals of two or more letters become digits
     # that the number rules read with their suffix (Faz II -> faz iki, II'de -> ikide, IV'üncü -> dördüncü).
@@ -307,6 +348,20 @@ def _clock(match):
     return f"{match.group(1)}{hour}" + ("" if minute == 0 else f" {match.group(3)}")
 
 
+def dates_clocks_and_signs(text):
+    """turkish-v2 training text: dates, clock times and minus signs spoken the way the frontend writes them.
+
+    The model reads `frontend.speakable` output at inference, where "14:00'te" is "on dörtte" and "-5" is
+    "eksi beş"; turkish-v1 labels say "on dört sıfır sıfırte" and "-beş". Dates use the frontend's DATE rule
+    (15.07.2016 -> 15 temmuz 2016), clock times the `turkish-v2` metric rules (saat 3.30 -> saat 3 30,
+    11.30'da -> 11 30'da, 14:00'te -> 14'te, 09:05 -> 9 05) and a minus sign before a number becomes "eksi".
+    """
+    text = DATE.sub(spoken_date, text)
+    for rule in ("clock_saat", "clock_suffix", "clock_colon"):
+        text = _METRIC_RULES[rule].sub(_clock, text)
+    return MINUS.sub("eksi ", text)
+
+
 def _fold_marks(text):
     """Drop combining marks and fold accented letters (â -> a, î -> i, û -> u, ô -> o, é -> e); keep ç ğ ö ş ü."""
     return "".join(
@@ -316,12 +371,29 @@ def _fold_marks(text):
     )
 
 
-def metric_text_turkish_v2(text):
+def _join_or_split_hyphens(text):
+    """Metric hyphens: join short-part compounds (e-posta, Wi-Fi), split longer pairs (yazlık-kışlık, yavaş-yavaş)."""
+    def repl(match):
+        left, right = match.group(1), match.group(2)
+        return f"{left}{right}" if min(len(left), len(right)) <= 2 else f"{left} {right}"
+
+    pattern = _METRIC_RULES["hyphen_pair"]
+    while True:  # chains (a-b-c) need one pass per hyphen
+        joined = pattern.sub(repl, text)
+        if joined == text:
+            return text
+        text = joined
+
+
+def metric_text_turkish_v2(text, apostrophe=""):
     """WER/CER normalization `turkish-v2`: the `turkish-v1` metric text without its known mistakes (issue #5).
 
     Order: apostrophe/hyphen variants, NFKC, then rewrites that need the original case and punctuation, Turkish
     lower-casing, combining-mark removal and the character filter:
-    - intra-word hyphens join (e-posta -> eposta, Wi-Fi -> wifi) instead of splitting a word in two;
+    - intra-word hyphens after or before a part of one or two letters join (e-posta -> eposta, Wi-Fi -> wifi)
+      instead of splitting a word in two; between longer parts they separate words like a space, as in turkish-v1,
+      because those are reduplications and pairs that Turkish writes apart and Whisper often hyphenates
+      (yazlık-kışlık = yazlık kışlık; joining them cost 2 word errors on 16 correct Freya-TR-Eval transcripts);
     - SAFE_ABBREVIATIONS expand (T.C. -> te ce, A.Ş. -> anonim şirketi, Dr. -> doktor, vb. -> ve benzeri);
     - Roman numerals (I-XXXIX): "II. Dünya", "XVI.yüzyıl", "XIX yüzyıl", "I. Dünya" -> ordinals; other standalone
       numerals of two or more letters -> cardinals (Faz II -> faz iki); v1 produced "ıı";
@@ -330,10 +402,12 @@ def metric_text_turkish_v2(text):
     - clock times: saat 3.30 -> saat üç otuz, 3.30'a -> üç otuza, 14:00 -> on dört (v1: "üç nokta otuza");
     - ordinals without a space: 21.yüzyıl -> yirmi birinci yüzyıl;
     - currency symbols and units after a number: €50 -> elli avro, 5km'de -> beş kilometrede, 3 TL'ye -> üç liraya;
-    - numbers as in turkish-v1 with "dört" softening (4'e -> dörde);
+    - numbers as in turkish-v1 with the v2 suffix repairs of `normalize_numbers` (4'e -> dörde, 2'incisi ->
+      ikincisi);
     - combining marks are removed after lower-casing, so "i̇stanbul" (a non-Turkish lower() of İstanbul) is
       "istanbul" rather than "i stanbul"; â/î/û/ô and foreign accents fold (kâr -> kar);
-    - apostrophes are deleted (İsveç'ten -> isveçten), other punctuation separates words;
+    - apostrophes are deleted (İsveç'ten -> isveçten; `apostrophe` replaces them instead), other punctuation
+      separates words;
     - METRIC_VARIANTS unify spellings (euro -> avro, herşey -> her şey).
     Plain sentences (letters, apostrophes and sentence punctuation, no abbreviation, all-caps word or variant
     spelling) come out exactly as with `turkish-v1`; this holds for all 495 Freya-TR-Eval sentences. The default
@@ -341,7 +415,7 @@ def metric_text_turkish_v2(text):
     """
     rules = _METRIC_RULES
     text = unicodedata.normalize("NFKC", text.translate(METRIC_MARKS))
-    text = rules["hyphen"].sub("", text)
+    text = _join_or_split_hyphens(text)
     text = expand_safe_abbreviations(text)
     text = rules["roman_century"].sub(lambda m: ordinal_words(roman_value(m.group(1))) + " ", text)
     text = rules["roman_ordinal"].sub(lambda m: ordinal_words(roman_value(m.group(1)[:-1])) + " ", text)
@@ -360,7 +434,7 @@ def metric_text_turkish_v2(text):
         text = re.sub(rf"(\d)\s?{s}", rf"\1 {word}", text)
     text = rules["lira_suffix"].sub(lambda m: f"{m.group(1)} lira" + m.group(2).translate(_BACK_VOWELS), text)
     text = rules["unit"].sub(lambda m: f"{m.group(1)} {METRIC_UNITS[m.group(2)]}", text)
-    text = normalize_numbers(text, soften=True)
+    text = normalize_numbers(text, v2=True)
     text = _fold_marks(tr_lower(text))
-    text = "".join(c if c.isalnum() or c.isspace() else ("" if c == "'" else " ") for c in text)
+    text = "".join(c if c.isalnum() or c.isspace() else (apostrophe if c == "'" else " ") for c in text)
     return " ".join(" ".join(METRIC_VARIANTS.get(word, word) for word in text.split()).split())

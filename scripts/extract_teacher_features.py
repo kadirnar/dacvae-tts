@@ -25,7 +25,8 @@ dependencies (transformers, SpeechBrain, dacvae) are imported only by the subcom
 Every run is resumable (rows already in a partition are skipped) and `--splits train` is enough for
 training; add val/test only if you want to inspect the targets there. `--embedder pkg.module:factory`
 plugs in any embedder: factory(model_id, device) returning an object with `sample_rate` and
-`__call__(waveform) -> [E]`.
+`__call__(waveform) -> [E]` (and optionally `model_id`, recorded in the store); without `--model` it is
+called as factory(device=...), so each factory falls back to its own default model.
 """
 
 import argparse
@@ -84,7 +85,7 @@ class SpeechBrainEmbedder:
         except ImportError:  # SpeechBrain < 1.0
             from speechbrain.pretrained import EncoderClassifier
         savedir = Path.home() / ".cache" / "speechbrain" / model_id.replace("/", "--")
-        self.torch = torch
+        self.torch, self.model_id = torch, model_id
         self.model = EncoderClassifier.from_hparams(
             source=model_id, savedir=str(savedir), run_opts={"device": str(device)}
         )
@@ -103,7 +104,7 @@ class HuggingFaceXVector:
         import torch
         from transformers import AutoFeatureExtractor, AutoModelForAudioXVector
 
-        self.torch, self.device = torch, torch.device(device)
+        self.torch, self.device, self.model_id = torch, torch.device(device), model_id
         self.extractor = AutoFeatureExtractor.from_pretrained(model_id)
         self.model = AutoModelForAudioXVector.from_pretrained(model_id).to(self.device).eval()
 
@@ -130,7 +131,8 @@ def load_embedder(args):
         raise ValueError(
             f"Unknown embedder {args.embedder}; use {sorted(EMBEDDERS)} or package.module:factory"
         )
-    return factory(args.model or DEFAULT_SPEAKER, args.device)
+    # Each factory has its own default model: SpeechBrain's ECAPA id would break hf-xvector.
+    return factory(args.model, args.device) if args.model else factory(device=args.device)
 
 
 def load_decoder(cache, checkpoint, device):
@@ -207,15 +209,16 @@ def fit_pca(args, teacher=None, audio=None):
 
 
 def speakers(args):
+    embedder = load_embedder(args)
     describe = {
         "embedder": args.embedder,
-        "model": args.model or DEFAULT_SPEAKER,
+        "model": getattr(embedder, "model_id", args.model),  # the model the embedder actually loaded
         "audio_source": args.audio_source,
     }
     return extract_speakers(
         args.cache,
         args.output,
-        load_embedder(args),
+        embedder,
         audio_source(args),
         args.splits,
         args.shard_index,
@@ -267,7 +270,11 @@ def parser():
     command.add_argument(
         "--embedder", default="speechbrain", help="speechbrain, hf-xvector or pkg.mod:factory"
     )
-    command.add_argument("--model", default=None, help=f"Speaker model id (default {DEFAULT_SPEAKER})")
+    command.add_argument(
+        "--model",
+        default=None,
+        help=f"Speaker model id (default: the embedder's own, {DEFAULT_SPEAKER} for speechbrain)",
+    )
     sharded(command)
     command = commands.add_parser("merge", help="Combine the partitions of a sharded run")
     command.set_defaults(function=merge)

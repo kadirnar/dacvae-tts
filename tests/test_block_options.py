@@ -283,6 +283,26 @@ def test_cond_text_pool_averages_the_target_bytes_and_vanishes_when_dropped():
     assert not seen[0][1].any()  # dropped text: the pooled term is exactly zero
 
 
+def test_cond_text_pool_covers_the_whole_joined_stream():
+    """`joined` (every Turkish config) marks all tokens segment 1: the pool is prompt transcript + target."""
+    from dacvae_tts.text import tokenize
+
+    model = perturbed(FlowTTS(ModelConfig(**BASE, cond_text_pool=True))).eval()
+    tokens, segments = (t[None] for t in tokenize("Referans cümlesi.", "Hedef metin.", layout="joined"))
+    assert segments.all()
+    seen = []
+    model.text_pool.register_forward_hook(lambda module, args, output: seen.append(args[0]))
+    prompt_mask = torch.arange(10)[None] < 4
+    prompt = torch.randn(1, 10, 4) * prompt_mask[..., None]
+    valid = torch.ones_like(prompt_mask)
+    model(torch.randn(1, 10, 4), torch.tensor([0.5]), prompt, prompt_mask, valid, tokens, segments)
+    text = model.conditions(prompt, prompt_mask, tokens, segments)[0]
+    pooled = tokens >= BYTE_OFFSET
+    assert int(pooled.sum()) == len("Referans cümlesi. Hedef metin.".encode())
+    expected = (text * pooled[..., None]).sum(1) / pooled.sum(1, keepdim=True)
+    assert torch.allclose(seen[0], expected, atol=1e-6)
+
+
 def test_condition_dropout_removes_the_transcript_from_every_option():
     """CFG's null branch: with the condition dropped no option (pooled text, gates, skips, final adaLN) may
     carry the transcript, and forward's dropout agrees with the sampler's cached zero conditions."""

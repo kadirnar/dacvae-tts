@@ -78,6 +78,65 @@ def test_asr_dependency_is_lazy_and_empty_transcripts_fail(monkeypatch):
         tts.prepare_reference("any.wav")
 
 
+def test_reference_asr_accepts_waveform_pairs(monkeypatch):
+    # prepare_reference documents (waveform, rate) input, but its ASR fallback read the pair as a file path
+    # (TypeError: Invalid file) whenever no transcript was given.
+    import numpy as np
+
+    heard = []
+
+    class FakeWhisper:
+        def transcribe(self, audio, **options):
+            heard.append((audio.dtype, audio.shape, options["language"]))
+            return [SimpleNamespace(text=" Merhaba dünya. ")], None
+
+    tts = Synthesizer.__new__(Synthesizer)
+    tts.device = torch.device("cpu")
+    tts.asr_model, tts.asr_language, tts._asr = "fake", "tr", FakeWhisper()
+    monkeypatch.setattr(tts, "encode_reference", lambda audio, rate: torch.zeros(3, 4))
+    wave = (0.1 * np.sin(np.arange(48000) / 10)).astype(np.float32)  # 2 s at 24 kHz
+    prepared = tts.prepare_reference((wave, 24000))
+    assert prepared.transcript == "Merhaba dünya." and prepared.transcript_source == "asr:fake"
+    assert heard == [(np.float32, (32000,), "tr")]  # resampled to Whisper's 16 kHz
+    assert tts.transcribe_reference((torch.from_numpy(wave), 16000)) == "Merhaba dünya."
+    assert heard[-1][:2] == (np.float32, (48000,))
+
+
+def test_reference_asr_defaults_follow_the_checkpoint_language(monkeypatch, cache, tmp_path):
+    # The defaults were small.en / en for every checkpoint: a Turkish prompt without --reference-text was
+    # transcribed by an English-only model, and the wrong transcript then set the byte-rule duration.
+    import dacvae_tts.inference as module
+    from dacvae_tts.inference import asr_defaults
+
+    assert asr_defaults("unicode-v1") == asr_defaults("english-explicit-v2") == ("small.en", "en")
+    assert asr_defaults("turkish-v1") == asr_defaults("turkish-v2") == ("large-v3-turbo", "tr")
+    assert asr_defaults("turkish-v2", asr_model="small") == ("small", "tr")  # explicit choices are kept
+    assert asr_defaults("turkish-v2", asr_language="en") == ("small.en", "en")
+    assert asr_defaults("turkish-v2", asr_model="small.en") == ("small.en", "en")  # an .en model is English
+    assert asr_defaults("unicode-v1", asr_language="de") == ("large-v3-turbo", "de")
+    data = LatentDataset(cache)
+    config = Config(ModelConfig(latent_dim=4, width=16, depth=1, heads=2, text_depth=1, text_layout="joined",
+                                duration="rule"))
+    path = tmp_path / "model.pt"
+    state = FlowTTS(config.model).state_dict()
+    torch.save({"model": state, "ema": state, "config": config.to_dict(), "codec": {**data.meta,
+                "text_normalization": "turkish-v2"}, "mean": data.mean, "std": data.std}, path)
+    monkeypatch.setattr(module, "Codec", FakeCodec)
+    tts = Synthesizer(path, device="cpu", precision="fp32")
+    assert (tts.asr_model, tts.asr_language) == ("large-v3-turbo", "tr")
+    tts = Synthesizer(path, device="cpu", precision="fp32", asr_model="medium", asr_language="az")
+    assert (tts.asr_model, tts.asr_language) == ("medium", "az")
+    # The CLI's unset --asr-model / --asr-language (None) resolve the same way.
+    built = []
+    monkeypatch.setattr(module.Synthesizer, "synthesize",
+                        lambda self, *a, **k: built.append(self) or SimpleNamespace(metadata={}))
+    module.infer(SimpleNamespace(checkpoint=path, device="cpu", precision="fp32", compile=False, asr_model=None,
+                                 asr_device="cpu", profile=False, asr_language=None, text="x", reference="r.wav",
+                                 reference_text=None, output=None, seconds=None, duration_scale=1.0, steps=1,
+                                 guidance=1.0, seed=0, sway=-1.0))
+    assert (built[0].asr_model, built[0].asr_language) == ("large-v3-turbo", "tr")
+
+
 def test_text_versions_and_accent_preservation():
     assert normalize("  José’s   café. ") == "José's café."
     assert metric_text("JOSÉ’S café!") == "josé's café"
@@ -187,6 +246,91 @@ def test_synthesize_many_duration_modes_and_speaker_guidance(monkeypatch, cache,
     assert guided[0][0]["frames"] == results[0][0]["frames"]
     with pytest.raises(TypeError):
         tts.synthesize_many(texts, voice, unknown_option=1)
+
+
+def test_synthesize_many_sizes_duration_head_models_like_synthesize(monkeypatch, cache, tmp_path):
+    # Best-of-N used to size head models with the byte rule (17 vs 82 frames for one text), so single and
+    # best-of-N evaluations of configs/small.yaml / tiny.yaml models compared different duration methods.
+    import math
+
+    import dacvae_tts.inference as module
+    from dacvae_tts.inference import VoiceReference
+
+    data = LatentDataset(cache)
+    config = Config(ModelConfig(latent_dim=4, width=16, depth=1, heads=2, text_depth=1, duration="head"))
+    model = FlowTTS(config.model)
+    torch.nn.init.zeros_(model.duration[-1].weight)
+    torch.nn.init.constant_(model.duration[-1].bias, math.log(3.0))  # three frames per target byte
+    path = tmp_path / "model.pt"
+    torch.save({"model": model.state_dict(), "ema": model.state_dict(), "config": config.to_dict(),
+                "codec": data.meta, "mean": data.mean, "std": data.std}, path)
+    monkeypatch.setattr(module, "Codec", FakeCodec)
+    tts = Synthesizer(path, device="cpu", precision="fp32")
+    voice = VoiceReference(torch.zeros(60, 4), "A reference transcript that is long enough.", "test", {})
+    text = "Target words here."
+    for scale in (1.0, 0.8):
+        single = tts.make_batch(voice.latents, voice.transcript, text, duration_scale=scale)["prompt"].size(1) - 60
+        assert single == round(3.0 * len(text.encode()) * scale)
+        assert single != tts.target_frames(60, voice.transcript, text, duration_scale=scale)[0]
+        results, _ = tts.synthesize_many([text], voice, candidates=2, steps=1, guidance=1.0, duration_scale=scale,
+                                         duration_factors=[1.0, 1.2])
+        assert results[0][0]["frames"] == single and results[0][0]["duration"]["duration_rule"] == "duration_head"
+        assert results[0][1]["frames"] == round(3.0 * len(text.encode()) * scale * 1.2)
+    # A fixed length still overrides the head.
+    results, _ = tts.synthesize_many([text], voice, seconds=0.5, steps=1, guidance=1.0)
+    assert results[0][0]["frames"] == round(0.5 * 24000 / 512)
+
+
+def test_model_guidance_checkpoints_default_to_their_recommended_guidance(monkeypatch, cache, tmp_path):
+    # Training marks model-guidance checkpoints with recommended_guidance 1.0, but nothing read it: `infer` stacked
+    # its default CFG 1.5 on a w=0.7 checkpoint that already acts like CFG 3.3 (~5 effective; --guidance 5: ~17).
+    import sys
+    import warnings
+
+    import dacvae_tts.cli as cli
+    import dacvae_tts.inference as module
+    from dacvae_tts.config import TrainConfig
+    from dacvae_tts.inference import VoiceReference
+
+    data = LatentDataset(cache)
+    model_config = ModelConfig(latent_dim=4, width=16, depth=1, heads=2, text_depth=1, text_layout="joined",
+                               duration="rule")
+    state = FlowTTS(model_config).state_dict()
+    paths = {}
+    for name, weight, extra in (("plain", 0.0, {}), ("guided", 0.7, {"recommended_guidance": 1.0})):
+        paths[name] = tmp_path / f"{name}.pt"
+        config = Config(model_config, TrainConfig(model_guidance_weight=weight))
+        torch.save({"model": state, "ema": state, "config": config.to_dict(), "codec": data.meta, "mean": data.mean,
+                    "std": data.std, **extra}, paths[name])
+    monkeypatch.setattr(module, "Codec", FakeCodec)
+    plain = Synthesizer(paths["plain"], device="cpu", precision="fp32")
+    guided = Synthesizer(paths["guided"], device="cpu", precision="fp32")
+    assert (plain.recommended_guidance, plain.model_guidance_weight) == (None, 0.0)
+    assert (guided.recommended_guidance, guided.model_guidance_weight) == (1.0, 0.7)
+    voice = VoiceReference(torch.zeros(20, 4), "Reference words.", "test", {})
+    with pytest.warns(UserWarning, match="model guidance"):
+        guided.synthesize("Target words.", reference=voice, seconds=0.5, steps=1, guidance=1.5)
+    with pytest.warns(UserWarning, match="model guidance"):
+        guided.synthesize_many(["Target words."], voice, seconds=0.5, steps=1)  # default guidance 5
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        guided.synthesize("Target words.", reference=voice, seconds=0.5, steps=1, guidance=1.0)
+        guided.synthesize_many(["Target words."], voice, seconds=0.5, steps=1, guidance=1.0)
+        plain.synthesize("Target words.", reference=voice, seconds=0.5, steps=1, guidance=3.0)
+    # The CLI leaves --guidance unset (None) and `infer` resolves it: recommended, else the old default 1.5.
+    parsed, infer = [], module.infer
+    monkeypatch.setattr(module, "infer", parsed.append)
+    monkeypatch.setattr(sys, "argv", ["dacvae-tts", "infer", "--checkpoint", "c.pt", "--output", "o.wav",
+                                      "--reference", "r.wav", "--text", "x"])
+    cli.main()
+    assert parsed[0].guidance is None
+    used = []
+    monkeypatch.setattr(module.Synthesizer, "synthesize",
+                        lambda self, *a, **k: used.append(k["guidance"]) or SimpleNamespace(metadata={}))
+    for name, given in (("guided", None), ("plain", None), ("guided", 2.0)):
+        infer(SimpleNamespace(**{**vars(parsed[0]), "checkpoint": paths[name], "device": "cpu", "precision": "fp32",
+                                 "guidance": given}))
+    assert used == [1.0, 1.5, 2.0]
 
 
 def test_auto_duration_picks_the_rule_per_prompt_rate():

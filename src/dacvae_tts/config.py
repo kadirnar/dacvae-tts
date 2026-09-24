@@ -1,3 +1,4 @@
+import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -33,11 +34,34 @@ class ModelConfig:
     attn_gate: str = "none"  # head: per-head 2*sigmoid output gate on generator self-/cross-attention
     ffn_activation: str = "gelu"  # swiglu: generator FFN as SwiGLU at equal parameters (hidden 2/3 of GELU's)
     final_adaln: bool = False  # output LayerNorm shift/scale from the condition (rank adaln_rank, zero-init)
-    cond_text_pool: bool = False  # condition += Linear0(mean of the target-byte text encodings); +D^2
+    # condition += Linear0(masked mean of the segment-1 byte encodings); +D^2. Segment 1 is the target text in
+    # the `segments` layout, the whole joined stream (prompt transcript + target) in `joined`.
+    cond_text_pool: bool = False
     # CTC labels of the auxiliary head. `chars`: Turkish lower-case letters + space, no punctuation (34
     # classes with the blank). A two-byte Turkish letter is one phone but two byte labels, and fast speakers
     # (16-19 bytes/s against 25 fps) leave byte CTC barely feasible; zero_infinity then zeroes those examples.
     ctc_targets: str = "bytes"
+    # Text input units. `chars`: one token per character (text.UNIT_CHARACTERS): ASCII keeps its byte id, so the
+    # vocabulary and embedding shape stay the byte model's, but the Turkish two-byte letters (ç ğ ı ö ş ü and
+    # capitals, ~12 % of letters) are one token instead of two: an even length-aware RoPE diagonal, one CTC label
+    # per letter, and a character duration rule at inference. Converted from the cached byte ids at load time.
+    text_units: str = "bytes"
+    # Frozen speaker-verification embedding (e.g. SpeechBrain ECAPA 192-d) added to the voice condition through a
+    # zero-init, bias-free Linear (~0.1M): a speaker prior from ~7k-200k training speakers next to the in-context
+    # prompt (Koel-TTS unseen SIM: in-context 0.637, SV vector 0.619; MiniMax-Speech: encoder + prompt 0.746 vs prompt
+    # 0.726, a frozen SV vector raised WER). 0 is off. Training reads a speaker store (train.speaker_condition).
+    speaker_condition_dim: int = 0
+    # Multi-clip speaker context (`vector`): a small transformer over the latents of further recordings of the voice
+    # (other utterances of the speaker in training, extra clips + the prompt at inference; no positions, so clip order
+    # does not matter) -> attention pooling -> a zero-init vector added to the voice condition. Irodori-TTS: CAM++
+    # SIM one clip 0.661 -> 30 s 0.752 -> 120 s 0.775 (766M, per-block speaker K/V); XTTS averages its reference
+    # latents over clips; Koel-TTS saw a cross-attention encoder overfit seen speakers, hence one vector. ~2.2M
+    # parameters at the defaults (+3.4 % at width 512); starts as the baseline, so it can warm-start from a checkpoint.
+    speaker_context: str = "none"
+    speaker_context_width: int = 256
+    speaker_context_layers: int = 3
+    speaker_context_heads: int = 4
+    speaker_context_patch: int = 4  # latent frames per context token (25 fps -> 6.25 tokens/s)
     # Training-only teacher heads (alignment.py); absent from the module and its checkpoints when off.
     repa_layer: int = 0  # speech-REPA: block predicting teacher SSL frames; 0 off, 10-11 with CTC at 8
     repa_dim: int = 0  # width of the stored teacher frames (after the extraction PCA, e.g. 256)
@@ -85,8 +109,20 @@ class ModelConfig:
             raise ValueError("attn_gate must be none or head")
         if self.ffn_activation not in {"gelu", "swiglu"}:
             raise ValueError("ffn_activation must be gelu or swiglu")
+        if self.text_units not in {"bytes", "chars"}:
+            raise ValueError("text_units must be bytes or chars")
         if self.ctc_targets not in {"bytes", "chars"} or (self.ctc_targets == "chars" and not self.ctc_layer):
             raise ValueError("ctc_targets must be bytes or chars; chars needs a CTC head (ctc_layer > 0)")
+        if self.ctc_layer and self.patch_size > 1 and self.ctc_targets == "bytes":
+            # CTC needs at least one input frame per label. The head reads packed frames: DACVAE's 25 latent
+            # frames/s become 12.5/s at patch_size 2, below the 16-19 bytes/s of normal speech, so most examples
+            # are infeasible and zero_infinity silently zeroes their loss. A warning: such configs still load.
+            warnings.warn(
+                f"ctc_layer with patch_size {self.patch_size} and byte targets: the CTC head sees "
+                f"{25 / self.patch_size:g} packed frames/s against 16-19 transcript bytes/s, so zero_infinity "
+                "zeroes most examples; use ctc_targets: chars or patch_size: 1",
+                stacklevel=3,
+            )
         self.tla_layers = teacher_blocks(self.tla_layers, self.depth)
         if not 0 <= self.repa_layer <= self.depth or (self.repa_layer and self.repa_dim < 1):
             raise ValueError("repa_layer must be 0 (off) or a generator block, with a positive repa_dim")
@@ -98,6 +134,16 @@ class ModelConfig:
             raise ValueError("tla_layers need positive tla_dim and tla_hidden")
         if not 0 <= self.dropout < 1:
             raise ValueError("dropout must lie in [0,1)")
+        if self.speaker_condition_dim < 0:
+            raise ValueError("speaker_condition_dim must be 0 (off) or the embedding width")
+        if self.speaker_context not in {"none", "vector"}:
+            raise ValueError("speaker_context must be none or vector")
+        if self.speaker_context != "none" and (
+            min(self.speaker_context_width, self.speaker_context_layers, self.speaker_context_heads,
+                self.speaker_context_patch) < 1
+            or self.speaker_context_width % self.speaker_context_heads
+        ):
+            raise ValueError("speaker_context needs positive width/layers/heads/patch, width divisible by heads")
 
 
 def teacher_blocks(value, depth):
@@ -190,6 +236,17 @@ class TrainConfig:
     # `quiet` moves each within cut to the silence-closest frame within +-0.3 s (needs silence.pt), so
     # prompts end in a pause like inference prompts do instead of mid-word.
     prompt_cut: str = "random"
+    # Prompt tempo perturbation (VoiceStar, arXiv:2505.19462: +cross prompts 6.42 -> 5.66 WER, SIM -0.004): with
+    # this probability the prompt is the same speech at another tempo, from a tempo-variant store (WSOLA-stretched
+    # audio re-encoded by scripts/build_tempo_variants.py; relative paths resolve against the cache). Training then
+    # shows prompt/target rate mismatches, the break the length-aware RoPE prior meets whenever the duration rule
+    # does not reproduce the prompt's rate. `tempo_prompt_factors` picks stored tempos (e.g. [0.8, 0.9, 1.0, 1.111,
+    # 1.25]; [] = all; 1.0 is the re-encoded round trip); `tempo_prompt_pairs`: all (within cuts and cross prompts)
+    # or cross (cross prompts only, as VoiceStar). Stretched prompts carry no REPA teacher frames.
+    tempo_prompt_prob: float = 0.0
+    tempo_variants: str = ""
+    tempo_prompt_factors: tuple = ()
+    tempo_prompt_pairs: str = "all"
     # Teacher-feature auxiliary losses (alignment.py, scripts/extract_teacher_features.py); stores are
     # sidecar directories, relative paths resolve against the cache directory.
     teacher_features: str = ""  # speech-REPA frame store (e.g. teacher/mhubert147-l12-pca256)
@@ -198,6 +255,23 @@ class TrainConfig:
     repa_frames: str = "all"  # all valid frames (prompt frames are real speech too) or target frames only
     speaker_embeddings: str = ""  # TLA-SA utterance speaker-embedding store (e.g. teacher/ecapa-speechbrain)
     tla_weight: float = 0.0  # TLA-SA used 0.5
+    # Speaker-embedding condition (model.speaker_condition_dim > 0): utterance embeddings of a speaker store built by
+    # scripts/extract_teacher_features.py speakers (train and val splits). `other` conditions a within-utterance item
+    # on another utterance of its speaker label (the target never leaks into its own condition, and inference
+    # embeds the prompt, not the target), `same` on its own; `min_cosine` falls back to the item's own embedding when
+    # the other utterance is further away (diarization label noise). Must not be the TLA-SA store.
+    speaker_condition: str = ""
+    speaker_condition_source: str = "other"
+    speaker_condition_min_cosine: float = 0.0
+    # Speaker context (model.speaker_context): with this probability an item gets a context of other utterances of
+    # its label, whole clips in random order up to a length drawn from [min, max] seconds (at most max_utterances;
+    # below min: none), drawn independently of prompt dropout (prompt-free rows then learn from the context alone).
+    # The other items keep an empty context, so single-clip inference stays in distribution (Irodori v4's single clip
+    # fell from 0.678 to 0.661 when every item had a long reference).
+    speaker_context_prob: float = 0.0
+    speaker_context_min_seconds: float = 3.0
+    speaker_context_max_seconds: float = 30.0
+    speaker_context_max_utterances: int = 8
     tla_entropy: float = 0.01  # weight of the negative entropy of the time-dependent block weights
     # Schedule and regularization options (issue #14); every default reproduces the original recipe exactly.
     # wsd: warmup, constant LR, then a decay over the last `decay_fraction` of the updates. A 20% 1-sqrt
@@ -219,6 +293,12 @@ class TrainConfig:
     # with load_model(..., ema=<decay>). The best EMA length depends on the run and on CFG (EDM2,
     # arXiv:2312.02696); 0.9999 is too slow for <15k-update fine-tunes. `ema_decay` itself may be listed.
     ema_decays: list = field(default_factory=list)
+    # EMA warm-up: every track (`ema` and `ema_decays`) averages with min(decay, (1 + step) / (10 + step)),
+    # so a track's own decay only applies from update ~9k (0.999), ~18k (0.9995) or ~90k (0.9999) on and
+    # until then all tracks are identical; on --init-from it also discards the warm-started EMA within ~10
+    # updates. false: every track uses exactly its decay from the first update, starting from the warm-start
+    # checkpoint's EMA; needs --init-from (a random initialization would dominate the average).
+    ema_warmup: bool = True
     # Model guidance (arXiv:2502.12154; on F5-TTS arXiv:2504.20334): the target becomes
     # v + w sg(v_cond - v_null) from the model's own predictions; sample without CFG (--guidance 1). The fixed
     # point bakes in CFG scale 1 / (1 - w) (w 0.5 ~ 2, 0.7 ~ 3.3); w >= 1 diverges. One extra no-grad forward
@@ -307,8 +387,30 @@ class TrainConfig:
             self.cross_prompt_prob or self.long_prompt_prob or self.prompt_cut != "random"
         ):
             raise ValueError("cross_prompt_prob, long_prompt_prob and prompt_cut: quiet need within pairing")
+        self.tempo_prompt_factors = tuple(self.tempo_prompt_factors)
+        if not 0 <= self.tempo_prompt_prob <= 1 or self.tempo_prompt_pairs not in {"all", "cross"}:
+            raise ValueError("tempo_prompt_prob must lie in [0,1]; tempo_prompt_pairs all or cross")
+        if not all(isinstance(f, (int, float)) and not isinstance(f, bool) and 0.5 <= f <= 2.0
+                   for f in self.tempo_prompt_factors) or len(set(self.tempo_prompt_factors)) != len(
+                self.tempo_prompt_factors):
+            raise ValueError("tempo_prompt_factors must be distinct tempo factors in [0.5, 2.0]")
+        if self.tempo_prompt_prob and (not self.tempo_variants or self.pairing != "within"):
+            raise ValueError("tempo_prompt_prob needs a tempo_variants store and within pairing")
+        if self.tempo_prompt_prob and self.tempo_prompt_pairs == "cross" and not self.cross_prompt_prob:
+            raise ValueError("tempo_prompt_pairs: cross stretches cross prompts only; set cross_prompt_prob > 0")
         if min(self.repa_weight, self.repa_stop_step, self.tla_weight, self.tla_entropy) < 0:
             raise ValueError("Teacher loss weights and repa_stop_step must be nonnegative")
+        if not 0 <= self.speaker_context_prob <= 1 or self.speaker_context_max_utterances < 1 or not (
+            0 < self.speaker_context_min_seconds <= self.speaker_context_max_seconds
+        ):
+            raise ValueError("speaker_context_prob in [0,1], positive max_utterances, 0 < min_seconds <= max_seconds")
+        if self.speaker_context_prob and self.pairing != "within":
+            raise ValueError("speaker_context_prob draws contexts for within pairing")
+        if self.speaker_condition_source not in {"other", "same"} or not -1 <= self.speaker_condition_min_cosine <= 1:
+            raise ValueError("speaker_condition_source must be other or same; min_cosine in [-1,1]")
+        if self.speaker_condition and self.tla_weight and self.speaker_condition == self.speaker_embeddings:
+            # The TLA heads could read the injected vector back from the hidden states and satisfy their loss.
+            raise ValueError("speaker_condition must be another store than the TLA-SA speaker_embeddings")
         if self.repa_frames not in {"all", "target"}:
             raise ValueError("repa_frames must be all or target")
         if (self.repa_weight and not self.teacher_features) or (
@@ -339,6 +441,8 @@ class TrainConfig:
             or not all(isinstance(d, float) and 0 <= d < 1 for d in self.ema_decays)
         ):
             raise ValueError("ema_decays must be a list of distinct decays in [0,1)")
+        if not isinstance(self.ema_warmup, bool):
+            raise ValueError("ema_warmup must be true or false")
         if not 0 <= self.model_guidance_weight < 1:
             raise ValueError("model_guidance_weight must lie in [0,1); w >= 1 diverges")
         if self.model_guidance_weight and self.contrastive_mode == "text_hinge" and self.contrastive_weight:
@@ -364,6 +468,10 @@ class Config:
             self.train.tla_weight and not self.model.tla_layers
         ):
             raise ValueError("repa_weight needs model.repa_layer and tla_weight needs model.tla_layers")
+        if (self.model.speaker_context != "none") != bool(self.train.speaker_context_prob):
+            raise ValueError("model.speaker_context and train.speaker_context_prob > 0 go together")
+        if bool(self.model.speaker_condition_dim) != bool(self.train.speaker_condition):
+            raise ValueError("model.speaker_condition_dim and train.speaker_condition (a speaker store) go together")
         if self.train.model_guidance_weight and not self.model.cond_dropout:
             raise ValueError("Model guidance needs model.cond_dropout > 0 to learn the null prediction")
 

@@ -4,6 +4,7 @@ import importlib.util
 import json
 import math
 import sqlite3
+import sys
 import types
 from pathlib import Path
 
@@ -515,6 +516,61 @@ def test_extraction_script_runs_with_fake_models(cache, monkeypatch, capsys):
     merged = script.main(["merge", "--output", str(speakers), "--cache", str(cache)])
     assert merged["rows"] == 12 and merged["embedder"] == "speechbrain" and merged["kind"] == "speaker"
     assert '"kind": "speaker"' in capsys.readouterr().out
+
+
+def test_speaker_embedders_default_to_their_own_model(cache, monkeypatch):
+    # `speakers --embedder hf-xvector` without --model used to load (and record) SpeechBrain's ECAPA id.
+    script = load_script()
+    loaded = []
+
+    class Extractor:
+        def __call__(self, waveform, sampling_rate, return_tensors):
+            return {"input_values": torch.as_tensor(waveform)[None]}
+
+    class XVector:
+        def to(self, device):
+            return self
+
+        def eval(self):
+            return self
+
+        def __call__(self, input_values):
+            return types.SimpleNamespace(embeddings=torch.stack([input_values.mean(-1), input_values.std(-1)], -1))
+
+    def pretrained(model):
+        return types.SimpleNamespace(from_pretrained=lambda model_id: loaded.append(model_id) or model)
+
+    transformers = types.ModuleType("transformers")
+    transformers.AutoFeatureExtractor = pretrained(Extractor())
+    transformers.AutoModelForAudioXVector = pretrained(XVector())
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    monkeypatch.setattr(script, "load_decoder", lambda *a: fake_decode)
+
+    def speakers(output, *flags):
+        return script.main(["speakers", "--cache", str(cache), "--output", str(output), "--quiet", *flags])
+
+    meta = speakers(cache / "teacher" / "xvector", "--embedder", "hf-xvector")
+    assert loaded == ["microsoft/wavlm-base-plus-sv"] * 2 and meta["model"] == "microsoft/wavlm-base-plus-sv"
+    assert meta["rows"] == 12 and meta["dim"] == 2
+    meta = speakers(cache / "teacher" / "other", "--embedder", "hf-xvector", "--model", "org/other-sv")
+    assert loaded[2:] == ["org/other-sv"] * 2 and meta["model"] == "org/other-sv"
+
+    calls = []
+
+    def factory(model_id="org/plugin-default", device="cpu"):
+        calls.append((model_id, device))
+        return FakeEmbedder()
+
+    plugin = types.ModuleType("speaker_plugin")
+    plugin.factory = factory
+    monkeypatch.setitem(sys.modules, "speaker_plugin", plugin)
+    args = script.parser().parse_args(
+        ["speakers", "--cache", "c", "--output", "o", "--embedder", "speaker_plugin:factory"]
+    )
+    script.load_embedder(args)
+    args.model = "org/chosen"
+    script.load_embedder(args)
+    assert calls == [("org/plugin-default", "cpu"), ("org/chosen", "cpu")]
 
 
 @pytest.mark.parametrize("name", ["repa", "tla", "repa_tla"])

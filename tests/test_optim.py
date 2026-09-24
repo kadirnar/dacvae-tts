@@ -67,6 +67,22 @@ def test_partition_assigns_every_parameter_once(overrides):
         assert "ref_pool.attention.weight" in adamw  # [1,D] is a vector, not a matrix
 
 
+def test_tla_logits_and_output_heads_stay_on_adamw():
+    """TLA-SA's zero-init block-weight logits and its heads into the speaker space are output heads; the
+    hidden maps in front of them are ordinary Muon matrices."""
+    model = FlowTTS(
+        ModelConfig(latent_dim=4, width=32, heads=2, depth=3, text_depth=1, tla_layers=[1, 3], tla_dim=6,
+                    tla_hidden=16)
+    )
+    matrices, parts, others = partition(model)
+    names = {id(p): name for name, p in model.named_parameters()}
+    muon = {names[id(p)] for p in matrices}
+    adamw = {names[id(p)] for p in others}
+    assert {"tla.weights.2.weight", "tla.heads.0.2.weight", "tla.heads.1.2.weight"} <= adamw
+    assert {"tla.weights.0.weight", "tla.heads.0.0.weight", "tla.heads.1.0.weight"} <= muon
+    assert muon_parts("blocks.0.ff.2.weight", torch.nn.Parameter(torch.zeros(8, 8))) == 1
+
+
 def test_fused_rows_are_orthogonalized_separately():
     torch.manual_seed(0)
     fused = torch.nn.Parameter(torch.zeros(16, 8))

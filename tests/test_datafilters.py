@@ -65,6 +65,10 @@ def test_freya_exact_matches_turkish_casing_punctuation_and_numbers():
     assert freya.match("Istanbul'da yarın öğleden sonra yağmur bekleniyor.") == "freya_exact"  # ASCII I
     assert freya.match("Kağıt kesiği çok acıtır") == "freya_exact"  # circumflex optional
     assert match_key("Işık 3'te!") == match_key("işik üçte") == "işik üçte"
+    # str.lower() of İ leaves a combining dot (U+0307); it must not split the word.
+    assert match_key("i̇stanbul'da 3 gün") == match_key("İstanbul'da 3 gün") == "istanbulda üç gün"
+    assert freya.match("i̇stanbul'da yarın öğleden sonra yağmur bekleniyor.") == "freya_exact"
+    assert freya.match("İstanbul'da yarın öğleden sonra yağmur bekleniyor.".lower()) == "freya_exact"
     assert freya.match("Bugün hava çok güzel.") is None
     assert freya.match("...") is None
 

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import os
 import random
 import sqlite3
@@ -15,7 +16,17 @@ from torch.utils.data import Dataset, Sampler
 
 from .contracts import normalization_stats
 from .teacher import TeacherInputs, collate_teacher, pair_teacher
-from .text import assemble, char_ctc_targets, decode_ids, join_ids, tokenize, tokenize_bytes
+from .tempo import TempoStore, tempo_key
+from .text import (
+    TEXT_UNITS,
+    assemble,
+    char_ctc_targets,
+    decode_ids,
+    join_ids,
+    to_units,
+    tokenize,
+    tokenize_bytes,
+)
 
 SCHEMA = """
 CREATE TABLE samples (
@@ -102,7 +113,8 @@ def load_silence(directory, meta):
 
 # Independent random streams per (seed, epoch, index): toggling one pair option never moves the draws
 # of another, and every stream stays clear of the original seed range seed + epoch * rows + index.
-CROSS_STREAM, TAIL_STREAM, LONG_STREAM = 1 << 48, 2 << 48, 3 << 48
+CROSS_STREAM, TAIL_STREAM, LONG_STREAM, TEMPO_STREAM, SPEAKER_STREAM = 1 << 48, 2 << 48, 3 << 48, 4 << 48, 5 << 48
+CONTEXT_STREAM = 6 << 48
 QUIET_CUT_SECONDS = 0.3
 
 
@@ -121,10 +133,18 @@ class LatentDataset(Dataset):
         prompt_dropout=0.0,
         teacher_features=None,
         speaker_embeddings=None,
+        text_units="bytes",
+        tempo_variants=None,
+        speaker_condition=None,
+        speaker_condition_source="other",
+        speaker_condition_min_cosine=0.0,
         **pair_options,
     ):
         if pairing not in {"cross", "within"} or layout not in {"segments", "joined"}:
             raise ValueError("pairing must be cross or within; layout must be segments or joined")
+        if text_units not in TEXT_UNITS:
+            raise ValueError(f"text_units must be one of {TEXT_UNITS}")
+        self.text_units = text_units  # model.text_units: collate converts the cached byte ids (chars)
         if pairing == "within" and layout != "joined":
             raise ValueError("Within-utterance prompts have no transcript boundary; use the joined layout")
         if not 0 <= prompt_fraction[0] <= prompt_fraction[1] < 1 or not 0 <= prompt_dropout <= 1:
@@ -173,6 +193,20 @@ class LatentDataset(Dataset):
                 end = self.group_end[start]
                 self.max_ref_lengths[start:end] = self.lengths[start:end].max()
             self.costs = self.lengths + self.max_ref_lengths
+        # Speaker-embedding condition (model.speaker_condition_dim): a speaker store, which utterance conditions a
+        # within cut (`other` recording of its label or the `same` one) and the cosine below which `other` falls back.
+        if speaker_condition_source not in {"other", "same"}:
+            raise ValueError("speaker_condition_source must be other or same")
+        self.speaker_store = None
+        if speaker_condition:
+            from .teacher import TeacherStore
+
+            self.speaker_store = TeacherStore(speaker_condition, "speaker")
+            self.speaker_store.check(self.db_path, split, self.meta["sample_rate"] / self.meta["hop_length"])
+        self.speaker_source, self.speaker_min_cosine = speaker_condition_source, speaker_condition_min_cosine
+        # Tempo-variant latents of the rows (tempo.py, scripts/build_tempo_variants.py) for prompt tempo perturbation.
+        self.tempo_store = TempoStore(tempo_variants) if tempo_variants else None
+        self.split = split
         self.configure_pairs(**pair_options)
         self._pid, self._db, self._maps = None, None, OrderedDict()
         # Precomputed teacher targets (teacher.py) for the alignment losses; None leaves items unchanged.
@@ -237,8 +271,10 @@ class LatentDataset(Dataset):
         rng = random.Random(self.seed + epoch * len(self) + index)
         if self.pairing == "within":
             references = self.cross_plan(epoch, index)
+            tempo = self.tempo_plan(epoch, index)
             if references:
-                return self.finish_item(self.cross_prompt_item(index, references), epoch, index)
+                item = self.cross_prompt_item(index, references, tempo)
+                return self.finish_item(stretch_teacher(item) if tempo is not None else item, epoch, index)
             row = self.row(index)
             frames = len(row["latents"])
             # Prompt dropout trains prompt-free synthesis of the whole utterance from its text.
@@ -265,6 +301,11 @@ class LatentDataset(Dataset):
                 "layout": self.layout,
                 **pair_teacher(row, row, cut),
             }
+            if tempo is not None and self.tempo_pairs == "all" and cut > 0:
+                # The same speech at another tempo: the prompt covers the cut's content, the target is unchanged.
+                variant = self.tempo_latents(row["uid"], tempo)
+                reference = variant[: min(max(round(cut * 1000 / tempo), 1), len(variant))]
+                item = stretch_teacher({**item, "reference": reference, "prompt_tempo": tempo / 1000})
             return self.finish_item(item, epoch, index)
         start, end = int(self.group_start[index]), int(self.group_end[index])
         ref_index = rng.randrange(start, end - 1)
@@ -302,6 +343,13 @@ class LatentDataset(Dataset):
         tail_silence_max_seconds=0.8,
         prompt_cut="random",
         ctc_targets="bytes",
+        tempo_prompt_prob=0.0,
+        tempo_prompt_factors=(),
+        tempo_prompt_pairs="all",
+        speaker_context_prob=0.0,
+        speaker_context_min_seconds=3.0,
+        speaker_context_max_seconds=30.0,
+        speaker_context_max_utterances=8,
     ):
         """Validate the options and widen `costs` to an upper bound of every prompt+target they can form.
 
@@ -337,6 +385,93 @@ class LatentDataset(Dataset):
         if cross_prompt_prob:
             several = self.group_end - self.group_start >= 2
             self.costs = self.costs + np.where(several, self.cross_prompt_frames, 0).astype(self.costs.dtype)
+        self.configure_tempo(tempo_prompt_prob, tempo_prompt_factors, tempo_prompt_pairs)
+        if not 0 <= speaker_context_prob <= 1 or speaker_context_max_utterances < 1 or not (
+            0 < speaker_context_min_seconds <= speaker_context_max_seconds
+        ):
+            raise ValueError("Invalid speaker context options")
+        if speaker_context_prob and self.pairing != "within":
+            raise ValueError("Speaker contexts are drawn for within pairing")
+        self.context_prob, self.context_utterances = speaker_context_prob, speaker_context_max_utterances
+        self.context_frames = (int(speaker_context_min_seconds * frame_rate),
+                               int(speaker_context_max_seconds * frame_rate))
+
+    def configure_tempo(self, probability, factors, pairs):
+        """Prompt tempo perturbation: with `probability`, an item's prompt is the same speech at one of `factors`
+        (tempo x0.8 = slower, from the tempo-variant store; () = every stored tempo). `pairs`: `all` stretches
+        within-utterance cuts and cross prompts, `cross` only cross prompts (VoiceStar's setting). Off: no draws,
+        no new item keys, unchanged costs. The static `costs` bound grows by the longest stretched within prompt.
+        """
+        if not 0 <= probability <= 1 or pairs not in {"all", "cross"}:
+            raise ValueError("tempo_prompt_prob must lie in [0,1]; tempo_prompt_pairs all or cross")
+        self.tempo_prompt_prob, self.tempo_pairs, self.tempo_factors = probability, pairs, ()
+        if not probability:
+            return
+        if self.tempo_store is None or self.pairing != "within":
+            raise ValueError("Prompt tempo perturbation needs within pairing and a tempo-variant store")
+        if pairs == "cross" and not self.cross_prompt_prob:
+            raise ValueError("tempo_prompt_pairs: cross stretches cross prompts only; set cross_prompt_prob > 0")
+        self.tempo_factors = tuple(sorted({tempo_key(f) for f in factors})) if factors else self.tempo_store.tempos
+        self.tempo_store.check(self.db_path, self.split, self.tempo_factors, self.meta)
+        with sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True) as db:
+            uid = dict(db.execute("SELECT id, uid FROM samples WHERE split=?", (self.split,)))
+        uids = [uid[int(i)] for i in self.ids]
+        self.tempo_lengths = {t: self.tempo_store.lengths(uids, t) for t in self.tempo_factors}
+        slowest = min(self.tempo_factors)
+        if pairs == "all" and slowest < 1000:
+            # Longest within prompt: the cut fraction's upper end (plus the quiet-cut window), stretched.
+            top = self.prompt_fraction_long_max if self.long_prompt_prob else self.prompt_fraction[1]
+            window = self.quiet_window if self.prompt_cut == "quiet" else 0
+            cut = np.minimum(self.lengths - 1, np.ceil(self.lengths * top).astype(np.int64) + window)
+            self.costs = self.costs + np.maximum(np.ceil(cut * 1000 / slowest).astype(np.int64) - cut, 0).astype(
+                self.costs.dtype)
+
+    def context_plan(self, epoch, index):
+        """Rows forming this row's speaker context in `epoch`, or (): other utterances of its label, whole clips in
+        random order up to a length drawn in [min, max] frames (at most `max_utterances`; clips that would pass the
+        maximum are skipped); fewer than min frames give none. A pure function of (seed, epoch, index) on its own
+        stream, independent of prompt dropout; off draws nothing."""
+        if not self.context_prob:
+            return ()
+        start, end = int(self.group_start[index]), int(self.group_end[index])
+        if end - start < 2:
+            return ()
+        rng = random.Random(self.seed + epoch * len(self) + index + CONTEXT_STREAM)
+        if rng.random() >= self.context_prob:
+            return ()
+        low, high = self.context_frames
+        goal = rng.randint(low, high)
+        chosen, total = [], 0
+        for other in rng.sample(range(start, end - 1), end - start - 1):
+            other += other >= index
+            length = int(self.lengths[other])
+            if total + length > high:
+                continue
+            chosen.append(other)
+            total += length
+            if total >= goal or len(chosen) >= self.context_utterances:
+                break
+        return tuple(chosen) if total >= low else ()
+
+    def tempo_plan(self, epoch, index):
+        """Tempo (per mille) of this row's prompt in `epoch`, or None: a pure function of (seed, epoch, index)."""
+        if not self.tempo_prompt_prob:
+            return None
+        rng = random.Random(self.seed + epoch * len(self) + index + TEMPO_STREAM)
+        if rng.random() >= self.tempo_prompt_prob:
+            return None
+        return rng.choice(self.tempo_factors)
+
+    def tempo_latents(self, uid, tempo):
+        """Normalized latents of a row at `tempo`, like `row` normalizes the cache latents."""
+        return (self.tempo_store.latents(uid, tempo) - self.mean) / self.std
+
+    def planned_cut(self, epoch, index):
+        """The within cut `__getitem__` draws before the quiet-cut move (0 with prompt dropout)."""
+        rng = random.Random(self.seed + epoch * len(self) + index)
+        if rng.random() < self.prompt_dropout:
+            return 0
+        return round(int(self.lengths[index]) * rng.uniform(*self.prompt_range(epoch, index)))
 
     def cross_plan(self, epoch, index):
         """Rows forming this row's prompt in `epoch` (other utterances of its speaker), or () for a cut.
@@ -359,28 +494,47 @@ class LatentDataset(Dataset):
         if rng.random() >= self.cross_prompt_prob:
             return ()
         count = rng.randint(1, min(self.cross_prompt_utterances, end - start - 1))
+        tempo = self.tempo_plan(epoch, index)  # stretched references are measured at their stretched length
+        lengths = self.lengths if tempo is None else self.tempo_lengths[tempo]
         chosen, total = [], 0
         for other in rng.sample(range(start, end - 1), count):
             other += other >= index
-            if total + int(self.lengths[other]) <= self.cross_prompt_frames:
+            if total + int(lengths[other]) <= self.cross_prompt_frames:
                 chosen.append(other)
-                total += int(self.lengths[other])
+                total += int(lengths[other])
         return tuple(chosen)
 
     def epoch_costs(self, epoch):
-        """Exact prompt+target frames of every row in `epoch` (plus the tail-silence maximum)."""
+        """Prompt+target frames of every row in `epoch` (plus the tail-silence maximum): exact for cross prompts, and
+        for stretched within prompts bounded by the planned cut plus the quiet-cut window."""
         costs = self.lengths + self.tail_silence_frames
+        crossed = set()
         if self.cross_prompt_prob:
             for index in np.flatnonzero(self.group_end - self.group_start >= 2):
                 references = self.cross_plan(epoch, int(index))
                 if references:
-                    costs[index] += int(self.lengths[list(references)].sum())
+                    crossed.add(int(index))
+                    tempo = self.tempo_plan(epoch, int(index))
+                    lengths = self.lengths if tempo is None else self.tempo_lengths[tempo]
+                    costs[index] += int(lengths[list(references)].sum())
+        if self.tempo_prompt_prob and self.tempo_pairs == "all":
+            window = self.quiet_window if self.prompt_cut == "quiet" else 0
+            for index in range(len(self)):
+                tempo = self.tempo_plan(epoch, index)
+                if tempo is None or tempo >= 1000 or index in crossed:
+                    continue
+                cut = min(int(self.lengths[index]) - 1, self.planned_cut(epoch, index) + window)
+                if cut > 0:
+                    costs[index] += max(math.ceil(cut * 1000 / tempo) - cut, 0)
         return costs
 
-    def cross_prompt_item(self, index, references):
+    def cross_prompt_item(self, index, references, tempo=None):
         """Prompt = the references' latents back to back, transcript = their texts + target text, target =
-        the whole utterance; the joined layout reads it as one stream like a within item."""
+        the whole utterance; the joined layout reads it as one stream like a within item. `tempo`: the references'
+        stretched latents (their teacher frames cannot be aligned and are marked invalid)."""
         target, refs = self.row(index), [self.row(r) for r in references]
+        if tempo is not None:
+            refs = [{**r, "latents": self.tempo_latents(r["uid"], tempo)} for r in refs]
         ids = [r["token_ids"] for r in refs]
         utf8 = [r["text_bytes"] for r in refs]
         return {
@@ -398,6 +552,7 @@ class LatentDataset(Dataset):
             "text_normalization": self.meta.get("text_normalization", "unicode-v1"),
             "layout": self.layout,
             **pair_teacher(refs, target),  # teacher frames of the references back to back, like the latents
+            **({"prompt_tempo": tempo / 1000} if tempo is not None else {}),
         }
 
     def prompt_range(self, epoch, index):
@@ -422,10 +577,46 @@ class LatentDataset(Dataset):
         last = min(range(high - low + 1), key=lambda i: (distance[i], abs(low + i - cut + 1)))
         return low + last + 1
 
+    def uid(self, index):
+        """uid of dataset row `index` without reading its latents."""
+        return self._connection().execute("SELECT uid FROM samples WHERE id=?", (int(self.ids[index]),)).fetchone()[0]
+
+    def speaker_vector(self, epoch, index, item):
+        """Speaker-embedding condition [E] of an item: zeros without a prompt; the L2-normalized mean of the prompt
+        recordings' embeddings for cross prompts and cross pairs (they are the prompt audio, as at inference); for a
+        within cut another utterance of the label (`other`, its own stream: toggling it moves no other draw; the
+        item's own vector when the label has one utterance or the other is below `min_cosine`) or its own (`same`)."""
+        store = self.speaker_store
+        if not len(item["reference"]):
+            return torch.zeros(store.dim)
+        if item["reference_uid"] != item["uid"]:
+            vectors = torch.stack([store.speaker(uid) for uid in item["reference_uid"].split("|")])
+            return torch.nn.functional.normalize(
+                torch.nn.functional.normalize(vectors, dim=-1).mean(0), dim=-1)
+        own = store.speaker(item["uid"])
+        start, end = int(self.group_start[index]), int(self.group_end[index])
+        if self.speaker_source == "same" or end - start < 2:
+            return own
+        other = random.Random(self.seed + epoch * len(self) + index + SPEAKER_STREAM).randrange(start, end - 1)
+        other += other >= index
+        vector = store.speaker(self.uid(other))
+        similarity = torch.nn.functional.cosine_similarity(vector, own, dim=0)
+        return vector if similarity >= self.speaker_min_cosine else own
+
     def finish_item(self, item, epoch, index):
-        """Tail silence and the CTC label flag; the item itself when both are off."""
+        """Tail silence, the speaker condition and context, the CTC label and text unit flags; the item itself when
+        all are off."""
+        if self.speaker_store is not None:
+            item = {**item, "speaker_condition": self.speaker_vector(epoch, index, item)}
+        if self.context_prob:
+            rows = self.context_plan(epoch, index)
+            context = [self.row(r)["latents"] for r in rows]
+            item = {**item, "context": torch.cat(context) if context else torch.zeros(0, self.channels),
+                    "context_uid": "|".join(self.uid(r) for r in rows)}
         if self.ctc_targets == "chars":
             item = {**item, "ctc_targets": "chars"}
+        if self.text_units != "bytes":
+            item = {**item, "text_units": self.text_units}
         if not self.tail_silence_prob:
             return item
         rng = random.Random(self.seed + epoch * len(self) + index + TAIL_STREAM)
@@ -438,6 +629,16 @@ class LatentDataset(Dataset):
             teacher = item["teacher_target"]
             item["teacher_target"] = torch.cat([teacher, teacher.new_zeros(frames, teacher.size(-1))])
         return item
+
+
+def stretch_teacher(item):
+    """A stretched prompt has no frame-aligned teacher features: zero rows of its length, flagged so that
+    collate_teacher leaves them out of speech-REPA (`teacher_valid`)."""
+    if "teacher_reference" not in item:
+        return item
+    width = item["teacher_reference"].size(-1)
+    zeros = item["teacher_reference"].new_zeros(len(item["reference"]), width)
+    return {**item, "teacher_reference": zeros, "teacher_prompt_invalid": True}
 
 
 def collate(items):
@@ -470,6 +671,7 @@ def collate(items):
             tok, seg = tokenize(
                 item["reference_text"], item["text"], item.get("text_normalization", "unicode-v1"), layout
             )
+        tok, seg = to_units(tok, seg, item.get("text_units", "bytes"))
         latents.append(z)
         prompts.append(z * mask[:, None])
         masks.append(mask)
@@ -485,12 +687,29 @@ def collate(items):
         "segments": pad_sequence(segments, batch_first=True),
         **collate_teacher(items),
     }
+    carried = [("context" in item) for item in items]
+    if any(carried):
+        # Speaker contexts of different lengths (empty ones too), padded with a mask; at least one frame wide.
+        if not all(carried):
+            raise ValueError("Either every item or none carries a speaker context")
+        contexts = [item["context"] for item in items]
+        width = max(1, max(len(c) for c in contexts))
+        batch["context"] = torch.stack([torch.cat([c, c.new_zeros(width - len(c), c.size(1))]) for c in contexts])
+        batch["context_mask"] = torch.arange(width)[None] < torch.tensor([len(c) for c in contexts])[:, None]
+    present = [("speaker_condition" in item) for item in items]
+    if any(present):
+        if not all(present):
+            raise ValueError("Either every item or none carries a speaker_condition")
+        batch["speaker_condition"] = torch.stack([item["speaker_condition"] for item in items]).float()
+    units = {item.get("text_units", "bytes") for item in items}
+    if len(units) > 1:
+        raise ValueError("A batch cannot mix text units")
     labels = {item.get("ctc_targets", "bytes") for item in items}
     if labels != {"bytes"}:
         # Character CTC targets are built here, in the loader workers, from the exact model tokens.
         if labels != {"chars"}:
             raise ValueError("A batch cannot mix byte and character CTC targets")
-        batch["ctc_targets"], batch["ctc_target_lengths"] = char_ctc_targets(tokens)
+        batch["ctc_targets"], batch["ctc_target_lengths"] = char_ctc_targets(tokens, units.pop())
     return batch
 
 

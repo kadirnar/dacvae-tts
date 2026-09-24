@@ -4,7 +4,7 @@ Run it before GRPO. For each held-out prompt N candidates are sampled and scored
 standardization and weights as `post-train --mode grpo` (dacvae_tts/grpo.py); summary.json reports per metric the first
 candidate (a plain sample), the candidate mean, the composite-selected best, the per-metric best and the mean
 within-group spread. `--sampler sde` samples the GRPO rollout policy instead of the deployed ODE sampler: its spread is
-the signal the policy gradient gets (raise --sde-sigma / move the window if groups are degenerate).
+the signal the policy gradient gets (raise --sde-sigma / move the window if groups are degenerate or floored).
 
   python scripts/oracle_best_of_n.py --checkpoint runs/tr-w512-clean/step-0060000.pt --cache data/tr55/clean \\
       --output outputs/oracle-c60k --split val --limit 64 --candidates 8 --sample-steps 32 --guidance 5 \\

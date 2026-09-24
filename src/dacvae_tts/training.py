@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import sqlite3
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -24,7 +25,7 @@ from .contracts import sanitize, target_mask
 from .data import BucketBatchSampler, LatentDataset, collate, move_batch
 from .data import load_silence as raw_silence
 from .diagnostics import ActivationProbe, gradient_contributions, gradient_groups, loss_buckets
-from .model import FlowTTS, flow_loss, flow_target, reduce_flow
+from .model import FlowTTS, condition_inputs, flow_loss, flow_target, reduce_flow
 from .negatives import (
     augmented_negatives,
     delta_record,
@@ -151,12 +152,16 @@ class Objective(nn.Module):
         return terms
 
     def forward(self, batch):
+        # Optional voice conditions (speaker embedding, speaker context), encoded once like the text.
+        voice_inputs = condition_inputs(batch)
         cached = self.model.conditions(
-            batch["prompt"], batch["prompt_mask"], batch["tokens"], batch["segments"]
+            batch["prompt"], batch["prompt_mask"], batch["tokens"], batch["segments"], **voice_inputs
         )
         expanded, shared = batch, cached
         if self.expansion > 1 and self.training:
-            expanded = {key: value.repeat_interleave(self.expansion, 0) for key, value in batch.items()}
+            # The context clips are only read through `cached`: not repeated for the flow draws.
+            expanded = {key: value.repeat_interleave(self.expansion, 0) for key, value in batch.items()
+                        if key not in ("context", "context_mask")}
             shared = tuple(value.repeat_interleave(self.expansion, 0) for value in cached)
         repa = self.training and self.repa_weight > 0 and self.repa_active
         tla = self.training and self.tla_weight > 0
@@ -201,7 +206,7 @@ class Objective(nn.Module):
                 0,
                 details["times"][::copies],
                 details["noise"][::copies],
-                cached=self.model.conditions(batch["prompt"], batch["prompt_mask"], tokens, segments),
+                cached=self.model.conditions(batch["prompt"], batch["prompt_mask"], tokens, segments, **voice_inputs),
             )
             positive = flow[::copies]
             hinge = F.relu(positive + self.contrastive_margin * positive.detach() - negative)
@@ -272,6 +277,12 @@ def ema_key(decay):
 def ema_tracks(train):
     """Extra EMA tracks {checkpoint key: decay}; `ema_decay` itself always stays under `ema`."""
     return {ema_key(decay): decay for decay in train.ema_decays if decay != train.ema_decay}
+
+
+def ema_rate(decay, step, warmup=True):
+    """Decay of an EMA track at 0-based update `step`. The warm-up keeps the average from being dominated
+    by the random initialization; without it (train.ema_warmup: false, warm starts only) `decay` applies."""
+    return min(decay, (1 + step) / (10 + step)) if warmup else decay
 
 
 def weights_key(checkpoint, ema=True):
@@ -353,17 +364,24 @@ def time_sampling_at(step, train):
 def training_dataset(cache, cfg):
     """The training split of `cache` with every data option of `cfg`: the pairing, the training-pair options
     (#11) and the teacher stores (#10, relative store paths resolve against `cache`)."""
-    return LatentDataset(
+    data = LatentDataset(
         cache,
         "train",
         cfg.train.seed,
         prompt_dropout=cfg.train.prompt_dropout,
         pairing=cfg.train.pairing,
         layout=cfg.model.text_layout,
+        text_units=cfg.model.text_units,
         prompt_fraction=(cfg.train.prompt_fraction_min, cfg.train.prompt_fraction_max),
         **pair_options(cfg),
         **teacher_sources(cfg.train, cache),
+        **tempo_sources(cfg.train, cache),
+        **speaker_sources(cfg, cache),
     )
+    if cfg.model.speaker_condition_dim and data.speaker_store.dim != cfg.model.speaker_condition_dim:
+        raise ValueError(f"model.speaker_condition_dim={cfg.model.speaker_condition_dim}, the speaker store has "
+                         f"{data.speaker_store.dim}-d embeddings")
+    return data
 
 
 def training_batches(data, cfg, rank, world, frame_budget, device):
@@ -399,12 +417,34 @@ def training_batches(data, cfg, rank, world, frame_budget, device):
     return sampler, loader
 
 
+def check_held_out(decay_index, main_index):
+    """No training row of the decay cache may be a val/test row or speaker of the main cache.
+
+    Each cache is split on its own when merged: a main cache split by voice clusters (--split-map) or split
+    keys and a decay cache merged with plain label hashing or another seed would otherwise train on the
+    main cache's held-out voices during the decay, and validation (on the main cache) would score them.
+    """
+    uids, speakers = set(), set()
+    with sqlite3.connect(main_index) as db:
+        for uid, speaker in db.execute("SELECT uid, speaker FROM samples WHERE split != 'train'"):
+            uids.add(uid)
+            speakers.add(speaker)
+    with sqlite3.connect(decay_index) as db:
+        for uid, speaker in db.execute("SELECT uid, speaker FROM samples WHERE split = 'train'"):
+            if uid in uids or speaker in speakers:
+                raise ValueError(
+                    f"Decay-cache training row {uid} (speaker {speaker}) is held out (val/test) in the main "
+                    "cache; merge both caches with the same --split-map/--split-key and seed"
+                )
+
+
 def decay_phase_loader(cache, reference, cfg, rank, world, frame_budget, device):
     """Sampler and loader over the WSD decay cache, built exactly like the main training loader (the same
     pair, teacher and throughput options; see `training_dataset` and `training_batches`).
 
     Latents are normalized with the main cache's statistics, so the latent space does not shift at the
-    switch and the checkpoint's mean/std stay valid for inference; the codec metadata must match. The
+    switch and the checkpoint's mean/std stay valid for inference; the codec metadata and the text
+    normalization must match, and no decay-cache training row may be held out in the main cache. The
     encoded-silence frame of tail silence / quiet cuts (#11) is re-standardized with the same statistics.
     Teacher stores given as relative paths are looked up in the decay cache, which needs its own
     extraction (or absolute store paths covering its rows).
@@ -413,6 +453,10 @@ def decay_phase_loader(cache, reference, cfg, rank, world, frame_budget, device)
     if not data.meta.get("merged"):
         raise ValueError("Run merge on the decay cache before training")
     check_compatibility(data.meta, reference.meta)
+    normalization = [meta.get("text_normalization", "unicode-v1") for meta in (data.meta, reference.meta)]
+    if normalization[0] != normalization[1]:
+        raise ValueError("The decay cache has a different text_normalization than the main cache")
+    check_held_out(data.db_path, reference.db_path)
     if data.channels != reference.channels:
         raise ValueError("The decay cache has a different latent width")
     data.mean, data.std = reference.mean, reference.std
@@ -421,19 +465,25 @@ def decay_phase_loader(cache, reference, cfg, rank, world, frame_budget, device)
     return training_batches(data, cfg, rank, world, frame_budget, device)
 
 
-def rng_state(device):
-    return {
+def rng_state(device, negatives=None):
+    """This rank's generator states; `negatives` is the in-step text_hinge generator (Objective.rng)."""
+    state = {
         "torch": torch.get_rng_state(),
         "python": random.getstate(),
         "cuda": torch.cuda.get_rng_state(device) if device.type == "cuda" else None,
     }
+    if negatives is not None:
+        state["negatives"] = negatives.getstate()
+    return state
 
 
-def restore_rng(state, device):
+def restore_rng(state, device, negatives=None):
     torch.set_rng_state(state["torch"])
     random.setstate(state["python"])
     if state["cuda"] is not None and device.type == "cuda":
         torch.cuda.set_rng_state(state["cuda"], device)
+    if negatives is not None and "negatives" in state:  # older checkpoints: the stream restarts, as before
+        negatives.setstate(state["negatives"])
 
 
 def shuffled_conditions(batch):
@@ -489,7 +539,66 @@ def pair_options(cfg):
         "tail_silence_max_seconds",
         "prompt_cut",
     )
-    return {**{name: getattr(cfg.train, name) for name in names}, "ctc_targets": cfg.model.ctc_targets}
+    options = {**{name: getattr(cfg.train, name) for name in names}, "ctc_targets": cfg.model.ctc_targets}
+    if cfg.train.speaker_context_prob:  # off: no context keywords, as for tempo below
+        options.update({name: getattr(cfg.train, name) for name in (
+            "speaker_context_prob", "speaker_context_min_seconds", "speaker_context_max_seconds",
+            "speaker_context_max_utterances")})
+    if cfg.train.tempo_prompt_prob:  # off: no tempo keywords at all, the dataset is built exactly as before
+        options.update(tempo_prompt_prob=cfg.train.tempo_prompt_prob,
+                       tempo_prompt_factors=cfg.train.tempo_prompt_factors,
+                       tempo_prompt_pairs=cfg.train.tempo_prompt_pairs)
+    return options
+
+
+CONTEXT_FIELDS = ("speaker_context", "speaker_context_width", "speaker_context_layers", "speaker_context_heads",
+                  "speaker_context_patch")
+
+
+def warm_start_config(warm, target):
+    """The warm-start checkpoint's model config as it may differ from `target`: dropout, and the speaker context
+    fields when the checkpoint has none (the zero-init context branch starts as that model)."""
+    changes = {"dropout": target.dropout}
+    if warm.speaker_context == "none":
+        changes.update({name: getattr(target, name) for name in CONTEXT_FIELDS})
+    return dataclasses.replace(warm, **changes)
+
+
+def warm_start(module, state):
+    """load_state_dict for --init-from: strict, except that a new speaker context branch may be missing."""
+    missing, unexpected = module.load_state_dict(state, strict=False)
+    stray = [key for key in missing if not key.startswith("speaker_context.")]
+    if unexpected or stray:
+        raise ValueError(f"--init-from weights do not match the model: missing {stray}, unexpected {unexpected}")
+
+
+def speaker_sources(cfg, cache):
+    """LatentDataset keywords of the speaker-embedding condition (model.speaker_condition_dim); empty if off."""
+    if not cfg.model.speaker_condition_dim:
+        return {}
+    from .teacher import resolve_store
+
+    return {"speaker_condition": resolve_store(cfg.train.speaker_condition, cache),
+            "speaker_condition_source": cfg.train.speaker_condition_source,
+            "speaker_condition_min_cosine": cfg.train.speaker_condition_min_cosine}
+
+
+def speaker_metadata(data):
+    """Checkpoint record of the speaker store's embedder: inference must embed prompts with the same model."""
+    if getattr(data, "speaker_store", None) is None:
+        return {}
+    meta = data.speaker_store.meta
+    return {"speaker_condition": {key: meta.get(key) for key in ("embedder", "model", "dim", "audio_source",
+                                                                  "audio_sources", "splits")}}
+
+
+def tempo_sources(train, cache):
+    """LatentDataset keyword for the tempo-variant store (relative paths resolve against `cache`); empty if off."""
+    if not train.tempo_prompt_prob:
+        return {}
+    from .teacher import resolve_store
+
+    return {"tempo_variants": resolve_store(train.tempo_variants, cache)}
 
 
 def train(args):
@@ -518,6 +627,9 @@ def train(args):
         if args.compile:
             cfg.train.compile = True if args.compile == "objective" else args.compile
         cfg.train.__post_init__()
+        if not cfg.train.ema_warmup and not args.resume and not getattr(args, "init_from", None):
+            # A resumed run was checked when it started (resume requires the same configuration).
+            raise ValueError("ema_warmup: false needs --init-from; from scratch the random weights dominate")
         if device.type == "cuda" and cfg.train.precision == "bf16" and not torch.cuda.is_bf16_supported():
             raise ValueError("This GPU does not support BF16; pass --precision fp32")
         torch.manual_seed(cfg.train.seed)
@@ -525,6 +637,7 @@ def train(args):
         pairing = dict(
             pairing=cfg.train.pairing,
             layout=cfg.model.text_layout,
+            text_units=cfg.model.text_units,
             prompt_fraction=(cfg.train.prompt_fraction_min, cfg.train.prompt_fraction_max),
         )
         data = training_dataset(args.cache, cfg)
@@ -541,7 +654,7 @@ def train(args):
             )
         validation = None
         if not args.no_validation:
-            val_data = LatentDataset(args.cache, "val", cfg.train.seed, **pairing)
+            val_data = LatentDataset(args.cache, "val", cfg.train.seed, **pairing, **speaker_sources(cfg, args.cache))
             val_sampler = BucketBatchSampler(val_data.costs, cfg.train.batch_size, rank, world, 12345)
             validation = DataLoader(
                 val_data,
@@ -563,7 +676,7 @@ def train(args):
             cfg.train.muon_momentum,
             fused=device.type == "cuda",
         )
-        start_step, epoch, batch_offset = 0, 0, 0
+        start_step, epoch, batch_offset, resumed_rng = 0, 0, 0, None
         if args.resume:
             saved = torch.load(args.resume, map_location="cpu", weights_only=True)
             # Checkpoints written before the optimizer became configurable were trained with AdamW.
@@ -585,20 +698,22 @@ def train(args):
                 average.load_state_dict(saved[key])
             optimizer.load_state_dict(saved["optimizer"])
             start_step, epoch, batch_offset = saved["step"], saved["epoch"], saved["batch_offset"]
-            restore_rng(saved["rng"][rank], device)
+            resumed_rng = saved["rng"][rank]  # restored once the objective (and its generator) exists
         else:
             if getattr(args, "init_from", None):
                 # Warm start: weights only. Schedule, optimizer state and data order start fresh, so
                 # a run can continue on a larger cache than the one that produced the checkpoint.
                 warm = torch.load(args.init_from, map_location="cpu", weights_only=True)
                 warm_model = Config.from_dict(warm["config"]).model
-                # Dropout has no parameters, so a run may switch it on or off when warm starting.
-                if dataclasses.replace(warm_model, dropout=cfg.model.dropout) != cfg.model:
-                    raise ValueError("--init-from requires an identical model configuration (except dropout)")
-                model.load_state_dict(warm["model"])
-                ema.load_state_dict(warm["ema"])
+                # Dropout has no parameters, so a run may switch it on or off when warm starting; a zero-init speaker
+                # context may be added to a checkpoint without one (it starts as that checkpoint's model).
+                if warm_start_config(warm_model, cfg.model) != cfg.model:
+                    raise ValueError("--init-from requires an identical model configuration (except dropout and an "
+                                     "added speaker context)")
+                warm_start(model, warm["model"])
+                warm_start(ema, warm["ema"])
                 for key, (_, average) in averages.items():
-                    average.load_state_dict(warm.get(key, warm["ema"]))
+                    warm_start(average, warm.get(key, warm["ema"]))
             torch.manual_seed(cfg.train.seed + rank)
             random.seed(cfg.train.seed + rank)
         silence = None
@@ -631,6 +746,8 @@ def train(args):
             tla_entropy=cfg.train.tla_entropy,
             guidance_weight=cfg.train.model_guidance_weight,
         ).train()
+        if resumed_rng is not None:
+            restore_rng(resumed_rng, device, objective.rng)
         raw_objective = objective  # compile/DDP wrap the module; helper methods stay reachable here
         eager_forward = model.forward
         eager_runner = model.block_runner
@@ -662,7 +779,10 @@ def train(args):
                     raise
                 model.forward = eager_forward
                 model.block_runner = eager_runner
-                objective = raw_objective
+                if world == 1:
+                    objective = module = raw_objective
+                # else: keep the DDP wrapper (it holds only raw_objective here) and retry through it, so
+                # this rank still joins the gradient all-reduce and `no_sync` stays available.
                 compiled = False
                 # Eager activations need roughly twice the memory of the compiled graph; recompute
                 # them instead so a run sized for the compiled path survives the switch.
@@ -678,7 +798,7 @@ def train(args):
                     ),
                     flush=True,
                 )
-                return raw_objective(batch)
+                return module(batch)
 
         if world > 1:
             objective = DDP(
@@ -849,11 +969,10 @@ def train(args):
                 diagnostics["consecutive_inactive_diagnostic_checks"] = dict(inactive)
             optimizer.step()
             with torch.no_grad():
-                # Warm-up keeps the average from being dominated by the random initialization.
-                decay = min(cfg.train.ema_decay, (1 + step) / (10 + step))
+                decay = ema_rate(cfg.train.ema_decay, step, cfg.train.ema_warmup)
                 torch._foreach_lerp_(list(ema.parameters()), list(model.parameters()), 1 - decay)
                 for track_decay, average in averages.values():
-                    decay = min(track_decay, (1 + step) / (10 + step))
+                    decay = ema_rate(track_decay, step, cfg.train.ema_warmup)
                     torch._foreach_lerp_(list(average.parameters()), list(model.parameters()), 1 - decay)
             if (step + 1) % cfg.train.log_every == 0 or step == start_step or diagnose:
                 if watch is not None:
@@ -934,7 +1053,7 @@ def train(args):
                 if watch is not None:
                     watch.check()  # never write a checkpoint after an unnoticed nonfinite update
                 states = [None] * world
-                state = rng_state(device)
+                state = rng_state(device, raw_objective.rng)
                 if world > 1:
                     dist.all_gather_object(states, state)
                 else:
@@ -953,6 +1072,7 @@ def train(args):
                         "frame_budget": args.frame_budget,
                         "cache_path": str(Path(args.cache).resolve()),
                         "codec": data.meta,
+                        **speaker_metadata(data),
                         "mean": data.mean,
                         "std": data.std,
                         "stage": "pretrain",

@@ -4,7 +4,7 @@ import json
 import multiprocessing
 import sqlite3
 import time
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import closing
 from functools import partial
@@ -23,6 +23,35 @@ from .speakers import assign_split, check_split_groups, compile_split_key, load_
 from .text import encode_ids, normalize
 
 ENGLISH_TAGS = {"en", "eng", "English", "english", "en-US", "en-GB"}
+UNRECORDED_SOURCE = "(unrecorded)"
+
+
+def source_summary(counts):
+    """{source: {"licenses", "prepared_rows"}} from accepted-row counts keyed by the manifest's (source, license).
+
+    Empty when no row has either column, so caches of manifests without them keep their metadata. The licenses
+    (CC0-1.0, MIT, CC-BY-3.0 in scripts/data/) live in metadata only: the index schema has no per-row column.
+    """
+    if all(source is None and license is None for source, license in counts):
+        return {}
+    summary = {}
+    for (source, license), rows in counts.items():
+        entry = summary.setdefault(UNRECORDED_SOURCE if source is None else source, {"licenses": [], "prepared_rows": 0})
+        entry["prepared_rows"] += rows
+        if license is not None and license not in entry["licenses"]:
+            entry["licenses"].append(license)
+    return {name: {**entry, "licenses": sorted(entry["licenses"])} for name, entry in sorted(summary.items())}
+
+
+def merge_source_summaries(summaries):
+    """Union of licenses and sum of prepared rows over the merge inputs' `sources` summaries."""
+    merged = {}
+    for summary in summaries:
+        for name, entry in summary.items():
+            target = merged.setdefault(name, {"licenses": set(), "prepared_rows": 0})
+            target["licenses"].update(entry["licenses"])
+            target["prepared_rows"] += entry["prepared_rows"]
+    return {name: {**entry, "licenses": sorted(entry["licenses"])} for name, entry in sorted(merged.items())}
 
 
 def source_manifest_digest(path):
@@ -192,6 +221,8 @@ def prepare_record(row, args, root, sample_rate):
                 row.get("end_seconds"),
             ),
             source=str(source) if not isinstance(source, io.BytesIO) else "embedded",
+            # scripts/data/ manifests name each row's corpus and license; other datasets may have neither.
+            corpus=tuple(None if row.get(key) is None else str(row[key]) for key in ("source", "license")),
         )
     except (ValueError, KeyError, OSError, sf.LibsndfileError) as exc:
         return {"uid": uid, "error": str(exc)}
@@ -275,6 +306,7 @@ def prepare(args):
     accepted, rejected, committed, audio_seconds = 0, 0, 0, 0.0
     counters = {"encoder_calls": 0, "oom_retries": 0}
     timings = {"input_wait_seconds": 0.0, "encode_seconds": 0.0, "write_seconds": 0.0}
+    corpora = Counter()  # accepted rows per manifest (source, license)
     source_path = Path(args.manifest).resolve()
     root = source_path if source_path.is_dir() else source_path.parent
     db = sqlite3.connect(out / "index.sqlite")
@@ -353,6 +385,7 @@ def prepare(args):
                         squares += z64.square().sum(0)
                         count += len(z)
                     accepted += 1
+                    corpora[record["corpus"]] += 1
                     audio_seconds += len(record["audio"]) / codec.sample_rate
                 if accepted - committed >= 1000:
                     db.commit()
@@ -420,6 +453,9 @@ def prepare(args):
     }
     if split_key:
         metadata.update(split_key=split_key.pattern, split_version="split_key_sha256_98_1_1_v1")
+    sources = source_summary(corpora)
+    if sources:
+        metadata["sources"] = sources
     save_stats(out / "stats.pt", count, sums, squares)
     # A completion marker is written only after both the index and statistics exist.
     (out / "metadata.json").write_text(json.dumps(metadata, indent=2))
@@ -447,7 +483,7 @@ def merge(args):
     db.executescript(SCHEMA)
     meta, duplicates, rejected, conflicts = None, 0, 0, 0
     partitions = {}
-    preparation_partitions = []
+    preparation_partitions, source_summaries = [], []
     fields = "uid,speaker,text,audio,shard,offset,frames,split,samples,digest"
     try:
         for directory in args.inputs:
@@ -458,6 +494,7 @@ def merge(args):
             if not current.get("complete"):
                 raise ValueError(f"Incomplete partition: {directory}")
             rejected += current.get("rejected", 0)
+            source_summaries.append((current.get("sources"), current.get("accepted", 0)))
             if "source" in current and "partition" in current:
                 key = (current["source"], current["partitions"])
                 partitions.setdefault(key, set()).add(current["partition"])
@@ -583,6 +620,13 @@ def merge(args):
                 "preparation_partitions": preparation_partitions,
             }
         )
+        if any(summary for summary, _ in source_summaries):
+            # Per-source licenses for attribution; counts are before merge-time drops (duplicates, --drop-uids,
+            # singletons), which the index cannot attribute to a source.
+            meta["sources"] = merge_source_summaries(
+                summary or {UNRECORDED_SOURCE: {"licenses": [], "prepared_rows": accepted}}
+                for summary, accepted in source_summaries
+            )
         if resplit:
             meta.update(
                 split_key=split_key.pattern if split_key else None,

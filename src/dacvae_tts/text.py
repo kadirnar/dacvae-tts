@@ -36,10 +36,82 @@ def normalize(text: str, version="unicode-v1", spoken_text=None) -> str:
 LAYOUTS = {"segments", "joined"}
 
 
-def tokenize(reference: str, target: str, version="unicode-v1", layout="segments"):
+def tokenize(reference: str, target: str, version="unicode-v1", layout="segments", units="bytes"):
     ref = normalize(reference, version).encode("utf-8") if reference.strip() else b""
     tgt = normalize(target, version).encode("utf-8")
-    return tokenize_bytes(ref, tgt, layout)
+    return to_units(*tokenize_bytes(ref, tgt, layout), units)
+
+
+# Character units (model.text_units: chars): one token per character. Ids are ISO-8859-9 (Latin-5, the Turkish
+# 8-bit code page) + BYTE_OFFSET: every ASCII character keeps its byte id, so spaces, punctuation, a-z and the
+# vocabulary size are those of byte models (embedding shapes, SPACE and the `tokens >= BYTE_OFFSET` "is text"
+# checks carry over), and every symbol turkish-v1/v2 lets through (Turkish letters with â î û and capitals) is one
+# token at 0xC2-0xFE instead of two UTF-8 bytes: an even length-aware RoPE diagonal, one CTC label per letter and
+# a per-character duration rule. A frozen standard, so ids never depend on a table order. No character id lies in
+# the UTF-8 continuation range 0x80-0xBF (Latin-5 symbols there map to UNIT_UNKNOWN), which (1) keeps UTF-8
+# lead-byte character counts valid on character rows and (2) tells byte rows from character rows (every non-ASCII
+# UTF-8 letter has a continuation byte). Other characters fall back to their NFKD base letter (ć -> c), else
+# UNIT_UNKNOWN (ASCII SUB). Caches keep their UTF-8 byte ids; `to_units` converts at load time.
+UNIT_CODEC = "iso8859_9"
+UNIT_UNKNOWN = 0x1A + BYTE_OFFSET
+CONTINUATION = (0x80 + BYTE_OFFSET, 0xBF + BYTE_OFFSET)  # UTF-8 continuation bytes as ids (inclusive)
+TEXT_UNITS = ("bytes", "chars")
+
+
+def _unit_id(character):
+    for candidate in (character, unicodedata.normalize("NFKD", character)[:1]):
+        try:
+            value = candidate.encode(UNIT_CODEC)[0] if candidate else None
+        except UnicodeEncodeError:
+            continue
+        if value is not None and not 0x80 <= value <= 0xBF and (value >= 0x20 or candidate in "\t\n"):
+            return value + BYTE_OFFSET
+    return UNIT_UNKNOWN
+
+
+def char_units(text):
+    """String -> character unit ids (NFC; Latin-5 + BYTE_OFFSET, see UNIT_CODEC). Combining marks left after NFC
+    are dropped: "i̇" (a non-Turkish lower() of İ) reads as "i"."""
+    return [_unit_id(c) for c in unicodedata.normalize("NFC", text) if unicodedata.category(c) != "Mn"]
+
+
+def units_text(values, units="bytes"):
+    """Text-unit ids (>= BYTE_OFFSET) -> string: UTF-8 bytes, or character units (Latin-5; unknown as U+FFFD)."""
+    data = bytes(v - BYTE_OFFSET for v in values)
+    if units == "bytes":
+        return data.decode("utf-8", errors="ignore")
+    return data.decode(UNIT_CODEC).replace("\x1a", "\ufffd")
+
+
+def to_units(tokens, segments, units="bytes"):
+    """Assembled byte-id rows (tokens, segments [S]) -> the same rows in `units`; bytes returns them unchanged.
+
+    Each run of text ids between special tokens (BOS/SEP/EOS) is decoded from UTF-8 and re-encoded as characters;
+    the run keeps its segment. Works for both layouts and for multi-utterance (cross) prompts.
+    """
+    if units == "bytes":
+        return tokens, segments
+    if units != "chars":
+        raise ValueError(f"text units must be one of {TEXT_UNITS}")
+    values, marks = tokens.tolist(), segments.tolist()
+    out_tokens, out_segments, run = [], [], []
+
+    def flush():
+        if run:
+            ids = char_units(units_text([values[i] for i in run]))
+            out_tokens.extend(ids)
+            out_segments.extend([marks[run[0]]] * len(ids))
+            run.clear()
+
+    for i, value in enumerate(values):
+        if value >= BYTE_OFFSET:
+            run.append(i)
+        else:
+            flush()
+            out_tokens.append(value)
+            out_segments.append(marks[i])
+    flush()
+    return torch.tensor(out_tokens, dtype=torch.int64), torch.tensor(out_segments, dtype=torch.int64)
 
 
 def corrupt_transcript(tokens, segments, rng):
@@ -183,20 +255,21 @@ def ctc_text(text):
     return " ".join("".join(characters).split())
 
 
-def char_ctc_targets(rows):
+def char_ctc_targets(rows, units="bytes"):
     """Assembled token rows ([B,S] or a list of [S]) -> padded character targets [B,T] and lengths [B].
 
-    The byte runs between special tokens (BOS/SEP/EOS/PAD) are decoded and joined by a space, so both
-    layouts and multi-utterance prompts give "reference words target words", like the byte targets.
+    The text runs between special tokens (BOS/SEP/EOS/PAD) are decoded (`units`: UTF-8 bytes or character
+    units) and joined by a space, so both layouts and multi-utterance prompts give "reference words target
+    words", like the byte targets.
     """
     targets = []
     for row in rows:
         runs, current = [], []
         for value in row.tolist() + [PAD]:
             if value >= BYTE_OFFSET:
-                current.append(value - BYTE_OFFSET)
+                current.append(value)
             elif current:
-                runs.append(bytes(current).decode("utf-8", errors="ignore"))
+                runs.append(units_text(current, units))
                 current = []
         targets.append(torch.tensor([CTC_INDEX[c] for c in ctc_text(" ".join(runs))], dtype=torch.int64))
     lengths = torch.tensor([len(t) for t in targets], dtype=torch.int64)

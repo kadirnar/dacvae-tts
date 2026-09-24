@@ -141,14 +141,23 @@ def main():
     )
 
     p = sub.add_parser("infer", help="Synthesize using a complete reference utterance and transcript")
-    add_inference_args(p)
+    add_inference_args(p, guidance=None)
     p.add_argument("--reference", "--ref-audio", dest="reference", required=True)
     p.add_argument(
         "--reference-text", help="Optional; omitted transcripts use ASR, not a transcript-free TTS model"
     )
-    p.add_argument("--asr-model", default="small.en")
+    p.add_argument("--context-audio", nargs="+", help="More recordings of the voice (no transcripts) for models with a "
+                   "speaker context (model.speaker_context); the context is the prompt plus these clips")
+    p.add_argument(
+        "--asr-model",
+        help="faster-whisper model of the reference ASR (default: small.en, or large-v3-turbo for a Turkish "
+        "checkpoint or a non-English --asr-language)",
+    )
     p.add_argument("--asr-device", choices=["cpu", "cuda"], default="cpu")
-    p.add_argument("--asr-language", default="en", help="Whisper language code of the reference audio")
+    p.add_argument(
+        "--asr-language",
+        help="Whisper language code of the reference audio (default: tr for turkish-* checkpoints, else en)",
+    )
     p.add_argument("--profile", action="store_true")
     p.add_argument("--text", required=True)
     p.add_argument("--seconds", type=float)
@@ -246,6 +255,8 @@ def main():
     p.add_argument("--output", required=True)
     p.add_argument("--bootstrap", type=positive_int, default=5000)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--interval", choices=("jackknife-t", "percentile"), default="jackknife-t",
+                   help="Paired interval: speaker jackknife with t(G-1) quantiles, or the percentile bootstrap")
 
     p = sub.add_parser("rank-pairs", help="Select non-regressing metric-ranked training pairs")
     p.add_argument("--scores", required=True)
@@ -446,7 +457,8 @@ def add_grpo_args(parser, training=True):
     t.add_argument("--monitor-audio", type=int, default=4, help="Monitor samples saved per evaluation")
 
 
-def add_inference_args(parser, steps=True):
+def add_inference_args(parser, steps=True, guidance=1.5):
+    """`guidance` None: an unset --guidance follows the checkpoint's recommended_guidance, else 1.5 (`infer`)."""
     add_codec_args(parser)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output", required=True)
@@ -457,8 +469,10 @@ def add_inference_args(parser, steps=True):
     parser.add_argument(
         "--guidance",
         type=float,
-        default=1.5,
-        help="1 disables CFG; use 1 for a distilled model with baked-in guidance",
+        default=guidance,
+        help="1 disables CFG; use 1 for a distilled model with baked-in guidance"
+        + ("" if guidance is not None else " (default: the checkpoint's recommended_guidance, e.g. 1 for "
+           "model-guidance and distilled checkpoints, else 1.5)"),
     )
     parser.add_argument("--sway", type=float, default=-1.0)
     parser.add_argument(

@@ -281,6 +281,61 @@ def test_merge_rejects_mixed_encoding_precision(cache, tmp_path):
         merge(SimpleNamespace(inputs=[cache, other], output=tmp_path / "merged"))
 
 
+def write_manifest(directory, name, count, **columns):
+    rows = []
+    for i in range(count):
+        path = directory / f"{name}-{i}.wav"
+        audio = np.random.default_rng([*name.encode(), i]).normal(0, 0.1, 400 + 8 * i).astype(np.float32)
+        sf.write(path, audio, 8000, subtype="FLOAT")
+        rows.append(dict(id=f"{name}-{i}", audio=path.name, text="Hello there.", speaker_id=f"{name}-{i // 2}",
+                         split="train", **columns))
+    manifest = directory / f"{name}.jsonl"
+    manifest.write_text("\n".join(map(json.dumps, rows)))
+    return manifest
+
+
+def test_source_licenses_reach_prepare_and_merge_metadata(tmp_path, monkeypatch):
+    # scripts/data/ manifests name each row's source and license (YODAS is CC-BY-3.0, which needs attribution);
+    # prepare used to drop both columns, so no cache recorded which licenses it contains.
+    import dacvae_tts.prepare as module
+
+    codec = ToyCodec()
+    monkeypatch.setattr(module, "Codec", lambda *args, **kwargs: codec)
+    yodas = write_manifest(tmp_path, "yodas", 4, source="yodas2-tr000", license="CC-BY-3.0")
+    lines = yodas.read_text().splitlines()
+    rejected = dict(json.loads(lines[0]), id="yodas-missing", audio="missing.wav")
+    yodas.write_text("\n".join([*lines, json.dumps(rejected)]))
+    manifests = {
+        "yodas": yodas,
+        "cv": write_manifest(tmp_path, "cv", 2, source="common-voice-tr", license="CC0-1.0"),
+        "plain": write_manifest(tmp_path, "plain", 2),  # a dataset without the columns
+    }
+    for name, manifest in manifests.items():
+        prepare(args_for(manifest, tmp_path / f"cache-{name}", max_seconds=2.0))
+    meta = {name: json.loads((tmp_path / f"cache-{name}" / "metadata.json").read_text()) for name in manifests}
+    assert meta["yodas"]["sources"] == {"yodas2-tr000": {"licenses": ["CC-BY-3.0"], "prepared_rows": 4}}
+    assert meta["yodas"]["rejected"] == 1  # rejected rows are not counted
+    assert "sources" not in meta["plain"]
+    # The index schema is untouched: the licenses live in metadata only.
+    schemas = set()
+    for name in manifests:
+        with sqlite3.connect(tmp_path / f"cache-{name}" / "index.sqlite") as db:
+            schemas.add(tuple(db.execute("SELECT name, sql FROM sqlite_master ORDER BY name").fetchall()))
+    assert len(schemas) == 1
+    merged = tmp_path / "merged"
+    merge(SimpleNamespace(inputs=[tmp_path / f"cache-{name}" for name in manifests], output=merged))
+    assert json.loads((merged / "metadata.json").read_text())["sources"] == {
+        "(unrecorded)": {"licenses": [], "prepared_rows": 2},
+        "common-voice-tr": {"licenses": ["CC0-1.0"], "prepared_rows": 2},
+        "yodas2-tr000": {"licenses": ["CC-BY-3.0"], "prepared_rows": 4},
+    }
+    merge(SimpleNamespace(inputs=[tmp_path / "cache-plain"], output=tmp_path / "plain-merged"))
+    assert "sources" not in json.loads((tmp_path / "plain-merged" / "metadata.json").read_text())
+    assert module.merge_source_summaries([meta["yodas"]["sources"], meta["yodas"]["sources"]]) == {
+        "yodas2-tr000": {"licenses": ["CC-BY-3.0"], "prepared_rows": 8}
+    }
+
+
 def test_folded_codec_parameters_stay_frozen(tmp_path, monkeypatch):
     import sys
 

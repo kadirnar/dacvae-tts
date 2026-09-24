@@ -216,7 +216,8 @@ def main():
                 rows.append(
                     {
                         **case,
-                        **{k: v for k, v in score.items() if k != "evaluator"},
+                        **score,
+                        "evaluator": evaluator.row_identity,  # compact: comparison.check_scorers reads it
                         "audio_seconds": result.metadata["audio_seconds"],
                         "duration_ratio": result.metadata["audio_seconds"] / case["ground_truth_seconds"],
                         "rtf": result.metadata["rtf"],

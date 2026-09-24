@@ -1,6 +1,7 @@
 import json
 import math
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +25,23 @@ WINDOW_OPTIONS = ("guidance_split", "guidance_late", "apg_eta_late", "apg_norm_l
 SAMPLER_OPTIONS += WINDOW_OPTIONS
 # Applied after sampling (Synthesizer._finish): per-channel moment matching and the decoder's pre-tanh gain.
 OUTPUT_OPTIONS = ("moment_match", "pre_tanh_gain")
+# faster-whisper models of the reference-transcript fallback: the English-only one for English checkpoints, a
+# multilingual one otherwise (an .en model cannot transcribe a Turkish prompt).
+ASR_MODELS = {"en": "small.en", "multilingual": "large-v3-turbo"}
+
+
+def asr_defaults(text_version, asr_model=None, asr_language=None):
+    """(Whisper model, language) for reference ASR: explicit choices are kept, the rest follow the checkpoint.
+
+    A turkish-* text normalization means Turkish prompts (language tr, multilingual model); other checkpoints keep
+    English (small.en). An explicitly chosen English-only (.en) model implies language en.
+    """
+    if asr_language is None:
+        turkish = str(text_version).startswith("turkish") and not str(asr_model or "").endswith(".en")
+        asr_language = "tr" if turkish else "en"
+    if asr_model is None:
+        asr_model = ASR_MODELS["en" if asr_language == "en" else "multilingual"]
+    return asr_model, asr_language
 
 
 @dataclass
@@ -34,6 +52,10 @@ class VoiceReference:
     timings: dict
     # audio.speech_timing of the prompt waveform (`articulation` duration rule); None until measured
     speech_timing: dict = None
+    # speaker-embedding condition [E] of speaker-conditioned models (Synthesizer.speaker_embedding); None until used
+    speaker_embedding: torch.Tensor = None
+    # speaker context [L,C] of speaker-context models: the prompt and any extra clips (Synthesizer.context_latents)
+    context: torch.Tensor = None
 
 
 @dataclass
@@ -45,6 +67,8 @@ class SynthesisResult:
 
 class Synthesizer:
     articulation_options = None  # keyword overrides of duration.articulation_seconds, e.g. {"comma_pause": 0.2}
+    text_units, rule_unit = "bytes", "bytes"  # a char-unit model sets both to its units in __init__
+    speaker_record, _speaker_embedder = None, None  # embedder of speaker-conditioned models, loaded on first use
 
     def __init__(
         self,
@@ -52,16 +76,18 @@ class Synthesizer:
         device="cuda",
         precision="bf16",
         compile_model=False,
-        asr_model="small.en",
+        asr_model=None,
         asr_device="cpu",
         profile=False,
         codec_options=None,
-        asr_language="en",
+        asr_language=None,
         codec=None,
         duration_model=None,
     ):
-        """`codec`: an already loaded Codec to share between checkpoints (same DACVAE weights and loudness)."""
-        self.asr_language = asr_language
+        """`codec`: an already loaded Codec to share between checkpoints (same DACVAE weights and loudness).
+
+        `asr_model`/`asr_language` (reference ASR fallback): None follows the checkpoint (see `asr_defaults`).
+        """
         started = time.perf_counter()
         self.device = torch.device(device)
         self.precision = precision
@@ -81,14 +107,37 @@ class Synthesizer:
         self.mean = self.checkpoint["mean"].to(device)
         self.std = self.checkpoint["std"].to(device)
         normalization_stats(self.mean, self.std, self.codec.latent_dim)
-        self.asr_model, self.asr_device, self._asr = asr_model, asr_device, None
         self.profile = profile
         self.text_version = self.checkpoint["codec"].get("text_normalization", "unicode-v1")
+        # Text units of the model; the prompt-rate rule keeps its frames per *unit* (characters for char models).
+        self.text_units = self.model.cfg.text_units
+        self.rule_unit = "chars" if self.text_units == "chars" else "bytes"
+        self.asr_model, self.asr_language = asr_defaults(self.text_version, asr_model, asr_language)
+        self.asr_device, self._asr = asr_device, None
+        # Guidance the checkpoint was prepared for (model guidance and distillation: 1, GRPO: its policy's); None if
+        # unset. Model guidance (train.model_guidance_weight w > 0) bakes CFG ~1/(1-w) into the conditional velocity.
+        self.recommended_guidance = self.checkpoint.get("recommended_guidance")
+        # Speaker-conditioned models embed every prompt with the speaker store's embedder (checkpoint record).
+        self.speaker_record = self.checkpoint.get("speaker_condition")
+        if self.model.speaker_condition is not None and not self.speaker_record:
+            raise ValueError("Speaker-conditioned checkpoint without the record of its speaker embedder")
+        self.model_guidance_weight = float(self.checkpoint["config"].get("train", {}).get("model_guidance_weight", 0))
         self.duration_profile = {}
         if compile_model:
             self.model.forward = torch.compile(self.model.forward, dynamic=True)
         self._sync()
         self.load_seconds = time.perf_counter() - started
+
+    def check_guidance(self, guidance):
+        """Warn when CFG is stacked on a model-guidance checkpoint, whose guidance is already built in."""
+        w = self.model_guidance_weight
+        if w > 0 and guidance != 1:
+            warnings.warn(
+                f"This checkpoint was trained with model guidance (w={w:g}) and already acts like CFG {1 / (1 - w):.3g};"
+                f" guidance={guidance:g} stacks on top (~{guidance / (1 - w):.3g} effective, over-saturation risk)."
+                " Sample it with guidance=1 (its recommended_guidance).",
+                stacklevel=3,
+            )
 
     def _sync(self):
         if self.device.type == "cuda":
@@ -104,8 +153,11 @@ class Synthesizer:
         timings[name] = time.perf_counter() - started
         return result
 
-    def transcribe_reference(self, path):
-        """Optional ASR convenience layer; the baseline TTS still consumes a transcript."""
+    def transcribe_reference(self, ref_audio):
+        """Optional ASR convenience layer; the baseline TTS still consumes a transcript.
+
+        `ref_audio`: a file path or a (waveform, sample_rate) pair of a mono recording, as prepare_reference takes.
+        """
         if self._asr is None:
             try:
                 from faster_whisper import WhisperModel
@@ -118,9 +170,19 @@ class Synthesizer:
                 device=self.asr_device,
                 compute_type="float16" if self.asr_device == "cuda" else "int8",
             )
-        audio = read_audio(path, 16000)
+        if isinstance(ref_audio, tuple):
+            import numpy as np
+            from scipy.signal import resample_poly
+
+            audio, rate = ref_audio
+            audio = np.asarray(audio.detach().cpu() if torch.is_tensor(audio) else audio, dtype=np.float32).reshape(-1)
+            if int(rate) != 16000:
+                factor = math.gcd(int(rate), 16000)
+                audio = resample_poly(audio, 16000 // factor, int(rate) // factor).astype(np.float32)
+        else:
+            audio = read_audio(ref_audio, 16000).numpy()
         segments, _ = self._asr.transcribe(
-            audio.numpy(),
+            audio,
             language=self.asr_language,
             beam_size=5,
             vad_filter=False,
@@ -131,8 +193,14 @@ class Synthesizer:
             raise ValueError("Reference ASR returned no text; use clear speech or supply reference_text")
         return transcript
 
-    def prepare_reference(self, ref_audio, reference_text=None):
-        """`ref_audio`: a file path, or a (waveform, sample_rate) pair of an already loaded mono recording."""
+    def prepare_reference(self, ref_audio, reference_text=None, context_audio=None):
+        """`ref_audio`: a file path, or a (waveform, sample_rate) pair of an already loaded mono recording.
+
+        `context_audio`: more recordings of the same voice (same forms, no transcripts needed) for models with a
+        speaker context; the context is the prompt plus these clips, whole clips up to the trained maximum length.
+        """
+        if context_audio and getattr(self.model, "speaker_context", None) is None:
+            raise ValueError("context_audio needs a model with a speaker context (model.speaker_context)")
         timings = {}
         started = time.perf_counter()
         if isinstance(ref_audio, tuple):
@@ -149,7 +217,30 @@ class Synthesizer:
             source = f"asr:{self.asr_model}"
         if not reference_text.strip():
             raise ValueError("A nonempty reference transcript is required internally")
-        return VoiceReference(latents, reference_text, source, timings, self.measure_speech_timing(ref_audio))
+        voice = VoiceReference(latents, reference_text, source, timings, self.measure_speech_timing(ref_audio))
+        if context_audio:
+            clips = [self.encode_reference(*clip) if isinstance(clip, tuple) else self.reference(clip)
+                     for clip in context_audio]
+            voice.context = self.context_latents(voice, clips)
+        return voice
+
+    def context_latents(self, reference, clips=()):
+        """Speaker context [L,C] of speaker-context models (None otherwise): the prompt's latents, then the given
+        extra clips' in order, whole clips while the total stays within the trained maximum (the prompt always
+        stays). Computed once per VoiceReference; references without extra clips use the prompt alone."""
+        if getattr(self.model, "speaker_context", None) is None:
+            return None
+        if getattr(reference, "context", None) is not None and not clips:
+            return reference.context
+        train = self.checkpoint.get("config", {}).get("train", {}) if hasattr(self, "checkpoint") else {}
+        limit = round(train.get("speaker_context_max_seconds", 30.0) * self.codec.sample_rate / self.codec.hop_length)
+        parts, total = [reference.latents.to(self.device)], len(reference.latents)
+        for clip in clips:
+            if total + len(clip) <= limit:
+                parts.append(clip.to(self.device))
+                total += len(clip)
+        reference.context = torch.cat(parts)
+        return reference.context
 
     def measure_speech_timing(self, ref_audio):
         """audio.speech_timing of a prompt file or (waveform, rate) pair; None if the file cannot be read again.
@@ -174,6 +265,22 @@ class Synthesizer:
         if not len(audio) or not np.isfinite(audio).all():
             return None
         return {**speech_timing(audio, int(rate)), "source": "waveform"}
+
+    @torch.inference_mode()
+    def speaker_embedding(self, reference):
+        """Speaker-embedding condition [E] of a voice for speaker-conditioned models, else None; computed once per
+        VoiceReference with the checkpoint's embedder on the prompt's codec reconstruction (speaker stores of
+        Parquet-prepared caches embed decoded latents as well, and every reference has latents)."""
+        if getattr(self.model, "speaker_condition", None) is None:
+            return None
+        if getattr(reference, "speaker_embedding", None) is None:
+            if self._speaker_embedder is None:
+                from .speakers import condition_embedder
+
+                self._speaker_embedder = condition_embedder(self.speaker_record, str(self.device))
+            audio = self.codec.decode(reference.latents.to(self.device).float() * self.std + self.mean)
+            reference.speaker_embedding = self._speaker_embedder(audio.float().cpu().numpy(), self.codec.sample_rate)
+        return reference.speaker_embedding
 
     @torch.inference_mode()
     def prompt_timing(self, reference):
@@ -208,9 +315,13 @@ class Synthesizer:
         guidance_until=1.0,
         noise_scale=1.0,
         duration_mode="rule",
+        context_audio=None,
         **sampler,
     ):
         """Use text + ref_audio; no speaker ID, enrollment table, or per-voice fine-tuning.
+
+        `context_audio`: further recordings of the voice (paths or (waveform, rate) pairs, no transcripts) for
+        speaker-context models; see `prepare_reference`.
 
         `sampler` takes the further options of `model.sample` (guidance_from, cfg_rescale, apg_eta, apg_norm,
         apg_momentum, speaker_guidance, and the late guidance window: guidance_split, guidance_late, apg_eta_late,
@@ -222,12 +333,14 @@ class Synthesizer:
         unknown = set(sampler) - set(SAMPLER_OPTIONS) - set(OUTPUT_OPTIONS)
         if unknown:
             raise TypeError(f"Unknown sampler options: {sorted(unknown)}")
+        self.check_guidance(guidance)
         started = time.perf_counter()
         reused = reference is not None
-        reference = reference or self.prepare_reference(ref_audio, reference_text)
+        reference = reference or self.prepare_reference(ref_audio, reference_text, context_audio)
         timing = self._articulation_timing(reference, seconds, duration_mode)
         batch = self.make_batch(reference.latents, reference.transcript, text, seconds, duration_scale, duration_mode,
-                                timing=timing)
+                                timing=timing, speaker=self.speaker_embedding(reference),
+                                context=self.context_latents(reference))
         audio, _, metadata = self.generate(
             batch, steps, guidance, seed, sway, guidance_until, noise_scale, **sampler
         )
@@ -299,7 +412,8 @@ class Synthesizer:
             raise ValueError(f"duration_mode must be one of {DURATION_MODES}")
         version = self.text_version
         reference_text, text = normalize(reference_text, version), normalize(text, version)
-        profile = {"duration_rule": "reference_frames_per_byte", "duration_mode": duration_mode}
+        rule = "reference_frames_per_byte" if self.rule_unit == "bytes" else "reference_frames_per_char"
+        profile = {"duration_rule": rule, "duration_mode": duration_mode}
         if duration_mode == "auto":
             duration_mode = auto_mode(reference_frames, reference_text)
             profile["duration_auto"] = duration_mode
@@ -313,12 +427,12 @@ class Synthesizer:
             needed, extra = articulation_seconds(timing, reference_text, text, **(self.articulation_options or {}))
             profile.update(extra)
             if needed is None:  # no usable prompt timing: the byte rule, flagged in the profile
-                frames = rule_frames(reference_frames, reference_text, text, "bytes")
+                frames = rule_frames(reference_frames, reference_text, text, self.rule_unit)
             else:
                 frames = needed * self.codec.sample_rate / self.codec.hop_length
                 profile["duration_rule"] = "prompt_syllables_per_speaking_second"
         else:
-            frames = rule_frames(reference_frames, reference_text, text, "bytes")
+            frames = rule_frames(reference_frames, reference_text, text, self.rule_unit)
             if duration_mode == "clamp":
                 factor = clamp_scale(reference_frames, reference_text)
                 frames *= factor
@@ -326,13 +440,33 @@ class Synthesizer:
         return round(frames * duration_scale), profile
 
     @torch.inference_mode()
+    def head_frames(self, reference, tokens, segments, profile):
+        """Unrounded target frames from the model's duration head: prompt latents [L,C], tokens/segments [1,S].
+
+        The head predicts log frames per target byte; `profile` receives the timing when profiling.
+        """
+        prompt = reference[None]
+        mask = torch.ones(prompt.shape[:2], device=self.device, dtype=torch.bool)
+        with autocast(self.device, self.precision):
+            log_rate = self._measure(
+                lambda: self.model.predict_duration(prompt, mask, tokens, segments),
+                profile,
+                "duration_prediction_seconds",
+            )
+        nbytes = ((segments == 1) & (tokens >= BYTE_OFFSET)).sum().item()
+        return math.exp(float(log_rate.clamp(-4, 6))) * nbytes
+
+    @torch.inference_mode()
     def make_batch(self, reference, reference_text, text, seconds=None, duration_scale=1.0, duration_mode="rule",
-                   timing=None):
+                   timing=None, speaker=None, context=None):
+        """`speaker`: the voice's speaker-embedding condition [E] (speaker_embedding) for speaker-conditioned models;
+        `context`: its speaker context [L,C] (context_latents) for speaker-context models."""
         if not math.isfinite(duration_scale) or duration_scale <= 0:
             raise ValueError("duration_scale must be finite and positive")
         reference = reference.to(self.device)
         layout = self.model.cfg.text_layout
-        tokens, segments = tokenize(reference_text, text, version=self.text_version, layout=layout)
+        tokens, segments = tokenize(reference_text, text, version=self.text_version, layout=layout,
+                                    units=self.text_units)
         tokens, segments = tokens[None].to(self.device), segments[None].to(self.device)
         if tokens.numel() > 2048:
             raise ValueError("Text too long; split into sentences before synthesis")
@@ -343,17 +477,8 @@ class Synthesizer:
                 len(reference), reference_text, text, None, duration_scale, duration_mode, timing=timing
             )
         elif seconds is None:
-            prompt = reference[None]
-            mask = torch.ones(prompt.shape[:2], device=self.device, dtype=torch.bool)
-            with autocast(self.device, self.precision):
-                self.duration_profile = {}
-                log_rate = self._measure(
-                    lambda: self.model.predict_duration(prompt, mask, tokens, segments),
-                    self.duration_profile,
-                    "duration_prediction_seconds",
-                )
-            nbytes = ((segments == 1) & (tokens >= BYTE_OFFSET)).sum().item()
-            frames = round(math.exp(float(log_rate.clamp(-4, 6))) * nbytes * duration_scale)
+            self.duration_profile = {}
+            frames = round(self.head_frames(reference, tokens, segments, self.duration_profile) * duration_scale)
         else:
             self.duration_profile = {"duration_override_seconds": seconds}
             if not math.isfinite(seconds) or seconds <= 0:
@@ -367,7 +492,8 @@ class Synthesizer:
         prompt = torch.zeros(1, len(reference) + frames, self.codec.latent_dim, device=self.device)
         prompt[:, : len(reference)] = reference
         prompt_mask = torch.arange(prompt.size(1), device=self.device)[None] < len(reference)
-        only_tokens, only_segments = tokenize("", text, version=self.text_version, layout=layout)
+        only_tokens, only_segments = tokenize("", text, version=self.text_version, layout=layout,
+                                              units=self.text_units)
         return {
             "prompt": prompt,
             "prompt_mask": prompt_mask,
@@ -376,6 +502,8 @@ class Synthesizer:
             "segments": segments,
             "text_only_tokens": only_tokens[None].to(self.device),
             "text_only_segments": only_segments[None].to(self.device),
+            **({"speaker": speaker[None].to(self.device)} if speaker is not None else {}),
+            **(context_batch(context, 1, self.device) if context is not None else {}),
         }
 
     def _sample(self, batch, steps, guidance, seed, sway, stats, condition_cache=None, **sampler):
@@ -387,7 +515,8 @@ class Synthesizer:
             )
         return sample(
             self.model, **core, steps=steps, guidance=guidance, seed=seed, sway=sway, stats=stats,
-            condition_cache=condition_cache, **sampler,
+            condition_cache=condition_cache, speaker=batch.get("speaker"), context=batch.get("context"),
+            context_mask=batch.get("context_mask"), **sampler,
         )
 
     @staticmethod
@@ -440,7 +569,8 @@ class Synthesizer:
                 lambda: self.model.text(batch["tokens"], batch["segments"]), stages, "text_encoding_seconds"
             )
             voice = self._measure(
-                lambda: self.model.reference_summary(batch["prompt"], batch["prompt_mask"]),
+                lambda: self.model.reference_summary(batch["prompt"], batch["prompt_mask"], batch.get("speaker"),
+                                                     batch.get("context"), batch.get("context_mask")),
                 stages,
                 "reference_summary_seconds",
             )
@@ -511,7 +641,8 @@ class Synthesizer:
         of a text differ only in their initial noise, which is what best-of-N reranking needs. `selector`, e.g.
         quality.CandidateScorer.select, is called as selector(text, waveforms, sample_rate) -> (best index,
         per-candidate scores): each candidate then carries its `selection` scores and metadata["selected"] lists
-        the best index per text (results keep the candidate order).
+        the best index per text (results keep the candidate order). Target lengths follow `synthesize`: `seconds`,
+        else a duration-head model's head, else `duration_mode`.
 
         `duration_factors` (e.g. [1.0, 0.9, 1.1]) makes the candidates duration-diverse as well: candidate k gets
         target length x factors[k % len(factors)] (on top of `duration_scale`) and its own noise, so `candidates`
@@ -527,6 +658,7 @@ class Synthesizer:
         unknown = set(sampler) - set(SAMPLER_OPTIONS) - set(OUTPUT_OPTIONS)
         if unknown:
             raise TypeError(f"Unknown sampler options: {sorted(unknown)}")
+        self.check_guidance(guidance)
         output = self._output_options(sampler)
         if not texts or candidates < 1 or max_rows < 1:
             raise ValueError("Need at least one text, one candidate and a positive batch size")
@@ -537,16 +669,29 @@ class Synthesizer:
         latents = reference.latents.to(self.device)
         layout = self.model.cfg.text_layout
         timing = self._articulation_timing(reference, seconds, duration_mode)
+        speaker, context = self.speaker_embedding(reference), self.context_latents(reference)
         requests = []
         for text in texts:
-            options = [self.target_frames(len(latents), reference.transcript, text, seconds, duration_scale * factor,
-                                          duration_mode, timing=timing) for factor in factors]
-            if not all(0.25 <= frames * self.codec.hop_length / self.codec.sample_rate <= 30 for frames, _ in options):
-                raise ValueError(f"Target duration outside .25–30 s for: {text[:60]!r}; split the text")
-            tokens, segments = tokenize(reference.transcript, text, version=self.text_version, layout=layout)
-            only_tokens, only_segments = tokenize("", text, version=self.text_version, layout=layout)
+            tokens, segments = tokenize(reference.transcript, text, version=self.text_version, layout=layout, units=self.text_units)
+            only_tokens, only_segments = tokenize("", text, version=self.text_version, layout=layout,
+                                              units=self.text_units)
             if tokens.numel() > 2048:
                 raise ValueError("Text too long; split into sentences before synthesis")
+            if seconds is None and self.model.duration is not None:
+                # A duration-head model is sized by its head, as in make_batch (synthesize); the rules are for
+                # rule-duration models.
+                if not math.isfinite(duration_scale) or duration_scale <= 0:
+                    raise ValueError("duration_scale must be finite and positive")
+                profile = {"duration_rule": "duration_head"}
+                predicted = self.head_frames(latents, tokens[None].to(self.device), segments[None].to(self.device),
+                                             profile)
+                options = [(round(predicted * (duration_scale * factor)), profile) for factor in factors]
+            else:
+                options = [self.target_frames(len(latents), reference.transcript, text, seconds,
+                                              duration_scale * factor, duration_mode, timing=timing)
+                           for factor in factors]
+            if not all(0.25 <= frames * self.codec.hop_length / self.codec.sample_rate <= 30 for frames, _ in options):
+                raise ValueError(f"Target duration outside .25–30 s for: {text[:60]!r}; split the text")
             requests.append((options, tokens, segments, only_tokens, only_segments))
         rows = [(i, k) for i in range(len(texts)) for k in range(candidates)]
         results = [[None] * candidates for _ in texts]
@@ -571,6 +716,8 @@ class Synthesizer:
                 "segments": pad([requests[i][2] for i, _ in chunk], batch_first=True).to(self.device),
                 "text_only_tokens": pad([requests[i][3] for i, _ in chunk], batch_first=True).to(self.device),
                 "text_only_segments": pad([requests[i][4] for i, _ in chunk], batch_first=True).to(self.device),
+                **({"speaker": speaker.to(self.device).expand(len(chunk), -1)} if speaker is not None else {}),
+                **(context_batch(context, len(chunk), self.device) if context is not None else {}),
             }
             tick = time.perf_counter()
             with autocast(self.device, self.precision):
@@ -619,6 +766,13 @@ class Synthesizer:
         return results, metadata
 
 
+def context_batch(context, rows, device):
+    """Batch entries of one voice's speaker context [L,C] shared by `rows` rows."""
+    context = context.to(device)
+    return {"context": context[None].expand(rows, -1, -1),
+            "context_mask": torch.ones(rows, len(context), dtype=torch.bool, device=device)}
+
+
 def infer(args):
     tts = Synthesizer(
         args.checkpoint,
@@ -629,8 +783,11 @@ def infer(args):
         args.asr_device,
         args.profile,
         codec_options=backend_options(args),
-        asr_language=getattr(args, "asr_language", "en"),
+        asr_language=getattr(args, "asr_language", None),
     )
+    guidance = args.guidance
+    if guidance is None:  # unset --guidance: what the checkpoint was prepared for, else the long-standing 1.5
+        guidance = 1.5 if tts.recommended_guidance is None else float(tts.recommended_guidance)
     result = tts.synthesize(
         args.text,
         args.reference,
@@ -639,7 +796,7 @@ def infer(args):
         seconds=args.seconds,
         duration_scale=args.duration_scale,
         steps=args.steps,
-        guidance=args.guidance,
+        guidance=guidance,
         seed=args.seed,
         sway=args.sway,
         guidance_until=getattr(args, "guidance_until", 1.0),
@@ -651,6 +808,7 @@ def infer(args):
         apg_norm=getattr(args, "apg_norm", 0.0),
         apg_momentum=getattr(args, "apg_momentum", 0.0),
         speaker_guidance=getattr(args, "speaker_guidance", None),
+        context_audio=getattr(args, "context_audio", None),
         **{name: getattr(args, name) for name in (*WINDOW_OPTIONS, *OUTPUT_OPTIONS) if hasattr(args, name)},
     )
     print(json.dumps(result.metadata, indent=2))

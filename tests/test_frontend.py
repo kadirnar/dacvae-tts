@@ -15,6 +15,7 @@ from dacvae_tts.frontend import locative, prepare_text, speakable, spell, split_
         ("Dolar 34,5 ₺ oldu. Fiyatı $199.", "Dolar otuz dört virgül beş lira oldu. Fiyatı yüz doksan dokuz dolar."),
         ("Hava 25°C, gece -3 derece.", "Hava yirmi beş derece, gece eksi üç derece."),
         ("Dr. Ahmet ve Prof. Ayşe geldi.", "Doktor Ahmet ve Profesör Ayşe geldi."),
+        ("Prof.Dr. Ahmet ve Öğr.Gör. Ayşe geldi.", "Profesör Doktor Ahmet ve öğretim görevlisi Ayşe geldi."),
         ("T.C. Sağlık Bakanlığı ve Koç Holding A.Ş. açıkladı.", "te ce Sağlık Bakanlığı ve Koç Holding anonim şirketi açıkladı."),
         ("Yılmaz Ltd. Şti. kuruldu.", "Yılmaz limited şirketi kuruldu."),
         ("elma, armut vs. Sonra geldi.", "elma, armut vesaire. Sonra geldi."),
@@ -100,6 +101,12 @@ def test_dort_softening_currency_suffixes_and_combining_marks():
     assert speakable("Saat 14.04'e kadar, 4'te ve 4'üncü sırada.")[0] == (
         "Saat on dört sıfır dörde kadar, dörtte ve dördüncü sırada."
     )
+    # An ordinal suffix with further suffixes reads as the ordinal (turkish-v1 keeps its old spelling).
+    assert speakable("2'incisi geldi, 7'inciye gitti.")[0] == "ikincisi geldi, yedinciye gitti."
+    assert speakable("2'incisi geldi.", "turkish-v1")[0] == "ikiincisi geldi."
+    # A suffix-initial d after a voiceless final consonant is t: 5'de is read "beşte".
+    assert speakable("Saat 5'de, 3'den 40'da.")[0] == "Saat beşte, üçten kırkta."
+    assert speakable("Saat 5'de.", "turkish-v1")[0] == "Saat beşde."
     # The suffix after a currency symbol was written for the number; it moves to the currency word.
     assert speakable("$4'e, 4$'a, €4'ü, ₺4'ün, $5'in ve €2'ye aldım.")[0] == (
         "dört dolara, dört dolara, dört avroyu, dört liranın, beş doların ve iki avroya aldım."

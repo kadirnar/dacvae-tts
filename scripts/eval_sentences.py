@@ -17,7 +17,20 @@ recording (the published SIM-o). The originals come from the dataset: this scrip
   python scripts/eval_sentences.py ... --rescore --protocol-v2 --prompt-audio data/tr55/eval-audio \
       --dnsmos models/sig_bak_ovr.onnx [--band-limit-8k] [--utmosv2]
 
-`--band-limit-8k` is the FreyaTTS scoring protocol (8 kHz resample before ASR only) for Freya-TR-Eval tables.
+Leak-free prompts (`--prompt-set`, instead of `--cache`): a JSON list of {"audio", "text", "speaker"[, "uid"]} entries,
+e.g. Common Voice test speakers from scripts/data/make_prompt_set.py, which never occur in the podcast training data.
+The prompt audio is encoded like any reference (loudness, codec) and is itself the original recording of `sim_o`:
+
+  python scripts/data/make_prompt_set.py --parquet data/cv17-tr/test --exclude-sentences data/eval/freya_tr_eval.jsonl \
+      --speakers 48 --dnsmos models/sig_bak_ovr.onnx --output data/eval/cv-tr-prompts
+  python scripts/eval_sentences.py ... --prompt-set data/eval/cv-tr-prompts/prompts.json --protocol-v2 --sim-o
+
+The cache prompts come from ~10 held-out podcast speakers, most of whose voices also occur in training under other
+episode labels; many independent voices also make the speaker-clustered intervals much tighter.
+
+`--band-limit-8k` is the ASR input of the FreyaTTS scoring protocol (8 kHz resample before ASR only). Their text
+scoring differs from ours (apostrophes become spaces, CER counts spaces): `--freya-metric` adds `freya_wer` /
+`freya_cer` under that convention next to the usual `wer` / `cer`; use both for Freya-TR-Eval tables.
 UTMOS comes from the protocol switches: `--utmos` (or `--utmos utmos22`) scores every output with UTMOS22-strong
 into `utmos`, `--utmosv2` (or `--utmos utmosv2`) with UTMOSv2 into `utmosv2`; `--select-utmos` is only the best-of-N
 selector's UTMOS.
@@ -45,7 +58,14 @@ from dacvae_tts.eval_protocol import (  # noqa: E402
     utmos_models,
 )
 from dacvae_tts.inference import OUTPUT_OPTIONS, WINDOW_OPTIONS, Synthesizer, VoiceReference  # noqa: E402
-from dacvae_tts.metrics import Evaluator, summarize  # noqa: E402
+from dacvae_tts.metrics import (  # noqa: E402
+    METRIC_NORMALIZATIONS,
+    Evaluator,
+    default_metric_normalization,
+    freya_error_counts,
+    row_identity,
+    summarize,
+)
 from dacvae_tts.quality import (  # noqa: E402
     METRIC_FAMILY,
     CandidateScorer,
@@ -140,14 +160,39 @@ def audio_stats(path):
             "lufs": float(loudness) if np.isfinite(loudness) else -70.0}
 
 
+def load_prompt_set(path, count=None):
+    """Cases of a --prompt-set JSON list of {"audio", "text", "speaker"[, "uid"]}: the select_cases fields a prompt
+    needs (speaker, prompt_uid, prompt_text) plus `prompt_audio`, the recording (relative paths: to the JSON file).
+    The first `count` entries (all when None), in file order."""
+    entries = json.loads(Path(path).read_text())
+    cases = []
+    for entry in entries:
+        audio = Path(entry["audio"])
+        audio = audio if audio.is_absolute() else Path(path).parent / audio
+        if not audio.exists():
+            raise SystemExit(f"--prompt-set: missing prompt recording {audio}")
+        if not str(entry.get("text", "")).strip() or not str(entry.get("speaker", "")).strip():
+            raise SystemExit(f"--prompt-set: entry {entry.get('audio')} needs a transcript and a speaker")
+        uid = str(entry.get("uid") or audio.name)
+        cases.append({"speaker": str(entry["speaker"]), "prompt_uid": uid, "prompt_text": entry["text"],
+                      "prompt_audio": str(audio)})
+    if len({case["prompt_uid"] for case in cases}) != len(cases):
+        raise SystemExit("--prompt-set: prompt uids (or file names) must be unique")
+    return cases[:count] if count else cases
+
+
 def original_prompt_finder(args, prompts, cases):
-    """prompt WAV name -> original recording (export_case_audio.py naming) or None; never the codec prompt."""
-    if not args.prompt_audio:
+    """prompt WAV name -> original recording (a --prompt-set file, else export_case_audio.py naming) or None; never
+    the codec prompt."""
+    sets = {prompt_name(number): case["prompt_audio"] for number, case in enumerate(cases) if case.get("prompt_audio")}
+    if not args.prompt_audio and not sets:
         return lambda name: None
     uids = {wav.name: case["prompt_uid"] for (_, wav, _), case in zip(prompts, cases)}
 
     def find(name):
-        if name not in uids:  # rows of a previous pass with a different prompt set
+        if name in sets:
+            return Path(sets[name])
+        if name not in uids or not args.prompt_audio:  # rows of a previous pass with a different prompt set
             return None
         path = Path(args.prompt_audio) / (uids[name].replace("/", "_").replace(":", "_") + ".wav")
         return path if path.exists() else None
@@ -159,12 +204,43 @@ def original_prompt_finder(args, prompts, cases):
     return find
 
 
+def prompt_name(number):
+    return f"prompt-{number:02d}.wav"
+
+
+def check_rescore_prompts(out, cases, rows=()):
+    """--rescore scores the WAVs of an earlier pass, whose prompts are the files prompt-NN.wav, named by position
+    only. `cases` are recomputed from the current --cache/--seed/--prompts/--exclude-speakers; if they are not the
+    pass's own, prompt-NN.wav would be paired with another speaker's original (sim_o) and rows with the wrong voice.
+    Checked against the pass's cases.json and against the prompt_uid of every previous row; exits on a mismatch."""
+    stored = out / "cases.json"
+    if stored.exists():
+        before = [case.get("prompt_uid") for case in json.loads(stored.read_text())]
+        if before != [case["prompt_uid"] for case in cases]:
+            raise SystemExit(
+                f"--rescore: the prompts selected now differ from {stored} (written by the synthesis pass); rerun with "
+                "that pass's --cache, --seed, --prompts and --exclude-speakers"
+            )
+    expected = {prompt_name(number): case["prompt_uid"] for number, case in enumerate(cases)}
+    wrong = [r.get("id") for r in rows if r.get("prompt_uid") and expected.get(r.get("prompt")) != r["prompt_uid"]]
+    if wrong:
+        raise SystemExit(
+            f"--rescore: {len(wrong)} rows (e.g. {wrong[:3]}) were synthesized with other prompts than the ones "
+            "selected now; rerun with the synthesis pass's --cache, --seed, --prompts and --exclude-speakers"
+        )
+
+
+HF_WHISPER_SECONDS = 30.0  # WhisperFeatureExtractor pads or truncates every clip to one 30 s window
+
+
 def score_hf(rows, out, args, protocol=None, originals=None):
     """Batched GPU scoring: transformers Whisper (greedy) for WER/CER, WavLM-SV similarity and DNSMOS per clip.
 
     With a protocol, ASR sees the protocol's input (trailing-silence trim / 8 kHz band limit) and each row gets the
     protocol extras; decoding stays greedy (already deterministic, `--asr-deterministic` concerns faster-whisper).
-    Returns (rows, protocol identity or None).
+    Whisper hears only the first 30 s of a clip here: longer rows are flagged with `asr_truncated_seconds` (their
+    WER counts the cut words as deletions) and a warning suggests the faster-whisper backend, which transcribes
+    long audio in windows. Returns (rows, protocol identity or None).
     """
     from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
@@ -183,9 +259,20 @@ def score_hf(rows, out, args, protocol=None, originals=None):
     evaluator.speaker = AutoModelForAudioXVector.from_pretrained(args.speaker_model).to(device).eval()
     dnsmos = DNSMOS(args.dnsmos) if args.dnsmos else None
     scorer = ProtocolScorer(protocol, device, dnsmos) if protocol is not None else None
+    normalization = args.metric_normalization or default_metric_normalization(args.language)
+    identity = row_identity({  # the same compact identity the faster-whisper rows carry
+        "asr_backend": "hf-greedy", "asr_model": name, "language": args.language, "metric_normalization": normalization,
+        "decoding": {"num_beams": 1, "max_new_tokens": 220}, "compute_type": "float16", "device": str(device),
+        "speaker_model": args.speaker_model, "protocol_options": scorer.identity["options"] if scorer else None,
+    })
     good = [r for r in rows if "error" not in r]
     audios = {r["audio"]: read_audio(r["audio"], 16000) for r in good}
     asr_inputs = {k: scorer.asr_audio(a) if scorer else (a, {}) for k, a in audios.items()}
+    truncated = {k: round(len(a) / 16000 - HF_WHISPER_SECONDS, 3) for k, (a, _) in asr_inputs.items()
+                 if len(a) > HF_WHISPER_SECONDS * 16000}
+    if truncated:
+        print(f"warning: {len(truncated)} clips are longer than {HF_WHISPER_SECONDS:g} s; --asr-backend hf transcribes "
+              "only their first 30 s (rows flagged asr_truncated_seconds; use --asr-backend faster-whisper)", flush=True)
     hypotheses = {}
     for start in range(0, len(good), args.asr_batch):
         chunk = good[start : start + args.asr_batch]
@@ -202,20 +289,25 @@ def score_hf(rows, out, args, protocol=None, originals=None):
             continue
         audio = audios[r["audio"]]
         try:
-            counts = error_counts(r["text"], hypotheses[r["audio"]], "turkish-v1")
+            counts = error_counts(r["text"], hypotheses[r["audio"]], normalization)
         except ValueError as error:
             scored.append({**r, "error": str(error)})
             continue
         if r["prompt"] not in prompt_embeddings:
             prompt_embeddings[r["prompt"]] = evaluator.embedding(read_audio(out / r["prompt"], 16000))
         similarity = float((evaluator.embedding(audio) * prompt_embeddings[r["prompt"]]).sum())
-        record = {**r, **counts, "hypothesis": hypotheses[r["audio"]], "speaker_similarity": similarity, "asr_backend": "hf-greedy"}
+        record = {**r, **counts, "hypothesis": hypotheses[r["audio"]], "speaker_similarity": similarity, "asr_backend": "hf-greedy",
+                  "evaluator": identity}
+        if r["audio"] in truncated:
+            record["asr_truncated_seconds"] = truncated[r["audio"]]
+        if args.freya_metric:
+            record.update(freya_error_counts(r["text"], hypotheses[r["audio"]], normalization))
         if dnsmos is not None:
             record.update(dnsmos(audio.numpy()))
         if scorer is not None:
             original = originals(r["prompt"]) if originals else None
             record.update(asr_inputs[r["audio"]][1])
-            record.update(scorer.score(r["audio"], audio, r["text"], hypotheses[r["audio"]], "turkish-v1",
+            record.update(scorer.score(r["audio"], audio, r["text"], hypotheses[r["audio"]], normalization,
                                        original, out / r["prompt"]))
             if original:
                 record["prompt_original"] = str(original)
@@ -226,11 +318,15 @@ def score_hf(rows, out, args, protocol=None, originals=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--cache", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--cache", help="Latent cache whose held-out validation recordings are the prompts")
+    source.add_argument("--prompt-set", help="JSON list of {audio, text, speaker[, uid]} prompt recordings (leak-free "
+                        "voices, e.g. scripts/data/make_prompt_set.py) instead of cache prompts")
     parser.add_argument("--sentences", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--prompts", type=int, default=24, help="Number of held-out prompt voices used in rotation")
+    parser.add_argument("--prompts", type=int, default=None,
+                        help="Number of prompt voices used in rotation (default: 24 cache prompts, every --prompt-set entry)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--steps", type=int, default=32)
     parser.add_argument("--guidance", type=float, default=3.0)
@@ -270,6 +366,15 @@ def main():
         help="Speaker model of --select-by sim; must differ from the SIM judge --speaker-model (arXiv 2607.08256)")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--language", default="tr")
+    parser.add_argument(
+        "--metric-normalization", choices=METRIC_NORMALIZATIONS,
+        help="WER/CER text normalization of both --asr-backend paths (default: turkish-v1 for --language tr, else "
+             "english-unicode-v2)",
+    )
+    parser.add_argument(
+        "--freya-metric", action="store_true",
+        help="Also score WER/CER the Freya-TR-Eval way (apostrophes -> spaces, CER with spaces) as freya_wer/freya_cer",
+    )
     parser.add_argument("--asr-model", default="large-v3")
     parser.add_argument("--asr-device", default="cuda")
     parser.add_argument("--dnsmos")
@@ -282,7 +387,11 @@ def main():
         help="hf = transformers Whisper on the GPU with cross-clip batching (~30x faster than CPU faster-whisper; greedy decoding)",
     )
     parser.add_argument("--asr-batch", type=int, default=24)
-    parser.add_argument("--rescore", action="store_true", help="Skip synthesis when the WAVs already exist; only score")
+    parser.add_argument(
+        "--rescore", action="store_true",
+        help="Skip synthesis when the WAVs already exist; only score. Give the synthesis pass's --cache, --seed, "
+             "--prompts and --exclude-speakers: the prompts are checked against its cases.json and rows",
+    )
     parser.add_argument(
         "--prompt-audio",
         help="Directory of ORIGINAL prompt recordings (export_case_audio.py --cases OUTPUT/cases.json); with a "
@@ -298,10 +407,18 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     sentences = load_sentences(args.sentences, args.limit)
     exclude = read_speaker_list(args.exclude_speakers) if args.exclude_speakers else ()
-    data, cases = select_cases(args.cache, args.prompts, args.seed, exclude=exclude)
-    (out / "cases.json").write_text(json.dumps(cases, indent=1, ensure_ascii=False))  # input of export_case_audio.py
+    if args.prompt_set:
+        data, cases = None, load_prompt_set(args.prompt_set, args.prompts)
+    else:
+        data, cases = select_cases(args.cache, args.prompts or 24, args.seed, exclude=exclude)
     wavs_exist = all((out / f"{s['id']}.wav").exists() for s in sentences)
     reuse = args.rescore and ((out / "results.jsonl").exists() or wavs_exist)
+    previous = None  # rows of the previous pass (rescore)
+    if reuse:  # before cases.json is rewritten: it is the record of the synthesis pass
+        if (out / "results.jsonl").exists():
+            previous = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines() if line.strip()]
+        check_rescore_prompts(out, cases, previous or ())
+    (out / "cases.json").write_text(json.dumps(cases, indent=1, ensure_ascii=False))  # input of export_case_audio.py
     tts = None if reuse else Synthesizer(args.checkpoint, device=args.device)
     if tts is not None:
         tts.articulation_options = args.articulation_options  # None: the defaults of duration.articulation_seconds
@@ -309,26 +426,31 @@ def main():
             tts.duration_model = args.duration_model  # loaded by the predictor/auto modes
     prompts = []
     for number, case in enumerate(cases):
-        latents = data.row(case["prompt_index"])["latents"]
-        wav = out / f"prompt-{number:02d}.wav"
-        if not wav.exists() and tts is not None:
+        wav = out / prompt_name(number)
+        if "prompt_audio" in case:  # a recording: encoded (and timed) like any reference; nothing to do on rescore
+            voice = tts.prepare_reference(case["prompt_audio"], case["prompt_text"]) if tts is not None else None
+            latents = None if voice is None else voice.latents
+        else:
+            latents = data.row(case["prompt_index"])["latents"]
+            voice = VoiceReference(latents, case["prompt_text"], "cache", {})
+        if tts is not None:  # always: a prompt-NN.wav left by a pass with other prompts must not be scored against
             sf.write(wav, tts.codec.decode(latents.to(tts.device) * tts.std + tts.mean).numpy(), tts.codec.sample_rate)
-        prompts.append((VoiceReference(latents, case["prompt_text"], "cache", {}), wav, case["speaker"]))
+        prompts.append((voice, wav, case["speaker"]))
     rows = []
     started = time.time()
     sampler = dict(guidance_from=args.guidance_from, cfg_rescale=args.cfg_rescale, apg_eta=args.apg_eta,
                    apg_norm=args.apg_norm, apg_momentum=args.apg_momentum, speaker_guidance=args.speaker_guidance,
                    **{name: getattr(args, name) for name in (*WINDOW_OPTIONS, *OUTPUT_OPTIONS)})
-    if tts is None and (out / "results.jsonl").exists():  # rescore: reuse the synthesis rows of the previous pass
-        previous = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines() if line.strip()]
-        rows = [{k: v for k, v in r.items() if k in {"id", "text", "speaker", "prompt", "audio", "audio_seconds", "rtf", "error", "selected_factor"}} for r in previous]
+    if previous is not None:  # rescore: reuse the synthesis rows of the previous pass
+        rows = [{k: v for k, v in r.items() if k in {"id", "text", "speaker", "prompt", "prompt_uid", "audio", "audio_seconds", "rtf", "error", "selected_factor"}} for r in previous]
         sentences = []
     elif tts is None:  # rescore an interrupted pass: rebuild the rows from the WAVs and their JSON sidecars
         for index, sentence in enumerate(sentences):
             _, prompt_wav, speaker = prompts[index % len(prompts)]
             path = out / f"{sentence['id']}.wav"
             meta = json.loads(path.with_suffix(".json").read_text()) if path.with_suffix(".json").exists() else {}
-            rows.append({**sentence, "speaker": speaker, "prompt": prompt_wav.name, "audio": str(path),
+            rows.append({**sentence, "speaker": speaker, "prompt": prompt_wav.name,
+                         "prompt_uid": cases[index % len(cases)]["prompt_uid"], "audio": str(path),
                          "audio_seconds": meta.get("audio_seconds", sf.info(str(path)).duration), "rtf": meta.get("rtf")})
         sentences = []
     rule, selector, selection_bias = parse_select_by(args.select_by), None, None
@@ -376,7 +498,8 @@ def main():
         except ValueError as error:
             rows.append({**sentence, "speaker": speaker, "error": str(error)})
             continue
-        rows.append({**sentence, "speaker": speaker, "prompt": prompt_wav.name, "audio": str(path), **extra})
+        rows.append({**sentence, "speaker": speaker, "prompt": prompt_wav.name,
+                     "prompt_uid": cases[index % len(cases)]["prompt_uid"], "audio": str(path), **extra})
     if selector is not None:
         del selector
     print(f"synthesized {len(rows)} in {time.time() - started:.0f}s", flush=True)
@@ -386,8 +509,8 @@ def main():
     if args.asr_backend == "hf":
         scored, protocol_identity = score_hf(rows, out, args, protocol, originals)
     else:
-        evaluator = Evaluator(args.asr_model, args.dnsmos, args.speaker_model, args.asr_device, language=args.language,
-                              protocol=protocol)
+        evaluator = Evaluator(args.asr_model, args.dnsmos, args.speaker_model, args.asr_device,
+                              metric_normalization=args.metric_normalization, language=args.language, protocol=protocol)
         protocol_identity = evaluator.identity.get("protocol")
         scored = []
         for row in rows:
@@ -395,10 +518,16 @@ def main():
                 scored.append(row)
                 continue
             original = originals(row["prompt"])
-            score = evaluator.score(row["audio"], row["text"], out / row["prompt"], original_prompt=original,
-                                    codec_prompt=out / row["prompt"])
-            extra = {"prompt_original": str(original)} if protocol is not None and original else {}
-            scored.append({**row, **{k: v for k, v in score.items() if k != "evaluator"}, **extra})
+            try:  # one bad row (empty reference after normalization, empty audio) must not discard the others
+                score = evaluator.score(row["audio"], row["text"], out / row["prompt"], original_prompt=original,
+                                        codec_prompt=out / row["prompt"])
+                extra = {"prompt_original": str(original)} if protocol is not None and original else {}
+                if args.freya_metric:
+                    extra.update(freya_error_counts(row["text"], score["hypothesis"], evaluator.metric_normalization))
+            except (RuntimeError, ValueError, OSError) as error:
+                scored.append({**row, "error": f"score: {error}"[:300]})
+                continue
+            scored.append({**row, **score, "evaluator": evaluator.row_identity, **extra})
     for row in scored:
         if "error" not in row:
             row.update(audio_stats(row["audio"]))
@@ -415,11 +544,13 @@ def main():
         checkpoint=args.checkpoint, steps=args.steps, guidance=args.guidance, guidance_until=args.guidance_until,
         noise_scale=args.noise_scale, sway=args.sway, duration_scale=args.duration_scale, asr_model=args.asr_model,
         asr_backend=args.asr_backend, chars_per_second=args.chars_per_second, duration_mode=args.duration_mode,
+        metric_normalization=args.metric_normalization or default_metric_normalization(args.language),
         candidates=args.candidates, selector=args.selector if args.candidates > 1 else None, **sampler,
         selection_changed=sum(r.get("selected", 0) != 0 for r in good) if args.candidates > 1 else None,
         select_by=args.select_by if args.candidates > 1 else None, selection_judge_overlap=selection_bias,
         utmos_model=utmos_models(protocol) or None,  # the means are `utmos` / `utmosv2` (summarize)
         sentences=str(args.sentences), prompts=len(prompts),
+        asr_truncated=sum("asr_truncated_seconds" in r for r in good) if args.asr_backend == "hf" else None,
     )
     if protocol is not None:
         summary.update(protocol=protocol_identity, prompt_audio=args.prompt_audio)

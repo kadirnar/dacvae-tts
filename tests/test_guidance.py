@@ -1,5 +1,6 @@
 """Sampler guidance variants: interval CFG, CFG rescale, APG, independent text/speaker guidance, padded batches."""
 
+import pytest
 import torch
 
 from dacvae_tts.config import ModelConfig
@@ -94,3 +95,69 @@ def test_interval_guidance_rescale_and_apg_run_and_count_evaluations():
         result = sample(model, **batch, steps=4, guidance=5.0, **kwargs)
         assert torch.isfinite(result).all()
         assert torch.equal(result[batch["prompt_mask"]], batch["prompt"][batch["prompt_mask"]])
+
+
+@torch.inference_mode()
+def speaker_guided_by_hand(model, batch, branch, noise, steps, speaker_guidance):
+    """Euler loop of v_text + g_s (v_full - v_text) (text scale 1) from separate, unbatched forwards."""
+    from dacvae_tts.contracts import mask_values, sanitize
+    from dacvae_tts.model import time_grid, to_velocity
+
+    prompt, prompt_mask, valid = batch["prompt"], batch["prompt_mask"], batch["valid"]
+    mask = mask_values(valid, prompt_mask)
+    x = sanitize(torch.where(prompt_mask[..., None], prompt, noise), valid)
+    index = branch["index"][..., None].expand(-1, -1, x.size(-1))
+    times = time_grid(steps, -1.0, x.device)
+    for t0, t1 in zip(times[:-1], times[1:]):
+        t = t0.expand(x.size(0))
+        full = to_velocity(model, model(x, t, prompt, prompt_mask, valid, batch["tokens"], batch["segments"]), x, t)
+        rows = sanitize(torch.gather(x, 1, index), branch["valid"])
+        text = model(rows, t, branch["prompt"], branch["prompt_mask"], branch["valid"], branch["tokens"],
+                     branch["segments"])
+        text = torch.zeros_like(x).scatter_add(1, index, sanitize(to_velocity(model, text, rows, t), branch["valid"]))
+        x = x + (t1 - t0) * sanitize(text + speaker_guidance * (full - text), mask)
+        x = sanitize(torch.where(prompt_mask[..., None], prompt, x), valid)
+    return x
+
+
+def test_speaker_guidance_acts_when_the_text_scale_is_one():
+    # It used to be skipped at guidance 1 (the demo's slider minimum): the output was the unguided one although the
+    # metadata reported the speaker scale.
+    model = trained_looking_model()
+    batch, (only_tokens, only_segments) = rows(["Merhaba dünya.", "Kısa."])
+    noise = torch.randn(batch["prompt"].shape)
+    branch = text_only_rows(model, batch["valid"], batch["prompt_mask"], only_tokens, only_segments)
+    target = batch["valid"] & ~batch["prompt_mask"]
+    unguided = sample(model, **batch, steps=3, guidance=1.0, initial_noise=noise)
+    stats = {}
+    guided = sample(model, **batch, steps=3, guidance=1.0, initial_noise=noise, speaker_guidance=3.0,
+                    text_only=branch, stats=stats)
+    assert not torch.allclose(guided[target], unguided[target], atol=1e-3)
+    expected = speaker_guided_by_hand(model, batch, branch, noise, 3, 3.0)
+    assert torch.allclose(guided[target], expected[target], atol=1e-5)
+    # Full and prompt-free branch per step; the null branch cancels at scale 1 and is not evaluated.
+    assert stats["branch_evaluations"] == 6 and stats["forward_calls"] == 6
+    # A late window with text scale 1 keeps the speaker guidance: the early window alone would differ.
+    late = sample(model, **batch, steps=4, sway=0.0, guidance=3.0, guidance_split=0.5, guidance_late=1.0,
+                  initial_noise=noise, speaker_guidance=3.0, text_only=branch, stats=stats)
+    early_only = sample(model, **batch, steps=4, sway=0.0, guidance=3.0, guidance_until=0.5, initial_noise=noise,
+                        speaker_guidance=3.0, text_only=branch)
+    assert not torch.allclose(late[target], early_only[target], atol=1e-3)
+    assert stats["late_window"]["guided_steps"] == 2 and stats["branch_evaluations"] == 2 * 3 + 2 * 2
+
+
+def test_speaker_guidance_rejects_update_shaping_it_cannot_apply():
+    # The three-branch update bypasses guided_update: rescale/APG (either window) used to be recorded in the stats
+    # as applied while the audio was identical to running without them.
+    model = trained_looking_model()
+    batch, (only_tokens, only_segments) = rows(["Merhaba dünya.", "Kısa."])
+    branch = text_only_rows(model, batch["valid"], batch["prompt_mask"], only_tokens, only_segments)
+    for shaping in (dict(cfg_rescale=0.9), dict(apg_eta=0.2), dict(apg_norm=1.0), dict(apg_momentum=-0.5),
+                    dict(guidance_split=0.5, apg_eta_late=0.5), dict(guidance_split=0.5, cfg_rescale_late=0.7),
+                    dict(guidance_split=0.5, apg_norm_late=2.0), dict(guidance_split=0.5, apg_momentum_late=-0.3)):
+        with pytest.raises(ValueError, match="speaker_guidance"):
+            sample(model, **batch, steps=2, guidance=3.0, speaker_guidance=2.0, text_only=branch, **shaping)
+    # Neutral values and a late text scale remain accepted.
+    out = sample(model, **batch, steps=2, guidance=3.0, speaker_guidance=2.0, text_only=branch, cfg_rescale=0.0,
+                 apg_eta=1.0, guidance_split=0.5, guidance_late=2.0, apg_eta_late=1.0)
+    assert torch.isfinite(out).all()

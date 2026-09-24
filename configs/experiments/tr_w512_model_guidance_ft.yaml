@@ -5,7 +5,9 @@
 # Sample with --guidance 1 (checkpoints carry recommended_guidance: 1.0): one forward per step instead of two.
 # Short schedule at the stage-2 LR; the contrastive hinge is off (it would compare a guided positive with a
 # plain negative). The primary EMA is 0.9995 because 0.9999 is too slow for an 8k-update fine-tune; 0.999 is
-# kept as a second track (ema_0.999). One extra no-grad forward per update: ~+30% time.
+# kept as a second track (ema_0.999). ema_warmup: false starts both tracks from the checkpoint's EMA with their own
+# decays: the warm-up (min(decay, (1 + step) / (10 + step))) would keep them identical for all 8k updates and
+# replace the warm-started EMA within ~10. One extra no-grad forward per update: ~+30% time.
 model:
   width: 512
   depth: 12
@@ -53,4 +55,5 @@ train:
   contrastive_weight: 0.0
   wandb_project: dacvae-tts-tr
   ema_decays: [0.9995, 0.999]
+  ema_warmup: false
   model_guidance_weight: 0.7

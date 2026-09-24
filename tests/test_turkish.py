@@ -67,11 +67,21 @@ V1_PINS = {
     "%4'ü": "yüzde dörtü",
     "2024'e": "iki bin yirmi dörte",
     "14'ün": "on dörtün",
+    "2'incisi": "ikiincisi",
+    "6'ıncısı": "altııncısı",
+    "5'de": "beşde",
+    "40'da": "kırkda",
     "T.C. vatandaşı": "T.C. vatandaşı",
     "Koç Holding A.Ş.": "Koç Holding A.Ş.",
     "Yılmaz Ltd. Şti.": "Yılmaz Ltd. Şti.",
     "Dr. Ahmet": "Dr. Ahmet",
+    "Prof.Dr. Ahmet": "Prof.Dr. Ahmet",
+    "Öğr.Gör. Ali": "Öğr.Gör. Ali",
     "3.30'a": "üç nokta otuza",
+    "14:00'te": "on dört sıfır sıfırte",
+    "11.30'da": "on bir nokta otuzda",
+    "15.07.2016": "on beş nokta sıfır yedi.iki bin on altı",
+    "-5 derece": "-beş derece",
     "21.yüzyıl": "yirmi bir.yüzyıl",
     "e-posta": "e-posta",
 }
@@ -117,6 +127,31 @@ def test_turkish_v1_outputs_are_pinned(raw, v1):
         ("3'e", "üçe"),
         ("40'a", "kırka"),
         ("8'e", "sekize"),
+        # An ordinal suffix followed by further suffixes is still an ordinal.
+        ("2'incisi", "ikincisi"),
+        ("7'inciye", "yedinciye"),
+        ("20'incisi", "yirmincisi"),
+        ("6'ıncısı", "altıncısı"),
+        ("4'üncüsü", "dördüncüsü"),
+        ("2'nci", "ikinci"),
+        # A suffix-initial d after a voiceless final consonant is t (the common misspelling of -te/-ten/-ta).
+        ("5'de", "beşte"),
+        ("3'den", "üçten"),
+        ("40'da", "kırkta"),
+        ("60'dan", "altmıştan"),
+        ("4'de", "dörtte"),
+        ("%5'de", "yüzde beşte"),
+        ("2'de", "ikide"),
+        ("9'dan", "dokuzdan"),
+        # Dates, clock times and minus signs are read as the synthesis frontend reads them.
+        ("14:00'te", "on dörtte"),
+        ("11.30'da", "on bir otuzda"),
+        ("saat 09.05", "saat dokuz sıfır beş"),
+        ("15.07.2016", "on beş temmuz iki bin on altı"),
+        ("15.07.2016'da", "on beş temmuz iki bin on altıda"),
+        ("-5 derece", "eksi beş derece"),
+        ("3-4 milyar", "üç dört milyar"),
+        ("3.5 puan", "üç nokta beş puan"),
         # Issue #5 table: abbreviations are expanded.
         ("T.C. vatandaşıyım.", "te ce vatandaşıyım."),
         ("Koç Holding A.Ş.", "Koç Holding anonim şirketi."),
@@ -126,6 +161,17 @@ def test_turkish_v1_outputs_are_pinned(raw, v1):
         ("Arş. Gör. Ali", "araştırma görevlisi Ali"),
         ("elma, armut vb. Sonra geldi", "elma, armut ve benzeri. Sonra geldi"),
         ("16. yy.", "on altıncı yüzyıl."),
+        # Written without a space: a capital after the full stop starts the next word, a lower-case letter is a
+        # suffix (Turkish attaches suffixes to such abbreviations without an apostrophe).
+        ("Prof.Dr. Ahmet", "Profesör Doktor Ahmet"),
+        ("Doç.Dr. Ayşe", "Doçent Doktor Ayşe"),
+        ("Yrd.Doç.Dr. Ali", "Yardımcı Doçent Doktor Ali"),
+        ("Öğr.Gör. Ali", "öğretim görevlisi Ali"),
+        ("Arş.Gör. Ali", "araştırma görevlisi Ali"),
+        ("Dr.Ahmet geldi", "Doktor Ahmet geldi"),
+        ("armut vs.Sonra", "armut vesaire. Sonra"),
+        ("16. yy.da", "on altıncı yüzyılda"),
+        ("elma vb.leri", "elma ve benzerileri"),
         # Abbreviations that could be an ordinary word before a full stop stay as they are.
         ("Ateşi yak.", "Ateşi yak."),
         ("Bir tel.", "Bir tel."),
@@ -136,6 +182,15 @@ def test_turkish_v1_outputs_are_pinned(raw, v1):
 def test_turkish_v2_softening_and_abbreviations(raw, v2):
     assert normalize_turkish_v2(raw) == v2
     assert normalize(raw, "turkish-v2") == v2
+
+
+def test_turkish_v2_training_text_matches_the_frontend():
+    """Labels say what the model is given at inference: speakable() rewrites clocks, dates and signs the same way."""
+    from dacvae_tts.frontend import speakable
+
+    for raw in ("Toplantı 14:00'te başladı.", "Saat 11.30'da geldi.", "15.07.2016 tarihinde -5 derece ölçüldü.",
+                "Saat 09:05'te çıktık."):
+        assert normalize_turkish_v2(raw) == speakable(raw)[0]
 
 
 def test_turkish_v2_is_v1_elsewhere_and_pins_its_abbreviations():
@@ -169,6 +224,8 @@ METRIC_V1_PINS = {
     "e-posta": "e posta",
     "COVID-19": "covıd on dokuz",
     "4'e": "dörte",
+    "2'incisi": "ikiincisi",
+    "5'de": "beşde",
 }
 
 
@@ -228,6 +285,10 @@ def test_metric_v1_outputs_are_pinned(raw, v1):
         ("Yılmaz Ltd. Şti.", "yılmaz limited şirketi"),
         ("Dr. Ahmet", "doktor ahmet"),
         ("elma vb.", "elma ve benzeri"),
+        ("Prof.Dr. Ahmet", "profesör doktor ahmet"),
+        ("Doç.Dr.", "doçent doktor"),
+        ("Yrd.Doç.Dr.", "yardımcı doçent doktor"),
+        ("Öğr.Gör.", "öğretim görevlisi"),
         # (8) intra-word hyphens join
         ("e-posta", "eposta"),
         ("Wi-Fi", "wifi"),
@@ -241,6 +302,11 @@ def test_metric_v1_outputs_are_pinned(raw, v1):
         # numbers, apostrophes, words that must not change
         ("4'e", "dörde"),
         ("%4'ü", "yüzde dördü"),
+        ("2'incisi", "ikincisi"),
+        ("6'ıncısı", "altıncısı"),
+        ("5'de", "beşte"),
+        ("3'den", "üçten"),
+        ("40'da", "kırkta"),
         ("İsveç'ten 86 kişi!", "isveçten seksen altı kişi"),
         ("İsveç´ten", "isveçten"),
         ("‘Merhaba’ dedi", "merhaba dedi"),
@@ -264,6 +330,7 @@ def test_metric_v2(raw, v2):
         ("T.C. vatandaşı", "te ce vatandaşı"),
         ("5 km yürüdük", "beş kilometre yürüdük"),
         ("Saat 4'e kadar", "saat dörde kadar"),
+        ("Saat 5'de başladı", "saat beşte başladı"),
     ],
 )
 def test_metric_v2_scores_equivalent_spellings_as_equal(reference, hypothesis):
@@ -278,3 +345,24 @@ def test_metric_v2_equals_v1_on_plain_sentences():
     if freya.exists():  # the full Freya-TR-Eval set: no digits, circumflexes, hyphens or acronyms
         rows = [json.loads(line)["text"] for line in freya.read_text().splitlines() if line.strip()]
         assert all(metric_text_turkish_v2(r) == metric_text_turkish(r) for r in rows)
+
+
+def test_v2_reads_ordinal_ranges_and_keeps_minus_for_signs_only():
+    # Found auditing the 42,591 tr-dataset-12 transcripts: "9.-10. yüzyıllarda" became "dokuz.eksi onuncu" in v2
+    # (the minus rule fired after the ordinal's full stop) and stays "dokuz.-onuncu" in the frozen v1.
+    assert normalize("9.-10. yüzyıllarda", "turkish-v2") == "dokuzuncu onuncu yüzyıllarda"
+    assert normalize("1.-2. dereceden akraba", "turkish-v2") == "birinci ikinci dereceden akraba"
+    assert normalize("9.-10. yüzyıllarda", "turkish-v1") == "dokuz.-onuncu yüzyıllarda"
+    assert normalize("Sıcaklık -5 derece", "turkish-v2") == "Sıcaklık eksi beş derece"
+    assert normalize("Hava (-3) derece", "turkish-v2") == "Hava (eksi üç) derece"
+    assert normalize("3-4 kişi", "turkish-v2") == "üç dört kişi"
+
+
+def test_v2_metric_splits_hyphenated_reduplications_and_joins_short_prefixes():
+    # Whisper writes "yazlık-kışlık" for the reference "yazlık kışlık": 16 correct transcripts of the published
+    # Freya-TR-Eval runs, which the joining rule turned into 2 word errors each.
+    assert metric_text("Yazlık-kışlık ayrımı", "turkish-v2") == "yazlık kışlık ayrımı"
+    assert error_counts("yazlık kışlık ayrımı", "yazlık-kışlık ayrımı", "turkish-v2")["word_edits"] == 0
+    assert metric_text("yavaş-yavaş, sağlı-sollu", "turkish-v2") == "yavaş yavaş sağlı sollu"
+    assert metric_text("e-posta ve Wi-Fi", "turkish-v2") == "eposta ve wifi"
+    assert metric_text("a-b-c", "turkish-v2") == "abc"
