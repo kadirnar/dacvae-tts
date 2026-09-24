@@ -45,7 +45,7 @@ def rotate(x, angles):
 
 
 class Attention(nn.Module):
-    def __init__(self, width, heads, qk_norm=False):
+    def __init__(self, width, heads, qk_norm=False, gate=False):
         super().__init__()
         self.heads = heads
         self.q = nn.Linear(width, width)
@@ -53,6 +53,15 @@ class Attention(nn.Module):
         self.out = nn.Linear(width, width)
         self.q_norm = nn.RMSNorm(width // heads) if qk_norm else None
         self.k_norm = nn.RMSNorm(width // heads) if qk_norm else None
+        # Head-wise output gate y_h <- 2 sigmoid(w_h . x + b_h) y_h from the query-side input (Qwen gated
+        # attention, arXiv:2505.06708: query-dependent sparsity, no attention sink, higher-LR stability; Echo,
+        # Irodori and Darya gate too; no TTS ablation). 2 sigmoid with zero init is exactly 1: starts as the
+        # baseline and can still open to 2. skip_init draws no random numbers (baseline weights per seed).
+        self.gate = None
+        if gate:
+            self.gate = nn.utils.skip_init(nn.Linear, width, heads)
+            nn.init.zeros_(self.gate.weight)
+            nn.init.zeros_(self.gate.bias)
 
     def forward(
         self, x, context, valid, query_angles=None, key_angles=None, value_mix=None, first_value=None
@@ -72,6 +81,8 @@ class Attention(nn.Module):
         if query_angles is not None:
             q, k = rotate(q, query_angles), rotate(k, key_angles)
         y = F.scaled_dot_product_attention(q.to(v.dtype), k.to(v.dtype), v, attn_mask=valid[:, None, None, :])
+        if self.gate is not None:
+            y = y * (2 * torch.sigmoid(self.gate(x))).transpose(1, 2)[..., None].to(y.dtype)
         y = self.out(y.transpose(1, 2).reshape(b, n, d))
         return y if value_mix is None else (y, first_value)
 
@@ -134,8 +145,8 @@ class Block(nn.Module):
         self.norm1 = nn.LayerNorm(d, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(d, elementwise_affine=False)
         self.norm3 = nn.LayerNorm(d, elementwise_affine=False)
-        self.self_attn = Attention(d, cfg.heads, cfg.qk_norm)
-        self.cross_attn = Attention(d, cfg.heads, cfg.qk_norm)
+        self.self_attn = Attention(d, cfg.heads, cfg.qk_norm, cfg.attn_gate == "head")
+        self.cross_attn = Attention(d, cfg.heads, cfg.qk_norm, cfg.attn_gate == "head")
         self.ff = nn.Sequential(
             nn.Linear(d, d * cfg.ff_mult), nn.GELU(approximate="tanh"), nn.Linear(d * cfg.ff_mult, d)
         )

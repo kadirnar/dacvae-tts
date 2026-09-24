@@ -30,6 +30,7 @@ class ModelConfig:
     long_skip: bool = False  # input embedding -> output head skip, h_L + Linear0(LN([h_0, h_L])); +~2D^2
     value_residual: bool = False  # self-attention v_l <- l1 v_l + l2 v_1 (ResFormer); 2 scalars per block
     ffn_conv_kernel: int = 0  # odd k > 0: residual depthwise time conv on the FFN hidden units (5 suggested)
+    attn_gate: str = "none"  # head: per-head 2*sigmoid output gate on generator self-/cross-attention
 
     def __post_init__(self):
         if min(self.latent_dim, self.width, self.depth, self.heads, self.patch_size) < 1:
@@ -64,6 +65,8 @@ class ModelConfig:
             raise ValueError("The duration head needs separate transcripts; use duration: rule when joined")
         if self.ffn_conv_kernel < 0 or (self.ffn_conv_kernel and self.ffn_conv_kernel % 2 == 0):
             raise ValueError("ffn_conv_kernel must be 0 (off) or odd, so the convolution stays centred")
+        if self.attn_gate not in {"none", "head"}:
+            raise ValueError("attn_gate must be none or head")
 
 
 @dataclass

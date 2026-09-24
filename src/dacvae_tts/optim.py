@@ -29,6 +29,9 @@ BOUNDARY = {
     "duration.2.weight",
     "ctc.weight",
 }
+# Per-head attention gate logits [heads, D] are a small zero-init output head, not a hidden map: Muon would
+# give every head an equally large update from the first step, whatever its gradient. AdamW, like the heads.
+ADAMW_SUFFIXES = (".gate.weight",)
 
 
 def orthogonalize(matrices, steps=5):
@@ -50,6 +53,8 @@ def orthogonalize(matrices, steps=5):
 def muon_parts(name, parameter, embeddings=frozenset()):
     """Number of independently orthogonalized row blocks; 0 keeps the parameter on AdamW."""
     if parameter.ndim != 2 or min(parameter.shape) < 2 or id(parameter) in embeddings or name in BOUNDARY:
+        return 0
+    if name.endswith(ADAMW_SUFFIXES):
         return 0
     for suffix, parts in FUSED_ROWS.items():
         if name.endswith(suffix) and parameter.size(0) % parts == 0:

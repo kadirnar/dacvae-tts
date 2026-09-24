@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from dacvae_tts.config import Config, ModelConfig
-from dacvae_tts.model import FlowTTS
+from dacvae_tts.model import Attention, FlowTTS
 from dacvae_tts.optim import partition
 from dacvae_tts.training import Objective
 from tests.test_nano import NANO, nano_batch
@@ -16,9 +16,10 @@ OPTIONS = {
     "long_skip": dict(long_skip=True),
     "value_residual": dict(value_residual=True),
     "ffn_conv": dict(ffn_conv_kernel=5),
+    "attn_gate": dict(attn_gate="head"),
 }
 # Options whose new parameters start at zero (or identity): the model starts as the baseline function.
-ZERO_INIT = ["long_skip", "value_residual", "ffn_conv"]
+ZERO_INIT = ["long_skip", "value_residual", "ffn_conv", "attn_gate"]
 ALL = {key: value for option in OPTIONS.values() for key, value in option.items()}
 CASES = {**OPTIONS, "all": ALL, "ffn_conv_patch2": dict(ffn_conv_kernel=3, patch_size=2)}
 
@@ -82,7 +83,7 @@ def test_options_off_keep_the_previous_model(overrides, keys, layout, expected):
     assert len(model.state_dict()) == keys and layout_hash(model) == layout
     assert fingerprint(model) == pytest.approx(expected, rel=1e-5, abs=1e-5)
     # Explicitly disabled options are the default: an old checkpoint loads strictly.
-    off = {"long_skip": False, "value_residual": False, "ffn_conv_kernel": 0}
+    off = {"long_skip": False, "value_residual": False, "ffn_conv_kernel": 0, "attn_gate": "none"}
     FlowTTS(ModelConfig(**overrides, **off)).load_state_dict(model.state_dict(), strict=True)
 
 
@@ -149,6 +150,7 @@ def test_muon_partition_covers_the_new_parameters():
     assert muon["skip.1.weight"] == 1 and {"skip.0.weight", "skip.1.bias"} <= adamw  # hidden [D,2D] map
     assert "blocks.0.value_mix" in adamw  # two scalars
     assert {"blocks.0.ff_conv.weight", "blocks.1.ff_conv.bias"} <= adamw  # [H,1,k] filters
+    assert {"blocks.0.self_attn.gate.weight", "blocks.1.cross_attn.gate.weight"} <= adamw  # [heads,D] heads
     assert muon["blocks.0.ff.0.weight"] == 1 and muon["blocks.1.self_attn.kv.weight"] == 2
 
 
@@ -195,6 +197,25 @@ def test_ffn_conv_is_depthwise_and_never_mixes_in_padded_frames():
     for kernel in (-1, 4):
         with pytest.raises(ValueError):
             ModelConfig(**BASE, ffn_conv_kernel=kernel)
+
+
+def test_head_gate_scales_each_attention_head():
+    model = FlowTTS(ModelConfig(**BASE, attn_gate="head"))
+    assert model.blocks[0].cross_attn.gate.weight.shape == (2, 32)
+    assert model.text.blocks[0].attention.gate is None  # generator blocks only
+    assert sum(p.numel() for p in new_parameters(model).values()) == len(model.blocks) * 2 * (32 * 2 + 2)
+    torch.manual_seed(0)
+    gated, plain = Attention(32, 2, gate=True), Attention(32, 2)
+    gated.load_state_dict(plain.state_dict(), strict=False)
+    x, valid = torch.randn(2, 5, 32), torch.ones(2, 5, dtype=torch.bool)
+    assert torch.equal(gated(x, x, valid), plain(x, x, valid))  # 2 sigmoid(0) = 1
+    with torch.no_grad():
+        gated.gate.bias.copy_(torch.tensor([-40.0, 0.0]))  # close head 0, keep head 1 at exactly 1
+        closed = gated(x, x, valid)
+        plain.out.weight[:, :16] = 0  # the same as dropping head 0's output
+        assert torch.allclose(closed, plain(x, x, valid), atol=1e-6)
+    with pytest.raises(ValueError):
+        ModelConfig(**BASE, attn_gate="elementwise")
 
 
 def test_example_configs_change_one_model_option_of_the_w512_recipe():
