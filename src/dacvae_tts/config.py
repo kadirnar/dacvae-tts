@@ -33,7 +33,9 @@ class ModelConfig:
     attn_gate: str = "none"  # head: per-head 2*sigmoid output gate on generator self-/cross-attention
     ffn_activation: str = "gelu"  # swiglu: generator FFN as SwiGLU at equal parameters (hidden 2/3 of GELU's)
     final_adaln: bool = False  # output LayerNorm shift/scale from the condition (rank adaln_rank, zero-init)
-    cond_text_pool: bool = False  # condition += Linear0(mean of the target-byte text encodings); +D^2
+    # condition += Linear0(masked mean of the segment-1 byte encodings); +D^2. Segment 1 is the target text in
+    # the `segments` layout, the whole joined stream (prompt transcript + target) in `joined`.
+    cond_text_pool: bool = False
     # CTC labels of the auxiliary head. `chars`: Turkish lower-case letters + space, no punctuation (34
     # classes with the blank). A two-byte Turkish letter is one phone but two byte labels, and fast speakers
     # (16-19 bytes/s against 25 fps) leave byte CTC barely feasible; zero_infinity then zeroes those examples.

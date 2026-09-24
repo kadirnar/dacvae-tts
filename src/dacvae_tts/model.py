@@ -344,9 +344,11 @@ class FlowTTS(nn.Module):
             )
             nn.init.zeros_(self.final_ada[-1].weight)
             nn.init.zeros_(self.final_ada[-1].bias)
-        # Pooled transcript in the condition (DiTTo: WER 3.00 -> 2.93): the masked mean of the target-byte
-        # encodings joins time + voice, so every adaLN sees the whole sentence. No bias and zero-init: it
-        # starts as the baseline, and text dropped for guidance (all zeros) adds nothing to the null branch.
+        # Pooled transcript in the condition (DiTTo: WER 3.00 -> 2.93): the masked mean of the byte encodings
+        # of segment 1 joins time + voice, so every adaLN sees the whole sentence. Segment 1 is the target text
+        # in the `segments` layout but the whole stream, prompt transcript + target, in `joined` (every Turkish
+        # config). No bias and zero-init: it starts as the baseline, and text dropped for guidance (all zeros)
+        # adds nothing to the null branch.
         self.text_pool = None
         if cfg.cond_text_pool:
             self.text_pool = nn.Linear(d, d, bias=False)
@@ -485,7 +487,7 @@ class FlowTTS(nn.Module):
         if time_embedding.shape != voice.shape:
             raise ValueError("Time embedding and reference summary must both be [B,D]")
         cond = time_embedding + voice
-        if self.text_pool is not None:  # target bytes, as the duration head; `text` is zero where dropped
+        if self.text_pool is not None:  # segment-1 bytes (joined: all of them); `text` is zero where dropped
             cond = cond + self.text_pool(masked_mean(text, (segments == 1) & (tokens >= BYTE_OFFSET)))
         shared = self.ada_shared(cond) if self.ada_shared is not None else None
         ctc_logits = None
