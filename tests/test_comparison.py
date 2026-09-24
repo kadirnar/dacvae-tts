@@ -1,6 +1,8 @@
 import copy
+import importlib.util
 import json
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -311,3 +313,35 @@ def test_markdown_report_tables():
         if table:
             assert len({line.count(" | ") for line in table if not line.startswith("| ---")}) == 1
     assert "Notes:" in text and "Only 8 `speaker` clusters" in text
+
+
+def test_compare_evals_script(tmp_path, capsys):
+    spec = importlib.util.spec_from_file_location(
+        "compare_evals", Path(__file__).resolve().parents[1] / "scripts" / "compare_evals.py"
+    )
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    rows = freya_rows()
+    for name, data in (("base", rows), ("new", shifted(rows, edits=1))):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "results.jsonl").write_text("\n".join(json.dumps(r) for r in data) + "\n")
+    (tmp_path / "seed2.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    script.main(
+        [
+            str(tmp_path / "base"),
+            f"new={tmp_path / 'new'},{tmp_path / 'seed2.jsonl'}",
+            "--bootstrap", "300", "--stratify", "length",
+            "--markdown", str(tmp_path / "out" / "report.md"),
+            "--output", str(tmp_path / "out" / "report.json"),
+        ]
+    )
+    printed = capsys.readouterr().out
+    assert printed == (tmp_path / "out" / "report.md").read_text()
+    assert "| `base` |" in printed and "| `new` |" in printed and "seeds" in printed
+    report = json.loads((tmp_path / "out" / "report.json").read_text())
+    assert report["config"]["baseline"] == "base" and len(report["config"]["sources"]["new"]) == 2
+    assert report["systems"]["new"]["replicates"] == 2
+    with pytest.raises(SystemExit):
+        script.main([str(tmp_path / "missing")])
+    with pytest.raises(SystemExit):
+        script.main([str(tmp_path / "base"), "--baseline", "nope", "--bootstrap", "10"])
