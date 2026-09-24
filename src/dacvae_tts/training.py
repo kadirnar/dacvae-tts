@@ -274,6 +274,12 @@ def ema_tracks(train):
     return {ema_key(decay): decay for decay in train.ema_decays if decay != train.ema_decay}
 
 
+def ema_rate(decay, step, warmup=True):
+    """Decay of an EMA track at 0-based update `step`. The warm-up keeps the average from being dominated
+    by the random initialization; without it (train.ema_warmup: false, warm starts only) `decay` applies."""
+    return min(decay, (1 + step) / (10 + step)) if warmup else decay
+
+
 def weights_key(checkpoint, ema=True):
     """Checkpoint entry for `ema`: True -> "ema", False -> "model", a decay (0.999 or "0.999") or a key
     ("ema_0.999") -> that EMA track; the primary decay maps to "ema"."""
@@ -518,6 +524,9 @@ def train(args):
         if args.compile:
             cfg.train.compile = True if args.compile == "objective" else args.compile
         cfg.train.__post_init__()
+        if not cfg.train.ema_warmup and not args.resume and not getattr(args, "init_from", None):
+            # A resumed run was checked when it started (resume requires the same configuration).
+            raise ValueError("ema_warmup: false needs --init-from; from scratch the random weights dominate")
         if device.type == "cuda" and cfg.train.precision == "bf16" and not torch.cuda.is_bf16_supported():
             raise ValueError("This GPU does not support BF16; pass --precision fp32")
         torch.manual_seed(cfg.train.seed)
@@ -852,11 +861,10 @@ def train(args):
                 diagnostics["consecutive_inactive_diagnostic_checks"] = dict(inactive)
             optimizer.step()
             with torch.no_grad():
-                # Warm-up keeps the average from being dominated by the random initialization.
-                decay = min(cfg.train.ema_decay, (1 + step) / (10 + step))
+                decay = ema_rate(cfg.train.ema_decay, step, cfg.train.ema_warmup)
                 torch._foreach_lerp_(list(ema.parameters()), list(model.parameters()), 1 - decay)
                 for track_decay, average in averages.values():
-                    decay = min(track_decay, (1 + step) / (10 + step))
+                    decay = ema_rate(track_decay, step, cfg.train.ema_warmup)
                     torch._foreach_lerp_(list(average.parameters()), list(model.parameters()), 1 - decay)
             if (step + 1) % cfg.train.log_every == 0 or step == start_step or diagnose:
                 if watch is not None:

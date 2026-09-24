@@ -219,6 +219,12 @@ class TrainConfig:
     # with load_model(..., ema=<decay>). The best EMA length depends on the run and on CFG (EDM2,
     # arXiv:2312.02696); 0.9999 is too slow for <15k-update fine-tunes. `ema_decay` itself may be listed.
     ema_decays: list = field(default_factory=list)
+    # EMA warm-up: every track (`ema` and `ema_decays`) averages with min(decay, (1 + step) / (10 + step)),
+    # so a track's own decay only applies from update ~9k (0.999), ~18k (0.9995) or ~90k (0.9999) on and
+    # until then all tracks are identical; on --init-from it also discards the warm-started EMA within ~10
+    # updates. false: every track uses exactly its decay from the first update, starting from the warm-start
+    # checkpoint's EMA; needs --init-from (a random initialization would dominate the average).
+    ema_warmup: bool = True
     # Model guidance (arXiv:2502.12154; on F5-TTS arXiv:2504.20334): the target becomes
     # v + w sg(v_cond - v_null) from the model's own predictions; sample without CFG (--guidance 1). The fixed
     # point bakes in CFG scale 1 / (1 - w) (w 0.5 ~ 2, 0.7 ~ 3.3); w >= 1 diverges. One extra no-grad forward
@@ -339,6 +345,8 @@ class TrainConfig:
             or not all(isinstance(d, float) and 0 <= d < 1 for d in self.ema_decays)
         ):
             raise ValueError("ema_decays must be a list of distinct decays in [0,1)")
+        if not isinstance(self.ema_warmup, bool):
+            raise ValueError("ema_warmup must be true or false")
         if not 0 <= self.model_guidance_weight < 1:
             raise ValueError("model_guidance_weight must lie in [0,1); w >= 1 diverges")
         if self.model_guidance_weight and self.contrastive_mode == "text_hinge" and self.contrastive_weight:

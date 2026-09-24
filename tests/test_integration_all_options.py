@@ -467,7 +467,7 @@ TRAIN_OFF = dict(
     teacher_features="", repa_weight=0.0, repa_stop_step=0, repa_frames="all", speaker_embeddings="",
     tla_weight=0.0, tla_entropy=0.01, lr_schedule="cosine", decay_fraction=0.2, decay_shape="1-sqrt",
     min_lr_ratio=0.1, decay_cache=None, final_time_sampling=None, final_time_sampling_start="decay",
-    ema_decays=[], model_guidance_weight=0.0,
+    ema_decays=[], ema_warmup=True, model_guidance_weight=0.0,
 )
 
 

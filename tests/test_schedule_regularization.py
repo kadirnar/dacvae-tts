@@ -361,6 +361,35 @@ def test_extra_ema_track_matches_a_run_with_that_decay(cache, tmp_path):
     assert all(torch.equal(v, tracked["ema_0.3"][k]) for k, v in exported.state_dict().items())
 
 
+def test_ema_warmup_off_applies_each_decay_to_the_warm_started_ema(cache, tmp_path):
+    """With the default warm-up, min(decay, (1 + step) / (10 + step)) is 0.1 for every track at the first
+    update: the tracks are identical and the warm-started EMA gets weight 0.1. `ema_warmup: false` averages
+    the checkpoint's EMA with each track's own decay from the first update on; training is unchanged."""
+    assert training.ema_rate(0.999, 0) == 0.1 and training.ema_rate(0.999, 8990) == 0.999
+    assert training.ema_rate(0.999, 0, warmup=False) == 0.999
+    run(config_file(tmp_path, "base.yaml", steps=3), cache, tmp_path / "base")
+    warm = torch.load(tmp_path / "base" / "last.pt", weights_only=True)
+    tracks = dict(steps=4, ema_decay=0.9, ema_decays=[0.9, 0.5])
+    options = dict(init_from=str(tmp_path / "base" / "last.pt"), stop_after=1)
+    default = run(config_file(tmp_path, "default.yaml", **tracks), cache, tmp_path / "default", **options)
+    exact = run(config_file(tmp_path, "exact.yaml", ema_warmup=False, **tracks), cache, tmp_path / "exact",
+                **options)
+    assert Config.from_dict(exact["config"]).train.ema_warmup is False and exact["step"] == 1
+    for key, source in warm["ema"].items():
+        assert torch.equal(default["model"][key], exact["model"][key]), key
+        assert torch.equal(default["ema"][key], default["ema_0.5"][key]), key
+        assert torch.equal(default["ema"][key], source.lerp(default["model"][key], 1 - 0.1)), key
+        assert torch.equal(exact["ema"][key], source.lerp(exact["model"][key], 1 - 0.9)), key
+        assert torch.equal(exact["ema_0.5"][key], source.lerp(exact["model"][key], 1 - 0.5)), key
+    assert any(not torch.equal(exact["ema"][k], exact["ema_0.5"][k]) for k in warm["ema"])
+    # From scratch the random initialization would dominate an average without warm-up.
+    with pytest.raises(ValueError, match="init-from"):
+        run(config_file(tmp_path, "scratch.yaml", ema_warmup=False), cache, tmp_path / "scratch")
+    with pytest.raises(ValueError, match="ema_warmup"):
+        TrainConfig(ema_warmup="false")
+    assert Config.load(CONFIGS / "experiments" / "tr_w512_model_guidance_ft.yaml").train.ema_warmup is False
+
+
 # ------------------------------------------------------------------------------------------ model guidance
 
 
