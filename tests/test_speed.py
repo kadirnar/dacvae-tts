@@ -1,5 +1,6 @@
 """Training throughput options (speed.py): off they are bit-identical, on they keep the objective."""
 
+import dataclasses
 import json
 import os
 import random
@@ -15,7 +16,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from dacvae_tts import model as model_module
-from dacvae_tts.config import ModelConfig, TrainConfig
+from dacvae_tts.config import Config, ModelConfig, TrainConfig
 from dacvae_tts.contracts import mask_values
 from dacvae_tts.data import BucketBatchSampler, collate
 from dacvae_tts.model import FlowTTS, ctc_alignment_loss, flow_loss, per_example_mse
@@ -23,6 +24,8 @@ from dacvae_tts.speed import (
     NegativeSeeds,
     NonfiniteWatch,
     TrainCollate,
+    block_checkpoint,
+    compile_blocks,
     corrupt_rows,
     pad_lengths,
     padded_costs,
@@ -30,6 +33,16 @@ from dacvae_tts.speed import (
 )
 from dacvae_tts.text import BYTE_OFFSET, corrupt_transcript
 from dacvae_tts.training import Objective, load_model
+
+SPEED_OPTIONS = {
+    "grad_checkpoint",
+    "compile",
+    "compile_dynamic",
+    "strict_checks",
+    "pad_multiple",
+    "text_pad_multiple",
+    "loader_negatives",
+}
 
 
 def legacy_ctc_alignment_loss(logits, token_valid, tokens, drop):
@@ -426,3 +439,104 @@ def test_speed_options_train_and_resume_exactly(cache, tmp_path):
     assert [r["step"] for r in records if "flow" in r] == [1, 2, 3, 4]
     assert all(r["contrastive"] >= 0 and np.isfinite(r["loss"]) for r in records if "flow" in r)
     assert any(r.get("validation_loss") is not None for r in records)
+
+
+@pytest.mark.parametrize("mode", [True, "selective", 2, 3])
+def test_checkpoint_modes_give_identical_gradients(mode):
+    model, batch = build()
+    assert_identical(update(model, batch, grad_checkpoint=False), update(model, batch, grad_checkpoint=mode))
+
+
+def test_block_checkpoint_modes():
+    assert [block_checkpoint(2, n) for n in (1, 2, 3, 4)] == [None, "full", None, "full"]
+    assert block_checkpoint(True, 1) == "full" and block_checkpoint("selective", 5) == "selective"
+    assert block_checkpoint(False, 1) is None and block_checkpoint(True, 1, training=False) is None
+
+
+def test_checkpoint_and_compile_options_are_validated():
+    for value in (False, True, "selective", 1, 2, 12):
+        TrainConfig(grad_checkpoint=value)
+    for value in ("full", 0, -1, 1.5, "2"):
+        with pytest.raises(ValueError, match="grad_checkpoint"):
+            TrainConfig(grad_checkpoint=value)
+    TrainConfig(compile="blocks", compile_dynamic="auto")
+    with pytest.raises(ValueError, match="compile_dynamic"):
+        TrainConfig(compile_dynamic="static")
+    with pytest.raises(ValueError, match="compile"):
+        TrainConfig(compile="block")
+
+
+def test_throughput_defaults_load_old_checkpoints():
+    defaults = TrainConfig()
+    assert (defaults.strict_checks, defaults.pad_multiple, defaults.text_pad_multiple) == (True, 1, 1)
+    assert not defaults.loader_negatives and defaults.grad_checkpoint is False and defaults.compile is False
+    # Checkpoints written before these options existed load with the defaults.
+    old = {k: v for k, v in dataclasses.asdict(defaults).items() if k not in SPEED_OPTIONS}
+    assert Config.from_dict({"model": {}, "train": old}).train == defaults
+
+
+def compiler_available():
+    try:
+        torch._dynamo.reset()
+        return torch.equal(torch.compile(lambda x: x * 2 + 1)(torch.ones(3)), torch.full((3,), 3.0))
+    except Exception:
+        return False
+    finally:
+        torch._dynamo.reset()
+
+
+def test_compiled_blocks_match_eager_and_share_graphs_across_batch_sizes():
+    if not compiler_available():
+        pytest.skip("torch.compile has no working backend here")
+    from torch._dynamo.utils import counters
+
+    eager, _ = build()
+    compiled, _ = build()
+    for model in (eager, compiled):
+        model.grad_checkpoint = "selective"
+    torch._dynamo.reset()
+    counters.clear()
+    compile_blocks(compiled, "batch")
+    try:
+        rows = items()
+        for batch in (pad_lengths(collate(rows), 64, 32), pad_lengths(collate(rows[:2]), 64, 32)):
+            time, noise = torch.rand(len(batch["latents"])), torch.randn_like(batch["latents"])
+            results = []
+            for model in (eager, compiled):
+                model.zero_grad(set_to_none=True)
+                details = flow_loss(model, batch, 0, time, noise, return_details=True)
+                (details["flow"].mean() + details["ctc"].mean()).backward()
+                results.append((details["flow"], [p.grad for p in model.parameters() if p.grad is not None]))
+            assert torch.allclose(results[0][0], results[1][0], rtol=1e-4, atol=1e-5)
+            for a, b in zip(results[0][1], results[1][1]):
+                assert torch.allclose(a, b, rtol=1e-4, atol=1e-5)
+        # All three blocks and both batch sizes (same padded lengths) share one compiled graph.
+        assert counters["stats"]["unique_graphs"] == 1
+    finally:
+        torch._dynamo.reset()
+
+
+def test_blocks_compiler_failure_falls_back_to_eager(cache, tmp_path, monkeypatch, capsys):
+    import torch._inductor.exc as inductor
+
+    from dacvae_tts import training
+
+    calls = {"count": 0}
+
+    def fake_compile(function, dynamic=True):
+        def wrapped(*args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 2:  # the second block call hits a "rare shape"
+                raise inductor.InductorError(AssertionError("synthetic"), None)
+            return function(*args, **kwargs)
+
+        return wrapped
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    options = dict(pad_multiple=8, text_pad_multiple=8, loader_negatives=True, grad_checkpoint="selective")
+    config = speed_config(tmp_path, compile="blocks", log_every=1, **options)
+    training.train(training_args(config, cache, tmp_path / "fallback"))
+    _, saved = load_model(tmp_path / "fallback" / "last.pt")
+    assert saved["step"] == 4 and calls["count"] == 2  # compiled blocks abandoned after the failure
+    assert Config.from_dict(saved["config"]).train.compile == "blocks"
+    assert any("activation checkpointing" in line for line in capsys.readouterr().out.splitlines())

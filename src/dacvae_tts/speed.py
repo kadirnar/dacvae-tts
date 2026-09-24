@@ -1,5 +1,5 @@
-"""Opt-in training throughput options: length padding, loader-side text negatives and sync-free
-finiteness checks.
+"""Opt-in training throughput options: checkpointing modes, regional compilation, length padding,
+loader-side text negatives and sync-free finiteness checks.
 
 The generator is small (66.5M) and overhead/memory bound, not FLOP bound: at 0.6 s per update an
 RTX 4090 runs at roughly 9% of its bf16 peak. The gains therefore come from fewer host-device
@@ -7,15 +7,144 @@ synchronizations, fused pointwise kernels and less recomputation, not from faste
 Every option is off by default, and the defaults reproduce the previous training numerics exactly.
 """
 
+import functools
 import random
 
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import Dataset
 
 from .data import collate
 from .text import corrupt_transcript
+
+try:  # PyTorch >= 2.4
+    from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
+except ImportError:  # pragma: no cover - older PyTorch
+    CheckpointPolicy = create_selective_checkpoint_contexts = None
+
+# Selective checkpointing keeps the outputs of matrix products and fused attention and recomputes
+# everything between them (LayerNorm, AdaLN modulation, RoPE, GELU, gated residuals). Those
+# pointwise ops are cheap to recompute but store as many bytes as the products, so a block keeps
+# about half of its activations for a small fraction of the cost of recomputing the whole block.
+SAVED_OPS = (
+    "mm",
+    "addmm",
+    "bmm",
+    "_scaled_dot_product_efficient_attention",
+    "_scaled_dot_product_flash_attention",
+    "_scaled_dot_product_cudnn_attention",
+    "_scaled_dot_product_flash_attention_for_cpu",
+)
+
+
+@functools.cache
+def saved_ops():
+    ops = set()
+    for name in SAVED_OPS:
+        try:
+            ops.add(getattr(torch.ops.aten, name).default)
+        except AttributeError:  # not every attention backend exists in every PyTorch build
+            continue
+    return frozenset(ops)
+
+
+def keep_products(ctx, op, *args, **kwargs):
+    return CheckpointPolicy.MUST_SAVE if op in saved_ops() else CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def selective_context():
+    if create_selective_checkpoint_contexts is None:
+        raise RuntimeError("grad_checkpoint: selective needs PyTorch >= 2.4")
+    return create_selective_checkpoint_contexts(keep_products)
+
+
+def block_checkpoint(setting, number, training=True):
+    """Checkpoint mode of generator block `number` (1-based) under `train.grad_checkpoint`.
+
+    false: keep all activations; true: recompute every block ("full"); "selective": every block
+    keeps its products and recomputes its pointwise ops; N: recompute every N-th block in full, the
+    rest keep their activations (N=2 halves both the recomputation and the memory saving).
+    """
+    if not training or not setting:
+        return None
+    if setting is True:
+        return "full"
+    if setting == "selective":
+        return "selective"
+    return "full" if number % int(setting) == 0 else None
+
+
+def run_block(block, args, mode=None):
+    """One generator block, optionally under activation checkpointing (`block_checkpoint` modes).
+
+    A free function so `compile_blocks` can compile it with the checkpoint call inside the compiled
+    region: a checkpoint wrapped around an already compiled block would hide the block's ops from
+    the selective policy.
+    """
+    if mode is None:
+        return block(*args)
+    if mode == "selective":
+        return checkpoint(block, *args, use_reentrant=False, context_fn=selective_context)
+    return checkpoint(block, *args, use_reentrant=False)
+
+
+def _mark_batch_dynamic(args):
+    """Only the leading batch dimension may vary; lengths stay specialized (bounded by padding)."""
+    batch = args[0].size(0)
+    for value in args:
+        if isinstance(value, torch.Tensor):
+            for dim in range(value.ndim):
+                if dim == 0 and value.size(0) == batch:
+                    torch._dynamo.maybe_mark_dynamic(value, 0)
+                else:
+                    torch._dynamo.mark_static(value, dim)
+
+
+def _raise_limit(config, names, value):
+    for name in names:
+        if hasattr(config, name):
+            setattr(config, name, max(getattr(config, name), value))
+            return
+
+
+def compile_blocks(model, dynamic="batch", recompile_limit=64):
+    """Regional compilation (`train.compile: blocks`): compile the per-block step once, reuse it.
+
+    Compiling the whole generator traced every block again for each new batch shape (more than 15
+    minutes before the first update of the w512 run); one block compiles in seconds, and its graph
+    serves all blocks because they share code and parameter structure. The rest of the step (text
+    encoder, losses, CTC, batch expansion) stays eager. `dynamic`:
+
+    - "batch": only the batch dimension is symbolic. Lengths are specialized, so there is one graph
+      per padded (frames, text) length pair; pad_multiple / text_pad_multiple bound that number.
+    - "auto": dynamo's automatic dynamic shapes. Lengths become symbolic after the first
+      recompilation, so about two graphs are compiled in total, with shape-generic kernels.
+
+    The recompilation limit is raised so that new length pairs keep compiling instead of silently
+    running eager. Returns the eager runner; `model.block_runner = returned` undoes the compilation.
+    """
+    if dynamic not in {"batch", "auto"}:
+        raise ValueError("compile_dynamic must be batch or auto")
+    config = torch._dynamo.config
+    _raise_limit(config, ("recompile_limit", "cache_size_limit"), recompile_limit)
+    accumulated = ("accumulated_recompile_limit", "accumulated_cache_size_limit")
+    _raise_limit(config, accumulated, 16 * recompile_limit)
+    eager = model.block_runner
+    compiled = torch.compile(eager, dynamic=None)
+
+    def runner(block, args, mode=None):
+        if args[0]._base is not None:
+            # The first block receives a view (F.linear's 3-D output), the others do not. Dynamo
+            # guards on that difference and would compile every shape twice; one copy avoids it.
+            args = (args[0].clone(), *args[1:])
+        if dynamic == "batch":
+            _mark_batch_dynamic(args)
+        return compiled(block, args, mode)
+
+    model.block_runner = runner
+    return eager
 
 
 class NonfiniteWatch:

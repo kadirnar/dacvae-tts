@@ -22,7 +22,7 @@ from .diagnostics import ActivationProbe, gradient_contributions, gradient_group
 from .model import FlowTTS, flow_loss, reduce_flow
 from .optim import build_optimizer
 from .parallel import device_batches, loader_options
-from .speed import NonfiniteWatch, training_loader
+from .speed import NonfiniteWatch, compile_blocks, training_loader
 from .text import BYTE_OFFSET, corrupt_transcript
 from .tracking import Tracker
 
@@ -357,11 +357,14 @@ def train(args):
         ).train()
         raw_objective = objective  # compile/DDP wrap the module; helper methods stay reachable here
         eager_forward = model.forward
+        eager_runner = model.block_runner
         compiled = bool(cfg.train.compile)
         if cfg.train.compile == "model":
             # Only the generator: the loss, CTC and batch expansion stay eager, which avoids
             # dynamic-shape failures in the compiler while keeping most of the speed-up.
             model.forward = torch.compile(model.forward, dynamic=True)
+        elif cfg.train.compile == "blocks":
+            compile_blocks(model, cfg.train.compile_dynamic)  # regional: one compiled block step
         elif cfg.train.compile:
             objective = torch.compile(objective, dynamic=True)
 
@@ -373,8 +376,8 @@ def train(args):
                 return module(batch)
             except Exception as error:
                 origin = type(error).__module__
-                # Under DDP only the generator-only mode can be swapped (the objective is wrapped).
-                swappable = cfg.train.compile == "model" or world == 1
+                # Under DDP only the generator/block modes can be swapped (the objective is wrapped).
+                swappable = cfg.train.compile in ("model", "blocks") or world == 1
                 if (
                     not compiled
                     or not swappable
@@ -382,6 +385,7 @@ def train(args):
                 ):
                     raise
                 model.forward = eager_forward
+                model.block_runner = eager_runner
                 objective = raw_objective
                 compiled = False
                 # Eager activations need roughly twice the memory of the compiled graph; recompute
@@ -503,7 +507,11 @@ def train(args):
                             loss = loss + auxiliary.sum() * world / flow_examples
                     if probe is not None:
                         diagnostics["activation_max_abs"] = probe.close()
-                        if world == 1:
+                        if model.grad_checkpoint == "selective":
+                            diagnostics["gradient_contributions"] = (
+                                "Unavailable under selective checkpointing, which allows a single backward"
+                            )
+                        elif world == 1:
                             diagnostics.update(
                                 gradient_contributions(
                                     model,

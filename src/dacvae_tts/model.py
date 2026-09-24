@@ -5,11 +5,11 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.checkpoint import checkpoint
 
 from .config import ModelConfig
 from .contracts import audio_shapes, mask_values, sanitize, text_shapes
 from .reference import ReferencePool, TemporalReference
+from .speed import block_checkpoint, run_block
 from .text import BYTE_OFFSET, VOCAB_SIZE
 
 
@@ -203,6 +203,7 @@ class FlowTTS(nn.Module):
         self.ctc = nn.Linear(d, VOCAB_SIZE) if cfg.ctc_layer else None
         self.grad_checkpoint = False
         self.strict_checks = True  # train.strict_checks: false skips value checks that wait for the GPU
+        self.block_runner = run_block  # train.compile: blocks swaps in a compiled runner (speed.py)
 
     def reference_summary(self, prompt, prompt_mask):
         prompt = sanitize(prompt, prompt_mask)
@@ -318,11 +319,7 @@ class FlowTTS(nn.Module):
         ctc_logits = None
         for number, block in enumerate(self.blocks, 1):
             args = (h, text, packed_valid, text_valid, cond, *angles, shared)
-            h = (
-                checkpoint(block, *args, use_reentrant=False)
-                if self.grad_checkpoint and self.training
-                else block(*args)
-            )
+            h = self.block_runner(block, args, block_checkpoint(self.grad_checkpoint, number, self.training))
             if return_ctc and number == self.cfg.ctc_layer:
                 ctc_logits = self.ctc(h)
         output = self.output(h)
