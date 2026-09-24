@@ -209,8 +209,9 @@ def main():
     p.add_argument("--no-speaker", action="store_true")
     p.add_argument(
         "--metric-normalization",
-        choices=["english-unicode-v2", "legacy-ascii-v1", "turkish-v1"],
-        help="WER/CER text normalization (default: turkish-v1 for --language tr, else english-unicode-v2)",
+        choices=["english-unicode-v2", "legacy-ascii-v1", "turkish-v1", "turkish-v2"],
+        help="WER/CER text normalization (default: turkish-v1 for --language tr, else english-unicode-v2); "
+        "turkish-v2 also reads Roman numerals, clock times, units and acronyms and folds â/î/û",
     )
 
     p = sub.add_parser(

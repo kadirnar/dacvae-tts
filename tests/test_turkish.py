@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import pytest
 
 from dacvae_tts.metrics import error_counts, metric_text
@@ -5,6 +8,7 @@ from dacvae_tts.text import normalize, tokenize
 from dacvae_tts.turkish import (
     SAFE_ABBREVIATIONS,
     metric_text_turkish,
+    metric_text_turkish_v2,
     normalize_turkish,
     normalize_turkish_v2,
     number_words,
@@ -151,3 +155,126 @@ def test_turkish_v2_is_v1_elsewhere_and_pins_its_abbreviations():
         normalize_turkish("x", "turkish-v3")
     with pytest.raises(ValueError):
         normalize("kelime ابت", "turkish-v2")
+
+
+# The turkish-v1 metric text is frozen too (published WER/CER), including the mistakes issue #5 lists.
+METRIC_V1_PINS = {
+    "i̇stanbul": "i stanbul",
+    "kâr": "kâr",
+    "II. Dünya": "ıı dünya",
+    "21.yüzyıl": "yirmi bir yüzyıl",
+    "3.30'a": "üç nokta otuza",
+    "50 euro": "elli euro",
+    "5 km": "beş km",
+    "e-posta": "e posta",
+    "COVID-19": "covıd on dokuz",
+    "4'e": "dörte",
+}
+
+
+@pytest.mark.parametrize("raw, v1", METRIC_V1_PINS.items())
+def test_metric_v1_outputs_are_pinned(raw, v1):
+    assert metric_text_turkish(raw) == v1
+    assert metric_text(raw, "turkish-v1") == v1
+
+
+@pytest.mark.parametrize(
+    "raw, v2",
+    [
+        # (1) combining marks are removed after lower-casing, not turned into word breaks
+        ("i̇stanbul'a gittik", "istanbula gittik"),
+        ("İSTANBUL", "istanbul"),
+        # (2) circumflexes fold
+        ("Kâr payı", "kar payı"),
+        ("hâlâ", "hala"),
+        ("millî takım", "milli takım"),
+        ("mahkûm", "mahkum"),
+        # (3) Roman numerals
+        ("II. Dünya Savaşı", "ikinci dünya savaşı"),
+        ("I. Dünya Savaşı", "birinci dünya savaşı"),
+        ("XVI. yüzyıl", "on altıncı yüzyıl"),
+        ("XVI.yüzyıl", "on altıncı yüzyıl"),
+        ("XIX yüzyılda", "on dokuzuncu yüzyılda"),
+        ("V. Murat", "beşinci murat"),
+        ("Faz II başladı", "faz iki başladı"),
+        ("Faz II'de", "faz ikide"),
+        ("Bay X. geldi", "bay x geldi"),
+        ("XL beden", "xl beden"),
+        ("CD aldım", "cd aldım"),
+        # (4) ordinals without a space
+        ("21.yüzyıl", "yirmi birinci yüzyıl"),
+        ("3.sınıf", "üçüncü sınıf"),
+        # (5) clock times
+        ("3.30'a kadar", "üç otuza kadar"),
+        ("saat 3.30", "saat üç otuz"),
+        ("Saat 14.00'te", "saat on dörtte"),
+        ("14:00", "on dört"),
+        ("saat 09.05", "saat dokuz sıfır beş"),
+        ("3.5 puan", "üç nokta beş puan"),
+        # (6) spelling variants
+        ("50 euro", "elli avro"),
+        ("€50", "elli avro"),
+        ("50€", "elli avro"),
+        ("herşey yolunda", "her şey yolunda"),
+        ("kovid", "covid"),
+        # (7) units and abbreviations
+        ("5 TL", "beş lira"),
+        ("5 TL'ye", "beş liraya"),
+        ("5km'de", "beş kilometrede"),
+        ("2 kg", "iki kilogram"),
+        ("25°C", "yirmi beş derece"),
+        ("T.C.", "te ce"),
+        ("Koç A.Ş.", "koç anonim şirketi"),
+        ("Yılmaz Ltd. Şti.", "yılmaz limited şirketi"),
+        ("Dr. Ahmet", "doktor ahmet"),
+        ("elma vb.", "elma ve benzeri"),
+        # (8) intra-word hyphens join
+        ("e-posta", "eposta"),
+        ("Wi-Fi", "wifi"),
+        # (9) Latin acronyms keep a dotted i; Turkish capitals keep ı
+        ("COVID-19", "covid on dokuz"),
+        ("UNICEF", "unicef"),
+        ("WIFI", "wifi"),
+        ("LinkedIn", "linkedin"),
+        ("IRAK", "ırak"),
+        ("ISPARTA'da", "ıspartada"),
+        # numbers, apostrophes, words that must not change
+        ("4'e", "dörde"),
+        ("%4'ü", "yüzde dördü"),
+        ("İsveç'ten 86 kişi!", "isveçten seksen altı kişi"),
+        ("İsveç´ten", "isveçten"),
+        ("‘Merhaba’ dedi", "merhaba dedi"),
+        ("ok attı", "ok attı"),
+    ],
+)
+def test_metric_v2(raw, v2):
+    assert metric_text_turkish_v2(raw) == v2
+    assert metric_text(raw, "turkish-v2") == v2
+
+
+@pytest.mark.parametrize(
+    "reference, hypothesis",
+    [
+        ("II. Dünya Savaşı 3.30'da bitti.", "İkinci Dünya Savaşı üç otuzda bitti."),
+        ("COVID-19 salgını", "Covid-19 salgını"),
+        ("Kâr 50 euro", "kar elli avro"),
+        ("e-posta adresi", "eposta adresi"),
+        ("21.yüzyıl", "21. yüzyıl"),
+        ("i̇stanbul", "İstanbul"),
+        ("T.C. vatandaşı", "te ce vatandaşı"),
+        ("5 km yürüdük", "beş kilometre yürüdük"),
+        ("Saat 4'e kadar", "saat dörde kadar"),
+    ],
+)
+def test_metric_v2_scores_equivalent_spellings_as_equal(reference, hypothesis):
+    assert error_counts(reference, hypothesis, "turkish-v2")["wer"] == 0
+    assert error_counts(reference, hypothesis, "turkish-v1")["wer"] > 0
+
+
+def test_metric_v2_equals_v1_on_plain_sentences():
+    for sentence in FREYA_LIKE:
+        assert metric_text_turkish_v2(sentence) == metric_text_turkish(sentence)
+    freya = Path("/workspace/data/eval/freya_tr_eval.jsonl")
+    if freya.exists():  # the full Freya-TR-Eval set: no digits, circumflexes, hyphens or acronyms
+        rows = [json.loads(line)["text"] for line in freya.read_text().splitlines() if line.strip()]
+        assert all(metric_text_turkish_v2(r) == metric_text_turkish(r) for r in rows)

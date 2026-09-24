@@ -92,7 +92,7 @@ def main():
     parser.add_argument("--asr-device", default="cpu")
     parser.add_argument(
         "--metric-normalization",
-        choices=["english-unicode-v2", "legacy-ascii-v1", "turkish-v1"],
+        choices=["english-unicode-v2", "legacy-ascii-v1", "turkish-v1", "turkish-v2"],
         help="WER/CER normalization (default follows --language: turkish-v1 for tr)",
     )
     parser.add_argument("--speaker-model", default="microsoft/wavlm-base-plus-sv")
