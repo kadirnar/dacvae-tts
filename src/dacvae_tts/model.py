@@ -353,6 +353,12 @@ class FlowTTS(nn.Module):
         if cfg.cond_text_pool:
             self.text_pool = nn.Linear(d, d, bias=False)
             nn.init.zeros_(self.text_pool.weight)
+        # Frozen speaker-verification embedding -> voice condition (bias-free and zero-init: starts as the baseline,
+        # and a zero row, i.e. no prompt, adds exactly nothing). skip_init draws no random numbers.
+        self.speaker_condition = None
+        if cfg.speaker_condition_dim:
+            self.speaker_condition = nn.utils.skip_init(nn.Linear, cfg.speaker_condition_dim, d, bias=False)
+            nn.init.zeros_(self.speaker_condition.weight)
         # Training-only teacher heads (alignment.py): created last and only when configured, so models
         # without them keep their initialization and old checkpoints load strictly.
         self.repa = RepaProjector(d, cfg.repa_dim, p) if cfg.repa_layer else None
@@ -363,7 +369,9 @@ class FlowTTS(nn.Module):
         self.strict_checks = True  # train.strict_checks: false skips value checks that wait for the GPU
         self.block_runner = run_block  # train.compile: blocks swaps in a compiled runner (speed.py)
 
-    def reference_summary(self, prompt, prompt_mask):
+    def reference_summary(self, prompt, prompt_mask, speaker=None):
+        """Global voice vector [B,D] of the prompt; plus the projected speaker embedding `speaker` [B,E] for models
+        with `speaker_condition_dim` (rows without a prompt or with a zero embedding get none)."""
         prompt = sanitize(prompt, prompt_mask)
         features = (
             self.ref(prompt, prompt_mask) if self.cfg.reference_encoder == "temporal" else self.ref(prompt)
@@ -375,21 +383,29 @@ class FlowTTS(nn.Module):
         )
         if self.cfg.reference_paths == "full":
             voice = voice * 0  # Keep a connected graph for DDP; this path is intentionally inactive.
+        if self.speaker_condition is not None:
+            width = self.cfg.speaker_condition_dim
+            if speaker is None or speaker.shape != (prompt.size(0), width):
+                raise ValueError(f"This model is conditioned on a speaker embedding: pass speaker [B,{width}] "
+                                 "(zeros where there is none)")
+            present = (prompt_mask.any(1) & speaker.ne(0).any(-1))[:, None]
+            unit = F.normalize(speaker.float(), dim=-1) * width**0.5 * present  # unit-variance entries
+            voice = voice + self.speaker_condition(unit.to(voice.dtype))
         return voice
 
-    def conditions(self, prompt, prompt_mask, tokens, segments, drop=None):
+    def conditions(self, prompt, prompt_mask, tokens, segments, drop=None, speaker=None):
         if self.strict_checks and self.cfg.text_units == "chars":
             low, high = CONTINUATION  # UTF-8 continuation bytes never occur in character-unit rows
             if ((tokens >= low) & (tokens <= high)).any():
                 raise ValueError("UTF-8 byte ids given to a character-unit model (text.to_units converts them)")
         text, text_valid = self.text(tokens, segments)
-        voice = self.reference_summary(prompt, prompt_mask)
+        voice = self.reference_summary(prompt, prompt_mask, speaker)
         if drop is not None:
             text = text.masked_fill(drop[:, None, None], 0)
             voice = voice.masked_fill(drop[:, None], 0)
         return text, text_valid, voice
 
-    def predict_duration(self, prompt, prompt_mask, tokens, segments, cached=None):
+    def predict_duration(self, prompt, prompt_mask, tokens, segments, cached=None, speaker=None):
         if self.duration is None:
             raise ValueError("This model has no duration head; its length follows the prompt speaking rate")
         if (
@@ -399,7 +415,9 @@ class FlowTTS(nn.Module):
         ):
             raise ValueError("Duration prompt must be [B,L,C] with matching [B,L] reference mask")
         text_shapes(tokens, segments, prompt.size(0), prompt.device)
-        text, _, voice = self.conditions(prompt, prompt_mask, tokens, segments) if cached is None else cached
+        text, _, voice = (
+            self.conditions(prompt, prompt_mask, tokens, segments, speaker=speaker) if cached is None else cached
+        )
         target_bytes = (segments == 1) & (tokens >= BYTE_OFFSET)
         if self.strict_checks and (target_bytes.sum(1) == 0).any():
             raise ValueError("Duration prediction requires nonempty target text")
@@ -433,6 +451,7 @@ class FlowTTS(nn.Module):
         cached=None,
         return_ctc=False,
         return_hidden=(),
+        speaker=None,
     ):
         """Velocity [B,L,C]; with `return_ctc`, (velocity, CTC logits, packed mask). A nonempty
         `return_hidden` (1-based block indices) wraps that result as (result, {block: [B,N,D]}) for
@@ -450,7 +469,7 @@ class FlowTTS(nn.Module):
         b, length, channels = x.shape
         p = self.cfg.patch_size
         if cached is None:
-            cached = self.conditions(prompt, prompt_mask, tokens, segments, drop)
+            cached = self.conditions(prompt, prompt_mask, tokens, segments, drop, speaker)
         text, text_valid, voice = cached
         if (
             text.shape != (*tokens.shape, self.cfg.width)
@@ -633,6 +652,7 @@ def flow_loss(
         batch["segments"],
         drop=drop,
         **({} if cached is None else {"cached": cached}),
+        **({"speaker": batch["speaker_condition"]} if cached is None and "speaker_condition" in batch else {}),
         **({"return_ctc": True} if with_ctc else {}),
         **({"return_hidden": tuple(hidden_layers)} if with_hidden else {}),
     )
@@ -699,6 +719,8 @@ def guidance_direction(model, prediction, xt, time, batch, drop, cached=None):
     inputs = (xt, time, batch["prompt"], batch["prompt_mask"], batch["valid"])
     inputs += (batch["tokens"], batch["segments"])
     extra = {} if cached is None else {"cached": cached}
+    if cached is None and "speaker_condition" in batch:
+        extra["speaker"] = batch["speaker_condition"]
     with torch.no_grad():
         if model.training and getattr(model.cfg, "dropout", 0) > 0:
             model.eval()
@@ -865,8 +887,14 @@ def text_only_rows(model, full_valid, prompt_mask, tokens, segments):
         prompt_mask=no_prompt,
         tokens=tokens,
         segments=segments,
-        cached=model.conditions(empty, no_prompt, tokens, segments),
+        cached=model.conditions(empty, no_prompt, tokens, segments, speaker=no_speaker(model, len(lengths))),
     )
+
+
+def no_speaker(model, rows):
+    """The zero speaker embedding [rows,E] of prompt-free conditions, or None for models without the condition."""
+    width = getattr(model.cfg, "speaker_condition_dim", 0)
+    return torch.zeros(rows, width, device=next(model.parameters()).device) if width else None
 
 
 @torch.inference_mode()
@@ -901,6 +929,7 @@ def sample(
     apg_norm_late=None,
     apg_momentum_late=None,
     cfg_rescale_late=None,
+    speaker=None,
 ):
     """Euler sampler with classifier-free guidance.
 
@@ -958,7 +987,7 @@ def sample(
     x = sanitize(torch.where(prompt_mask[..., None], prompt, x), valid)
     times = time_grid(steps, sway, x.device, times)
     cond = (
-        model.conditions(prompt, prompt_mask, tokens, segments)
+        model.conditions(prompt, prompt_mask, tokens, segments, speaker=speaker)
         if condition_cache is None
         else condition_cache
     )

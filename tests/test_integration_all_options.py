@@ -454,7 +454,7 @@ MAIN_TRAIN_FIELDS = (
 MODEL_OFF = dict(
     long_skip=False, value_residual=False, ffn_conv_kernel=0, attn_gate="none", ffn_activation="gelu",
     final_adaln=False, cond_text_pool=False, ctc_targets="bytes", repa_layer=0, repa_dim=0, tla_layers=(),
-    tla_dim=0, tla_hidden=256, dropout=0.0, text_units="bytes",
+    tla_dim=0, tla_hidden=256, dropout=0.0, text_units="bytes", speaker_condition_dim=0,
 )
 # Every training option added by the branches, explicitly off (#7, #8, #11, #10, #14).
 TRAIN_OFF = dict(
@@ -468,7 +468,8 @@ TRAIN_OFF = dict(
     tla_weight=0.0, tla_entropy=0.01, lr_schedule="cosine", decay_fraction=0.2, decay_shape="1-sqrt",
     min_lr_ratio=0.1, decay_cache=None, final_time_sampling=None, final_time_sampling_start="decay",
     ema_decays=[], ema_warmup=True, model_guidance_weight=0.0, tempo_prompt_prob=0.0, tempo_variants="",
-    tempo_prompt_factors=(), tempo_prompt_pairs="all",
+    tempo_prompt_factors=(), tempo_prompt_pairs="all", speaker_condition="", speaker_condition_source="other",
+    speaker_condition_min_cosine=0.0,
 )
 
 

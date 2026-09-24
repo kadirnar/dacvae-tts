@@ -113,7 +113,7 @@ def load_silence(directory, meta):
 
 # Independent random streams per (seed, epoch, index): toggling one pair option never moves the draws
 # of another, and every stream stays clear of the original seed range seed + epoch * rows + index.
-CROSS_STREAM, TAIL_STREAM, LONG_STREAM, TEMPO_STREAM = 1 << 48, 2 << 48, 3 << 48, 4 << 48
+CROSS_STREAM, TAIL_STREAM, LONG_STREAM, TEMPO_STREAM, SPEAKER_STREAM = 1 << 48, 2 << 48, 3 << 48, 4 << 48, 5 << 48
 QUIET_CUT_SECONDS = 0.3
 
 
@@ -134,6 +134,9 @@ class LatentDataset(Dataset):
         speaker_embeddings=None,
         text_units="bytes",
         tempo_variants=None,
+        speaker_condition=None,
+        speaker_condition_source="other",
+        speaker_condition_min_cosine=0.0,
         **pair_options,
     ):
         if pairing not in {"cross", "within"} or layout not in {"segments", "joined"}:
@@ -189,6 +192,17 @@ class LatentDataset(Dataset):
                 end = self.group_end[start]
                 self.max_ref_lengths[start:end] = self.lengths[start:end].max()
             self.costs = self.lengths + self.max_ref_lengths
+        # Speaker-embedding condition (model.speaker_condition_dim): a speaker store, which utterance conditions a
+        # within cut (`other` recording of its label or the `same` one) and the cosine below which `other` falls back.
+        if speaker_condition_source not in {"other", "same"}:
+            raise ValueError("speaker_condition_source must be other or same")
+        self.speaker_store = None
+        if speaker_condition:
+            from .teacher import TeacherStore
+
+            self.speaker_store = TeacherStore(speaker_condition, "speaker")
+            self.speaker_store.check(self.db_path, split, self.meta["sample_rate"] / self.meta["hop_length"])
+        self.speaker_source, self.speaker_min_cosine = speaker_condition_source, speaker_condition_min_cosine
         # Tempo-variant latents of the rows (tempo.py, scripts/build_tempo_variants.py) for prompt tempo perturbation.
         self.tempo_store = TempoStore(tempo_variants) if tempo_variants else None
         self.split = split
@@ -522,8 +536,36 @@ class LatentDataset(Dataset):
         last = min(range(high - low + 1), key=lambda i: (distance[i], abs(low + i - cut + 1)))
         return low + last + 1
 
+    def uid(self, index):
+        """uid of dataset row `index` without reading its latents."""
+        return self._connection().execute("SELECT uid FROM samples WHERE id=?", (int(self.ids[index]),)).fetchone()[0]
+
+    def speaker_vector(self, epoch, index, item):
+        """Speaker-embedding condition [E] of an item: zeros without a prompt; the L2-normalized mean of the prompt
+        recordings' embeddings for cross prompts and cross pairs (they are the prompt audio, as at inference); for a
+        within cut another utterance of the label (`other`, its own stream: toggling it moves no other draw; the
+        item's own vector when the label has one utterance or the other is below `min_cosine`) or its own (`same`)."""
+        store = self.speaker_store
+        if not len(item["reference"]):
+            return torch.zeros(store.dim)
+        if item["reference_uid"] != item["uid"]:
+            vectors = torch.stack([store.speaker(uid) for uid in item["reference_uid"].split("|")])
+            return torch.nn.functional.normalize(
+                torch.nn.functional.normalize(vectors, dim=-1).mean(0), dim=-1)
+        own = store.speaker(item["uid"])
+        start, end = int(self.group_start[index]), int(self.group_end[index])
+        if self.speaker_source == "same" or end - start < 2:
+            return own
+        other = random.Random(self.seed + epoch * len(self) + index + SPEAKER_STREAM).randrange(start, end - 1)
+        other += other >= index
+        vector = store.speaker(self.uid(other))
+        similarity = torch.nn.functional.cosine_similarity(vector, own, dim=0)
+        return vector if similarity >= self.speaker_min_cosine else own
+
     def finish_item(self, item, epoch, index):
-        """Tail silence, the CTC label and text unit flags; the item itself when all are off."""
+        """Tail silence, the speaker condition, the CTC label and text unit flags; the item itself when all are off."""
+        if self.speaker_store is not None:
+            item = {**item, "speaker_condition": self.speaker_vector(epoch, index, item)}
         if self.ctc_targets == "chars":
             item = {**item, "ctc_targets": "chars"}
         if self.text_units != "bytes":
@@ -598,6 +640,11 @@ def collate(items):
         "segments": pad_sequence(segments, batch_first=True),
         **collate_teacher(items),
     }
+    present = [("speaker_condition" in item) for item in items]
+    if any(present):
+        if not all(present):
+            raise ValueError("Either every item or none carries a speaker_condition")
+        batch["speaker_condition"] = torch.stack([item["speaker_condition"] for item in items]).float()
     units = {item.get("text_units", "bytes") for item in items}
     if len(units) > 1:
         raise ValueError("A batch cannot mix text units")

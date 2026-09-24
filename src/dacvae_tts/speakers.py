@@ -457,6 +457,43 @@ def make_embedder(name="ecapa", device="cpu", model=None):
     return getattr(importlib.import_module(module), factory)(device=device, model=model)
 
 
+# Embedder names of scripts/extract_teacher_features.py (speaker stores) -> the built-ins of make_embedder.
+STORE_EMBEDDERS = {"speechbrain": "ecapa", "hf-xvector": "wavlm"}
+
+
+def condition_embedder(record, device="cpu"):
+    """callable(waveform, sample_rate) -> float32 [E] tensor with the embedder a speaker store was built with.
+
+    `record`: the checkpoint's `speaker_condition` entry (training.speaker_metadata: the store's embedder name, model
+    id and width). A speaker-conditioned model must embed its prompts with exactly that model at inference.
+    """
+    import torch
+    from scipy.signal import resample_poly
+
+    name, model, width = record.get("embedder"), record.get("model"), record.get("dim")
+    if name in STORE_EMBEDDERS:
+        embed, rate = make_embedder(STORE_EMBEDDERS[name], device, model), EMBEDDING_RATE
+    elif name and ":" in name:
+        module, factory = name.split(":", 1)
+        maker = getattr(importlib.import_module(module), factory)
+        embed = maker(model, device) if model else maker(device=device)
+        rate = int(getattr(embed, "sample_rate", EMBEDDING_RATE))
+    else:
+        raise ValueError(f"Unknown speaker-store embedder {name!r}; expected {sorted(STORE_EMBEDDERS)} or pkg:factory")
+
+    def run(waveform, sample_rate):
+        audio = np.asarray(waveform, dtype=np.float32).reshape(-1)
+        if int(sample_rate) != rate:
+            factor = math.gcd(int(sample_rate), rate)
+            audio = resample_poly(audio, rate // factor, int(sample_rate) // factor).astype(np.float32)
+        vector = torch.as_tensor(np.asarray(embed(audio), dtype=np.float32)).reshape(-1)
+        if width and vector.numel() != width:
+            raise ValueError(f"Embedder {name} gave {vector.numel()} dims, the store has {width}")
+        return vector
+
+    return run
+
+
 def embedding_identity(args):
     """What the cached vectors depend on; a mismatch refuses reuse instead of mixing embedding spaces."""
     name = getattr(args, "embedder", "ecapa")

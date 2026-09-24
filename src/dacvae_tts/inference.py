@@ -52,6 +52,8 @@ class VoiceReference:
     timings: dict
     # audio.speech_timing of the prompt waveform (`articulation` duration rule); None until measured
     speech_timing: dict = None
+    # speaker-embedding condition [E] of speaker-conditioned models (Synthesizer.speaker_embedding); None until used
+    speaker_embedding: torch.Tensor = None
 
 
 @dataclass
@@ -64,6 +66,7 @@ class SynthesisResult:
 class Synthesizer:
     articulation_options = None  # keyword overrides of duration.articulation_seconds, e.g. {"comma_pause": 0.2}
     text_units, rule_unit = "bytes", "bytes"  # a char-unit model sets both to its units in __init__
+    speaker_record, _speaker_embedder = None, None  # embedder of speaker-conditioned models, loaded on first use
 
     def __init__(
         self,
@@ -112,6 +115,10 @@ class Synthesizer:
         # Guidance the checkpoint was prepared for (model guidance and distillation: 1, GRPO: its policy's); None if
         # unset. Model guidance (train.model_guidance_weight w > 0) bakes CFG ~1/(1-w) into the conditional velocity.
         self.recommended_guidance = self.checkpoint.get("recommended_guidance")
+        # Speaker-conditioned models embed every prompt with the speaker store's embedder (checkpoint record).
+        self.speaker_record = self.checkpoint.get("speaker_condition")
+        if self.model.speaker_condition is not None and not self.speaker_record:
+            raise ValueError("Speaker-conditioned checkpoint without the record of its speaker embedder")
         self.model_guidance_weight = float(self.checkpoint["config"].get("train", {}).get("model_guidance_weight", 0))
         self.duration_profile = {}
         if compile_model:
@@ -229,6 +236,22 @@ class Synthesizer:
         return {**speech_timing(audio, int(rate)), "source": "waveform"}
 
     @torch.inference_mode()
+    def speaker_embedding(self, reference):
+        """Speaker-embedding condition [E] of a voice for speaker-conditioned models, else None; computed once per
+        VoiceReference with the checkpoint's embedder on the prompt's codec reconstruction (speaker stores of
+        Parquet-prepared caches embed decoded latents as well, and every reference has latents)."""
+        if getattr(self.model, "speaker_condition", None) is None:
+            return None
+        if getattr(reference, "speaker_embedding", None) is None:
+            if self._speaker_embedder is None:
+                from .speakers import condition_embedder
+
+                self._speaker_embedder = condition_embedder(self.speaker_record, str(self.device))
+            audio = self.codec.decode(reference.latents.to(self.device).float() * self.std + self.mean)
+            reference.speaker_embedding = self._speaker_embedder(audio.float().cpu().numpy(), self.codec.sample_rate)
+        return reference.speaker_embedding
+
+    @torch.inference_mode()
     def prompt_timing(self, reference):
         """The prompt's speech timing for the `articulation` rule, measured once and kept on the VoiceReference.
 
@@ -281,7 +304,7 @@ class Synthesizer:
         reference = reference or self.prepare_reference(ref_audio, reference_text)
         timing = self._articulation_timing(reference, seconds, duration_mode)
         batch = self.make_batch(reference.latents, reference.transcript, text, seconds, duration_scale, duration_mode,
-                                timing=timing)
+                                timing=timing, speaker=self.speaker_embedding(reference))
         audio, _, metadata = self.generate(
             batch, steps, guidance, seed, sway, guidance_until, noise_scale, **sampler
         )
@@ -399,7 +422,8 @@ class Synthesizer:
 
     @torch.inference_mode()
     def make_batch(self, reference, reference_text, text, seconds=None, duration_scale=1.0, duration_mode="rule",
-                   timing=None):
+                   timing=None, speaker=None):
+        """`speaker`: the voice's speaker-embedding condition [E] (speaker_embedding) for speaker-conditioned models."""
         if not math.isfinite(duration_scale) or duration_scale <= 0:
             raise ValueError("duration_scale must be finite and positive")
         reference = reference.to(self.device)
@@ -441,6 +465,7 @@ class Synthesizer:
             "segments": segments,
             "text_only_tokens": only_tokens[None].to(self.device),
             "text_only_segments": only_segments[None].to(self.device),
+            **({"speaker": speaker[None].to(self.device)} if speaker is not None else {}),
         }
 
     def _sample(self, batch, steps, guidance, seed, sway, stats, condition_cache=None, **sampler):
@@ -452,7 +477,7 @@ class Synthesizer:
             )
         return sample(
             self.model, **core, steps=steps, guidance=guidance, seed=seed, sway=sway, stats=stats,
-            condition_cache=condition_cache, **sampler,
+            condition_cache=condition_cache, speaker=batch.get("speaker"), **sampler,
         )
 
     @staticmethod
@@ -505,7 +530,7 @@ class Synthesizer:
                 lambda: self.model.text(batch["tokens"], batch["segments"]), stages, "text_encoding_seconds"
             )
             voice = self._measure(
-                lambda: self.model.reference_summary(batch["prompt"], batch["prompt_mask"]),
+                lambda: self.model.reference_summary(batch["prompt"], batch["prompt_mask"], batch.get("speaker")),
                 stages,
                 "reference_summary_seconds",
             )
@@ -604,6 +629,7 @@ class Synthesizer:
         latents = reference.latents.to(self.device)
         layout = self.model.cfg.text_layout
         timing = self._articulation_timing(reference, seconds, duration_mode)
+        speaker = self.speaker_embedding(reference)
         requests = []
         for text in texts:
             tokens, segments = tokenize(reference.transcript, text, version=self.text_version, layout=layout, units=self.text_units)
@@ -650,6 +676,7 @@ class Synthesizer:
                 "segments": pad([requests[i][2] for i, _ in chunk], batch_first=True).to(self.device),
                 "text_only_tokens": pad([requests[i][3] for i, _ in chunk], batch_first=True).to(self.device),
                 "text_only_segments": pad([requests[i][4] for i, _ in chunk], batch_first=True).to(self.device),
+                **({"speaker": speaker.to(self.device).expand(len(chunk), -1)} if speaker is not None else {}),
             }
             tick = time.perf_counter()
             with autocast(self.device, self.precision):

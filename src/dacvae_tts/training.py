@@ -152,8 +152,9 @@ class Objective(nn.Module):
         return terms
 
     def forward(self, batch):
+        speaker = batch.get("speaker_condition")  # speaker-embedding condition (model.speaker_condition_dim)
         cached = self.model.conditions(
-            batch["prompt"], batch["prompt_mask"], batch["tokens"], batch["segments"]
+            batch["prompt"], batch["prompt_mask"], batch["tokens"], batch["segments"], speaker=speaker
         )
         expanded, shared = batch, cached
         if self.expansion > 1 and self.training:
@@ -202,7 +203,7 @@ class Objective(nn.Module):
                 0,
                 details["times"][::copies],
                 details["noise"][::copies],
-                cached=self.model.conditions(batch["prompt"], batch["prompt_mask"], tokens, segments),
+                cached=self.model.conditions(batch["prompt"], batch["prompt_mask"], tokens, segments, speaker=speaker),
             )
             positive = flow[::copies]
             hinge = F.relu(positive + self.contrastive_margin * positive.detach() - negative)
@@ -360,7 +361,7 @@ def time_sampling_at(step, train):
 def training_dataset(cache, cfg):
     """The training split of `cache` with every data option of `cfg`: the pairing, the training-pair options
     (#11) and the teacher stores (#10, relative store paths resolve against `cache`)."""
-    return LatentDataset(
+    data = LatentDataset(
         cache,
         "train",
         cfg.train.seed,
@@ -372,7 +373,12 @@ def training_dataset(cache, cfg):
         **pair_options(cfg),
         **teacher_sources(cfg.train, cache),
         **tempo_sources(cfg.train, cache),
+        **speaker_sources(cfg, cache),
     )
+    if cfg.model.speaker_condition_dim and data.speaker_store.dim != cfg.model.speaker_condition_dim:
+        raise ValueError(f"model.speaker_condition_dim={cfg.model.speaker_condition_dim}, the speaker store has "
+                         f"{data.speaker_store.dim}-d embeddings")
+    return data
 
 
 def training_batches(data, cfg, rank, world, frame_budget, device):
@@ -538,6 +544,26 @@ def pair_options(cfg):
     return options
 
 
+def speaker_sources(cfg, cache):
+    """LatentDataset keywords of the speaker-embedding condition (model.speaker_condition_dim); empty if off."""
+    if not cfg.model.speaker_condition_dim:
+        return {}
+    from .teacher import resolve_store
+
+    return {"speaker_condition": resolve_store(cfg.train.speaker_condition, cache),
+            "speaker_condition_source": cfg.train.speaker_condition_source,
+            "speaker_condition_min_cosine": cfg.train.speaker_condition_min_cosine}
+
+
+def speaker_metadata(data):
+    """Checkpoint record of the speaker store's embedder: inference must embed prompts with the same model."""
+    if getattr(data, "speaker_store", None) is None:
+        return {}
+    meta = data.speaker_store.meta
+    return {"speaker_condition": {key: meta.get(key) for key in ("embedder", "model", "dim", "audio_source",
+                                                                  "audio_sources", "splits")}}
+
+
 def tempo_sources(train, cache):
     """LatentDataset keyword for the tempo-variant store (relative paths resolve against `cache`); empty if off."""
     if not train.tempo_prompt_prob:
@@ -600,7 +626,7 @@ def train(args):
             )
         validation = None
         if not args.no_validation:
-            val_data = LatentDataset(args.cache, "val", cfg.train.seed, **pairing)
+            val_data = LatentDataset(args.cache, "val", cfg.train.seed, **pairing, **speaker_sources(cfg, args.cache))
             val_sampler = BucketBatchSampler(val_data.costs, cfg.train.batch_size, rank, world, 12345)
             validation = DataLoader(
                 val_data,
@@ -1016,6 +1042,7 @@ def train(args):
                         "frame_budget": args.frame_budget,
                         "cache_path": str(Path(args.cache).resolve()),
                         "codec": data.meta,
+                        **speaker_metadata(data),
                         "mean": data.mean,
                         "std": data.std,
                         "stage": "pretrain",

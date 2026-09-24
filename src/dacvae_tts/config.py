@@ -46,6 +46,11 @@ class ModelConfig:
     # capitals, ~12 % of letters) are one token instead of two: an even length-aware RoPE diagonal, one CTC label
     # per letter, and a character duration rule at inference. Converted from the cached byte ids at load time.
     text_units: str = "bytes"
+    # Frozen speaker-verification embedding (e.g. SpeechBrain ECAPA 192-d) added to the voice condition through a
+    # zero-init, bias-free Linear (~0.1M): a speaker prior from ~7k-200k training speakers next to the in-context
+    # prompt (Koel-TTS unseen SIM: in-context 0.637, SV vector 0.619; MiniMax-Speech: encoder + prompt 0.746 vs prompt
+    # 0.726, a frozen SV vector raised WER). 0 is off. Training reads a speaker store (train.speaker_condition).
+    speaker_condition_dim: int = 0
     # Training-only teacher heads (alignment.py); absent from the module and its checkpoints when off.
     repa_layer: int = 0  # speech-REPA: block predicting teacher SSL frames; 0 off, 10-11 with CTC at 8
     repa_dim: int = 0  # width of the stored teacher frames (after the extraction PCA, e.g. 256)
@@ -118,6 +123,8 @@ class ModelConfig:
             raise ValueError("tla_layers need positive tla_dim and tla_hidden")
         if not 0 <= self.dropout < 1:
             raise ValueError("dropout must lie in [0,1)")
+        if self.speaker_condition_dim < 0:
+            raise ValueError("speaker_condition_dim must be 0 (off) or the embedding width")
 
 
 def teacher_blocks(value, depth):
@@ -229,6 +236,14 @@ class TrainConfig:
     repa_frames: str = "all"  # all valid frames (prompt frames are real speech too) or target frames only
     speaker_embeddings: str = ""  # TLA-SA utterance speaker-embedding store (e.g. teacher/ecapa-speechbrain)
     tla_weight: float = 0.0  # TLA-SA used 0.5
+    # Speaker-embedding condition (model.speaker_condition_dim > 0): utterance embeddings of a speaker store built by
+    # scripts/extract_teacher_features.py speakers (train and val splits). `other` conditions a within-utterance item
+    # on another utterance of its speaker label (the target never leaks into its own condition, and inference
+    # embeds the prompt, not the target), `same` on its own; `min_cosine` falls back to the item's own embedding when
+    # the other utterance is further away (diarization label noise). Must not be the TLA-SA store.
+    speaker_condition: str = ""
+    speaker_condition_source: str = "other"
+    speaker_condition_min_cosine: float = 0.0
     tla_entropy: float = 0.01  # weight of the negative entropy of the time-dependent block weights
     # Schedule and regularization options (issue #14); every default reproduces the original recipe exactly.
     # wsd: warmup, constant LR, then a decay over the last `decay_fraction` of the updates. A 20% 1-sqrt
@@ -357,6 +372,11 @@ class TrainConfig:
             raise ValueError("tempo_prompt_pairs: cross stretches cross prompts only; set cross_prompt_prob > 0")
         if min(self.repa_weight, self.repa_stop_step, self.tla_weight, self.tla_entropy) < 0:
             raise ValueError("Teacher loss weights and repa_stop_step must be nonnegative")
+        if self.speaker_condition_source not in {"other", "same"} or not -1 <= self.speaker_condition_min_cosine <= 1:
+            raise ValueError("speaker_condition_source must be other or same; min_cosine in [-1,1]")
+        if self.speaker_condition and self.tla_weight and self.speaker_condition == self.speaker_embeddings:
+            # The TLA heads could read the injected vector back from the hidden states and satisfy their loss.
+            raise ValueError("speaker_condition must be another store than the TLA-SA speaker_embeddings")
         if self.repa_frames not in {"all", "target"}:
             raise ValueError("repa_frames must be all or target")
         if (self.repa_weight and not self.teacher_features) or (
@@ -414,6 +434,8 @@ class Config:
             self.train.tla_weight and not self.model.tla_layers
         ):
             raise ValueError("repa_weight needs model.repa_layer and tla_weight needs model.tla_layers")
+        if bool(self.model.speaker_condition_dim) != bool(self.train.speaker_condition):
+            raise ValueError("model.speaker_condition_dim and train.speaker_condition (a speaker store) go together")
         if self.train.model_guidance_weight and not self.model.cond_dropout:
             raise ValueError("Model guidance needs model.cond_dropout > 0 to learn the null prediction")
 

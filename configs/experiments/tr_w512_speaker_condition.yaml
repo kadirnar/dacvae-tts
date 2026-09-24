@@ -1,0 +1,59 @@
+# A/B: nano_tr_w512 + a frozen speaker-verification embedding in the voice condition, the only change (+98,304
+# parameters: a bias-free, zero-init 192 -> 512 projection; starts as the baseline).
+# Koel-TTS (unseen speakers): in-context 0.637 SIM, frozen SV vector 0.619; MiniMax-Speech: encoder + prompt 0.746 vs
+# prompt only 0.726, while a frozen SV vector raised WER (1.207 -> 1.400/1.704): watch WER as the gate, SIM-o as the goal.
+# Each within cut is conditioned on ANOTHER utterance of its speaker label (the target never leaks into its condition;
+# inference embeds the prompt). Prerequisite (train and val rows; TLA-SA must use another embedder):
+#   pip install speechbrain
+#   python scripts/extract_teacher_features.py speakers --cache C --output C/teacher/ecapa-speechbrain \
+#       --splits train,val --device cuda
+# Compare at 20k with the baseline at seeds 42/43: SIM-o (+ an independent SV model), WER/CER, 3 s vs 10 s prompts.
+model:
+  width: 512
+  depth: 12
+  heads: 8
+  text_depth: 4
+  text_attention: 4
+  patch_size: 1
+  latent_dim: 128
+  positions: rope
+  qk_norm: true
+  prediction: edm
+  text_layout: joined
+  duration: rule
+  cond_dropout: 0.2
+  ctc_layer: 8
+  adaln_rank: 64
+  speaker_condition_dim: 192
+train:
+  steps: 60000
+  batch_size: 96
+  accumulation: 1
+  learning_rate: 0.0008
+  warmup: 2000
+  weight_decay: 0.01
+  optimizer: muon
+  muon_momentum: 0.95
+  ema_decay: 0.9999
+  precision: bf16
+  workers: 4
+  prefetch_factor: 4
+  checkpoint_every: 1000
+  keep_every: 5000
+  validate_every: 1000
+  log_every: 100
+  grad_checkpoint: true    # eager on 24 GB needs recomputation at frame budget 12000
+  compile: false           # generator-only compile spent >15 min on the first step here (dynamic-shape recompiles); eager + checkpointing instead
+  seed: 42
+  flow_reduction: frame
+  pairing: within
+  prompt_fraction_min: 0.1
+  prompt_fraction_max: 0.6
+  prompt_dropout: 0.3
+  time_sampling: logit_normal
+  batch_expansion: 4       # run B (Ke=4) led run A (Ke=2) by 0.02-0.04 WER at 25k-30k updates and kept SIM higher
+  ctc_weight: 0.1
+  contrastive_weight: 0.2
+  contrastive_margin: 0.1
+  wandb_project: dacvae-tts-tr
+  speaker_condition: teacher/ecapa-speechbrain
