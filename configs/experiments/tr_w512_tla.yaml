@@ -1,5 +1,6 @@
 # nano_tr_w512 + TLA-SA speaker alignment (SpeechBrain ECAPA targets). Only the teacher lines differ from configs/nano_tr_w512.yaml;
-# A/B at 20k updates: pass --steps 20000 to every arm, the baseline included (issue #10).
+# A/B at 20k updates of the unchanged 60k schedule (train --steps 60000 --stop-after 20000), the baseline
+# included, like every arm of scripts/gpu/30_ab_training.sh (issue #10).
 model:
   width: 512
   depth: 12
