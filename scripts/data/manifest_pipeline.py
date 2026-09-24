@@ -92,9 +92,9 @@ def add_arguments(parser):
     group = parser.add_argument_group("manifest and filters (shared by all Turkish source preparers)")
     group.add_argument("--output", required=True, help="Directory for manifest/, summary.json, rejected.jsonl")
     group.add_argument(
-        "--freya-sentences",
-        help="Freya-TR-Eval sentences (.jsonl with `text`, .txt, .csv/.tsv), e.g. data/eval/freya_tr_eval.jsonl; "
-        "required unless --no-freya-check",
+        "--freya-sentences", nargs="+",
+        help="Evaluation sentences never to train on (.jsonl with `text`, .txt, .csv/.tsv), one or more files: "
+        "data/eval/freya_tr_eval.jsonl and e.g. the FLEURS-tr transcripts; required unless --no-freya-check",
     )
     group.add_argument("--no-freya-check", action="store_true", help="Skip the evaluation-sentence exclusion")
     group.add_argument(
@@ -279,8 +279,11 @@ class ManifestBuilder:
         self.output = Path(args.output)
         if (self.output / "manifest").exists() and any((self.output / "manifest").iterdir()):
             raise ValueError(f"{self.output}/manifest already exists; use a new output directory")
-        if args.freya_sentences:
-            self.freya = FreyaExclusion(load_sentences(args.freya_sentences), args.freya_near_threshold)
+        paths = args.freya_sentences
+        self.freya_files = [str(paths)] if isinstance(paths, (str, Path)) else [str(p) for p in paths or ()]
+        if self.freya_files:  # every evaluation set's sentences in one exclusion (Freya-TR-Eval, FLEURS-tr, ...)
+            sentences = [s for path in self.freya_files for s in load_sentences(path)]
+            self.freya = FreyaExclusion(sentences, args.freya_near_threshold)
         elif args.no_freya_check:
             self.freya = None
         else:
@@ -498,6 +501,7 @@ class ManifestBuilder:
             "kept_speech_ratio": quantiles(self.kept["speech_ratio"]),
             "kept_sample_rates": {str(k): v for k, v in sorted(self.kept["sample_rate"].items())},
             "freya_sentences": len(self.freya) if self.freya is not None else 0,
+            "freya_sentence_files": self.freya_files,
             "wall_seconds": seconds,
             "warnings": warnings,
             "next_steps": next_steps(self.output, self.source),

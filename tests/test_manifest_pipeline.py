@@ -168,3 +168,24 @@ def test_freya_file_is_required(tmp_path):
     args = parser.parse_args(["--output", str(tmp_path / "x"), "--no-freya-check", "--cps-iqr-k", "0"])
     summary = manifest_pipeline.ManifestBuilder(args, source="s", license="MIT").run(good_candidates(2))
     assert any("Freya" in w for w in summary["warnings"])
+
+
+def test_several_evaluation_sentence_files_are_excluded(tmp_path):
+    """--freya-sentences takes Freya-TR-Eval plus other evaluation sets (e.g. FLEURS-tr); one file still works."""
+    fleurs = tmp_path / "fleurs_tr.txt"
+    fleurs.write_text("Bu cümle FLEURS değerlendirme setinden alınmıştır.\n")
+    rows = good_candidates(12) + [
+        dict(id="bad/freya", text="İstanbul'da yarın öğleden sonra yağmur bekleniyor.", speaker="spk/x",
+             audio_bytes=wav_bytes(noise(3))),
+        dict(id="bad/fleurs", text="bu cümle fleurs değerlendirme setinden alınmıştır", speaker="spk/x",
+             audio_bytes=wav_bytes(noise(3))),
+    ]
+    args = builder_args(tmp_path, "--freya-sentences", str(freya_file(tmp_path)), str(fleurs), "--cps-iqr-k", "0")
+    assert args.freya_sentences == [str(tmp_path / "freya_tr_eval.jsonl"), str(fleurs)]
+    summary = manifest_pipeline.ManifestBuilder(args, source="s", license="MIT").run(rows)
+    assert summary["removed"]["freya_exact"] == 2 and summary["freya_sentences"] == 3
+    assert summary["freya_sentence_files"] == args.freya_sentences
+    assert "bad/fleurs" not in {r["id"] for r in manifest_rows(tmp_path / "out")}
+    single = builder_args(tmp_path, "--output", str(tmp_path / "single"), "--cps-iqr-k", "0")
+    summary = manifest_pipeline.ManifestBuilder(single, source="s", license="MIT").run(rows)
+    assert summary["removed"]["freya_exact"] == 1 and summary["freya_sentence_files"] == single.freya_sentences
