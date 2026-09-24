@@ -326,6 +326,23 @@ class Synthesizer:
         return round(frames * duration_scale), profile
 
     @torch.inference_mode()
+    def head_frames(self, reference, tokens, segments, profile):
+        """Unrounded target frames from the model's duration head: prompt latents [L,C], tokens/segments [1,S].
+
+        The head predicts log frames per target byte; `profile` receives the timing when profiling.
+        """
+        prompt = reference[None]
+        mask = torch.ones(prompt.shape[:2], device=self.device, dtype=torch.bool)
+        with autocast(self.device, self.precision):
+            log_rate = self._measure(
+                lambda: self.model.predict_duration(prompt, mask, tokens, segments),
+                profile,
+                "duration_prediction_seconds",
+            )
+        nbytes = ((segments == 1) & (tokens >= BYTE_OFFSET)).sum().item()
+        return math.exp(float(log_rate.clamp(-4, 6))) * nbytes
+
+    @torch.inference_mode()
     def make_batch(self, reference, reference_text, text, seconds=None, duration_scale=1.0, duration_mode="rule",
                    timing=None):
         if not math.isfinite(duration_scale) or duration_scale <= 0:
@@ -343,17 +360,8 @@ class Synthesizer:
                 len(reference), reference_text, text, None, duration_scale, duration_mode, timing=timing
             )
         elif seconds is None:
-            prompt = reference[None]
-            mask = torch.ones(prompt.shape[:2], device=self.device, dtype=torch.bool)
-            with autocast(self.device, self.precision):
-                self.duration_profile = {}
-                log_rate = self._measure(
-                    lambda: self.model.predict_duration(prompt, mask, tokens, segments),
-                    self.duration_profile,
-                    "duration_prediction_seconds",
-                )
-            nbytes = ((segments == 1) & (tokens >= BYTE_OFFSET)).sum().item()
-            frames = round(math.exp(float(log_rate.clamp(-4, 6))) * nbytes * duration_scale)
+            self.duration_profile = {}
+            frames = round(self.head_frames(reference, tokens, segments, self.duration_profile) * duration_scale)
         else:
             self.duration_profile = {"duration_override_seconds": seconds}
             if not math.isfinite(seconds) or seconds <= 0:
@@ -511,7 +519,8 @@ class Synthesizer:
         of a text differ only in their initial noise, which is what best-of-N reranking needs. `selector`, e.g.
         quality.CandidateScorer.select, is called as selector(text, waveforms, sample_rate) -> (best index,
         per-candidate scores): each candidate then carries its `selection` scores and metadata["selected"] lists
-        the best index per text (results keep the candidate order).
+        the best index per text (results keep the candidate order). Target lengths follow `synthesize`: `seconds`,
+        else a duration-head model's head, else `duration_mode`.
 
         `duration_factors` (e.g. [1.0, 0.9, 1.1]) makes the candidates duration-diverse as well: candidate k gets
         target length x factors[k % len(factors)] (on top of `duration_scale`) and its own noise, so `candidates`
@@ -539,14 +548,25 @@ class Synthesizer:
         timing = self._articulation_timing(reference, seconds, duration_mode)
         requests = []
         for text in texts:
-            options = [self.target_frames(len(latents), reference.transcript, text, seconds, duration_scale * factor,
-                                          duration_mode, timing=timing) for factor in factors]
-            if not all(0.25 <= frames * self.codec.hop_length / self.codec.sample_rate <= 30 for frames, _ in options):
-                raise ValueError(f"Target duration outside .25–30 s for: {text[:60]!r}; split the text")
             tokens, segments = tokenize(reference.transcript, text, version=self.text_version, layout=layout)
             only_tokens, only_segments = tokenize("", text, version=self.text_version, layout=layout)
             if tokens.numel() > 2048:
                 raise ValueError("Text too long; split into sentences before synthesis")
+            if seconds is None and self.model.duration is not None:
+                # A duration-head model is sized by its head, as in make_batch (synthesize); the rules are for
+                # rule-duration models.
+                if not math.isfinite(duration_scale) or duration_scale <= 0:
+                    raise ValueError("duration_scale must be finite and positive")
+                profile = {"duration_rule": "duration_head"}
+                predicted = self.head_frames(latents, tokens[None].to(self.device), segments[None].to(self.device),
+                                             profile)
+                options = [(round(predicted * (duration_scale * factor)), profile) for factor in factors]
+            else:
+                options = [self.target_frames(len(latents), reference.transcript, text, seconds,
+                                              duration_scale * factor, duration_mode, timing=timing)
+                           for factor in factors]
+            if not all(0.25 <= frames * self.codec.hop_length / self.codec.sample_rate <= 30 for frames, _ in options):
+                raise ValueError(f"Target duration outside .25–30 s for: {text[:60]!r}; split the text")
             requests.append((options, tokens, segments, only_tokens, only_segments))
         rows = [(i, k) for i in range(len(texts)) for k in range(candidates)]
         results = [[None] * candidates for _ in texts]

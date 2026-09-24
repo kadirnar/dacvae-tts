@@ -189,6 +189,39 @@ def test_synthesize_many_duration_modes_and_speaker_guidance(monkeypatch, cache,
         tts.synthesize_many(texts, voice, unknown_option=1)
 
 
+def test_synthesize_many_sizes_duration_head_models_like_synthesize(monkeypatch, cache, tmp_path):
+    # Best-of-N used to size head models with the byte rule (17 vs 82 frames for one text), so single and
+    # best-of-N evaluations of configs/small.yaml / tiny.yaml models compared different duration methods.
+    import math
+
+    import dacvae_tts.inference as module
+    from dacvae_tts.inference import VoiceReference
+
+    data = LatentDataset(cache)
+    config = Config(ModelConfig(latent_dim=4, width=16, depth=1, heads=2, text_depth=1, duration="head"))
+    model = FlowTTS(config.model)
+    torch.nn.init.zeros_(model.duration[-1].weight)
+    torch.nn.init.constant_(model.duration[-1].bias, math.log(3.0))  # three frames per target byte
+    path = tmp_path / "model.pt"
+    torch.save({"model": model.state_dict(), "ema": model.state_dict(), "config": config.to_dict(),
+                "codec": data.meta, "mean": data.mean, "std": data.std}, path)
+    monkeypatch.setattr(module, "Codec", FakeCodec)
+    tts = Synthesizer(path, device="cpu", precision="fp32")
+    voice = VoiceReference(torch.zeros(60, 4), "A reference transcript that is long enough.", "test", {})
+    text = "Target words here."
+    for scale in (1.0, 0.8):
+        single = tts.make_batch(voice.latents, voice.transcript, text, duration_scale=scale)["prompt"].size(1) - 60
+        assert single == round(3.0 * len(text.encode()) * scale)
+        assert single != tts.target_frames(60, voice.transcript, text, duration_scale=scale)[0]
+        results, _ = tts.synthesize_many([text], voice, candidates=2, steps=1, guidance=1.0, duration_scale=scale,
+                                         duration_factors=[1.0, 1.2])
+        assert results[0][0]["frames"] == single and results[0][0]["duration"]["duration_rule"] == "duration_head"
+        assert results[0][1]["frames"] == round(3.0 * len(text.encode()) * scale * 1.2)
+    # A fixed length still overrides the head.
+    results, _ = tts.synthesize_many([text], voice, seconds=0.5, steps=1, guidance=1.0)
+    assert results[0][0]["frames"] == round(0.5 * 24000 / 512)
+
+
 def test_auto_duration_picks_the_rule_per_prompt_rate():
     from dacvae_tts.duration import auto_mode
 
