@@ -632,3 +632,21 @@ def test_eval_sentences_synthesis_rewrites_prompt_wavs(fake_whisper, tmp_path, m
     ] * 2
     assert json.loads((out / "cases.json").read_text()) == OTHER_CASES
 
+
+def test_seedtts_normalization_deletes_punctuation_like_upstream():
+    """seed-tts-eval run_wer.py deletes punctuation (zhon.hanzi + string.punctuation, apostrophe kept): a hyphenated
+    word stays one word, so its WER denominator matches published Seed-TTS numbers."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "eval_seedtts.py"
+    spec = importlib.util.spec_from_file_location("eval_seedtts_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    normalize = module.seed_normalize
+    assert normalize("Twenty-one people, don't go!") == "twentyone people don't go"
+    assert normalize("He said “yes”… (twice) — then left.") == "he said yes twice then left"
+    assert normalize("don’t  stop") == "dont stop"  # the curly apostrophe is zhon punctuation upstream
+    assert normalize("e.g. U.S.A.") == "eg usa"
+    assert len(module.HANZI_PUNCTUATION) == 82 and "\u3002" in module.HANZI_PUNCTUATION
+
