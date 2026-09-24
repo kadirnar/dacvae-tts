@@ -14,7 +14,16 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 
-from .turkish import LATIN_EXTRA, PUNCTUATION, ordinal_words, tr_lower
+from .turkish import (
+    ABBREVIATIONS,
+    LATIN_EXTRA,
+    PUNCTUATION,
+    abbreviation_rules,
+    ordinal_words,
+    tr_lower,
+    tr_title,
+    tr_upper,
+)
 
 LETTERS = "a-zA-ZçğıöşüâîûÇĞİÖŞÜÂÎÛ"
 UPPER = "A-ZÇĞİÖŞÜÂÎÛ"
@@ -36,15 +45,6 @@ SPOKEN_ACRONYMS = {
     "GIF": "gif", "JPEG": "jipeg", "LAN": "lan", "WAN": "van", "PDF": "pe de fe", "USB": "u se be",
     "NBA": "en bi ey", "BBC": "bi bi si", "CNN": "si en en", "FBI": "ef bi ay", "CIA": "si ay ey",
     "AI": "ey ay", "OK": "okey", "TV": "te ve", "DJ": "di cey", "PC": "pe ce", "CEO": "si i o",
-}
-ABBREVIATIONS = {
-    "Dr.": "doktor", "Prof.": "profesör", "Doç.": "doçent", "Yrd.": "yardımcı", "Av.": "avukat", "Uzm.": "uzman",
-    "Op.": "operatör", "Arş.": "araştırma", "Gör.": "görevlisi", "Öğr.": "öğretim", "Sn.": "sayın", "Hz.": "hazreti",
-    "Müh.": "mühendis", "Mah.": "mahallesi", "Cad.": "caddesi", "Sok.": "sokağı", "Apt.": "apartmanı",
-    "Blv.": "bulvarı", "Tel.": "telefon", "No.": "numara",
-    "vb.": "ve benzeri", "vs.": "vesaire", "vd.": "ve diğerleri", "örn.": "örneğin", "bkz.": "bakınız",
-    "yy.": "yüzyıl", "yak.": "yaklaşık", "ort.": "ortalama", "maks.": "maksimum", "mah.": "mahallesi",
-    "cad.": "caddesi", "sok.": "sokağı", "apt.": "apartmanı", "tel.": "telefon", "no.": "numara",
 }
 UNITS = {
     "km/sa": "kilometre", "km/s": "kilometre", "km/h": "kilometre",
@@ -69,15 +69,6 @@ FOREIGN = {"č": "ç", "ć": "ç", "Č": "Ç", "Ć": "Ç", "š": "ş", "ś": "ş
            "đ": "d", "Đ": "D", "ð": "d", "þ": "t", "ə": "e", "Ə": "E"}
 # `%` stays: turkish-v1 reads it next to a number (%50 -> yüzde elli); a lone % is rewritten before the final filter.
 ALLOWED = set(PUNCTUATION) | LATIN_EXTRA | set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 %")
-
-
-def tr_upper(text):
-    """Turkish upper-casing: i -> İ and ı -> I before the generic upper-casing."""
-    return text.replace("i", "İ").replace("ı", "I").upper()
-
-
-def tr_title(word):
-    return tr_upper(word[:1]) + tr_lower(word[1:])
 
 
 @dataclass
@@ -267,13 +258,9 @@ def prepare_text(text):
     text = r.sub(r"\b([IVXLC]{1,7})\.(?=\s+[" + LETTERS + r"])()", roman, text, "Roma rakamı")
     text = r.sub(r"\b([IVXLC]{1,7})\.?( yüzyıl)", roman, text, "Roma rakamı")
     # Abbreviations with a period; keep a sentence end when the abbreviation closes the text.
-    for abbreviation, word in sorted(ABBREVIATIONS.items(), key=lambda item: -len(item[0])):
-        a = re.escape(abbreviation)
-        word = tr_title(word) if abbreviation[0].isupper() else word  # "Dr. Ahmet" -> "Doktor Ahmet"
-        text = r.sub(rf"(?<![{LETTERS}]){a}(?=\s*$)", word + ".", text, "kısaltma")
-        if abbreviation[0].islower():  # "armut vs. Sonra" keeps its sentence end; "Dr. Ahmet" does not
-            text = r.sub(rf"(?<![{LETTERS}]){a}(?=\s+[{UPPER}])", word + ".", text, "kısaltma")
-        text = r.sub(rf"(?<![{LETTERS}]){a}", word, text, "kısaltma")
+    # "Dr. Ahmet" -> "Doktor Ahmet"; "armut vs. Sonra" keeps its sentence end; T.C. -> te ce, A.Ş. -> anonim şirketi.
+    for pattern, word in abbreviation_rules(ABBREVIATIONS):
+        text = r.sub(pattern, word, text, "kısaltma")
     # Letters glued to digits (5G, 3D, Q3, A4, H2O, COVID-19): split, and spell a single capital letter.
     text = r.sub(rf"(?<![{LETTERS}])([{UPPER}])(?=\d)", lambda m: LETTER_NAMES.get(m.group(1), m.group(1)) + " ", text, "harf")
     text = r.sub(rf"(?<=[{LETTERS}])-(?=\d)", " ", text, "tire")

@@ -7,7 +7,7 @@ import torch
 PAD, BOS, SEP, EOS, BYTE_OFFSET = 0, 1, 2, 3, 4
 SPACE = 32 + BYTE_OFFSET
 VOCAB_SIZE = 260
-TEXT_VERSIONS = {"unicode-v1", "english-explicit-v2", "turkish-v1"}
+TEXT_VERSIONS = {"unicode-v1", "english-explicit-v2", "turkish-v1", "turkish-v2"}
 
 
 def normalize(text: str, version="unicode-v1", spoken_text=None) -> str:
@@ -16,10 +16,10 @@ def normalize(text: str, version="unicode-v1", spoken_text=None) -> str:
     if not isinstance(text, str) or (spoken_text is not None and not isinstance(spoken_text, str)):
         raise ValueError("Transcript must be a string")
     text = text if spoken_text is None else spoken_text
-    if version == "turkish-v1":
+    if version in {"turkish-v1", "turkish-v2"}:
         from .turkish import normalize_turkish
 
-        return normalize_turkish(text)
+        return normalize_turkish(text, version)
     text = unicodedata.normalize("NFKC", text).translate(
         str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"', "–": "-", "—": "-", "…": "..."})
     )

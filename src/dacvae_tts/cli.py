@@ -26,8 +26,10 @@ def main():
     p.add_argument("--speaker-column", default="speaker_id")
     p.add_argument(
         "--text-normalization",
-        choices=["unicode-v1", "english-explicit-v2", "turkish-v1"],
+        choices=["unicode-v1", "english-explicit-v2", "turkish-v1", "turkish-v2"],
         default="unicode-v1",
+        help="Transcript normalization stored in the cache; turkish-v2 = turkish-v1 plus 'dört' softening "
+        "(4'e -> dörde) and T.C./A.Ş./Ltd. Şti./Dr./vb. expansion (scripts/renormalize_cache.py converts a cache)",
     )
     p.add_argument("--min-seconds", type=float, default=1.0)
     p.add_argument("--max-seconds", type=float, default=15.0)

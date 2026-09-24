@@ -45,7 +45,7 @@ def main():
     parser.add_argument("--repo", required=True, help="ORG/DATASET, or anything with --local-dir")
     parser.add_argument("--local-dir", help="Use already downloaded shards from this directory (not deleted)")
     parser.add_argument(
-        "--text-normalization", choices=["unicode-v1", "english-explicit-v2", "turkish-v1"], default="unicode-v1"
+        "--text-normalization", choices=["unicode-v1", "english-explicit-v2", "turkish-v1", "turkish-v2"], default="unicode-v1"
     )
     parser.add_argument("--languages", default="any", help="Comma-separated accepted language tags, or any")
     parser.add_argument("--pattern", default="data/train-{index:05d}-of-{total:05d}.parquet")
