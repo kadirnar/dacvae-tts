@@ -1,4 +1,5 @@
 import json
+import shutil
 import sqlite3
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ import soundfile as sf
 import torch
 
 from dacvae_tts.data import LatentDataset, speaker_split
+from dacvae_tts.prepare import merge, prepare
 from dacvae_tts.speakers import (
     RowAudio,
     assign_split,
@@ -271,3 +273,122 @@ def test_cluster_speakers_end_to_end_with_cached_embeddings(cache, tmp_path):
 
     with pytest.raises(ValueError, match="first 20 rows all failed"):
         cluster_speakers(SimpleNamespace(**{**vars(args), "output": tmp_path / "broken"}), embed=fake_embed, load=broken)
+
+
+def split_by_uid(path):
+    with sqlite3.connect(path / "index.sqlite") as db:
+        return dict(db.execute("SELECT uid, split FROM samples"))
+
+
+def test_merge_default_splits_unchanged(cache, tmp_path):
+    merge(SimpleNamespace(inputs=[cache], output=tmp_path / "merged"))
+    meta = json.loads((tmp_path / "merged" / "metadata.json").read_text())
+    assert split_by_uid(tmp_path / "merged") == split_by_uid(cache)
+    assert not {"split_key", "split_map", "split_version", "split_reassigned_rows"} & meta.keys()
+
+
+def test_merge_split_map_reassigns_and_repairs_leaks(cache, tmp_path):
+    split_map = tmp_path / "split_map.json"
+    split_map.write_text(json.dumps({"val-0": "train", "test-1": "train"}))
+    output = tmp_path / "merged"
+    merge(SimpleNamespace(inputs=[cache], output=output, split_map=split_map))
+    splits = split_by_uid(output)
+    assert {splits[f"val-0-{i}"] for i in range(3)} == {splits[f"test-1-{i}"] for i in range(3)} == {"train"}
+    assert {uid: s for uid, s in splits.items() if s != uid.split("-")[0]}.keys() == {
+        f"{label}-{i}" for label in ("val-0", "test-1") for i in range(3)
+    }
+    meta = json.loads((output / "metadata.json").read_text())
+    assert meta["split_counts"] == {"train": 18, "val": 9, "test": 9}
+    assert meta["split_version"] == "split_map_v1" and meta["split_reassigned_rows"] == 6
+    assert meta["split_map"] == str(split_map.resolve()) and len(meta["split_map_sha256"]) == 64
+    with sqlite3.connect(output / "index.sqlite") as db:
+        frames = db.execute("SELECT sum(frames) FROM samples WHERE split='train'").fetchone()[0]
+    assert torch.load(output / "stats.pt", weights_only=True)["count"] == frames  # statistics follow the map
+
+    broken = tmp_path / "broken"
+    shutil.copytree(cache, broken)
+    with sqlite3.connect(broken / "index.sqlite") as db:
+        db.execute("UPDATE samples SET split='train' WHERE uid='val-0-0'")
+    with pytest.raises(ValueError, match="Speaker appears across splits"):
+        merge(SimpleNamespace(inputs=[broken], output=tmp_path / "still-broken"))
+    split_map.write_text(json.dumps({"val-0": "val"}))
+    merge(SimpleNamespace(inputs=[broken], output=tmp_path / "repaired", split_map=split_map))
+    assert split_by_uid(tmp_path / "repaired")["val-0-0"] == "val"
+
+
+def test_merge_split_key_holds_whole_groups_out(cache, tmp_path):
+    prefix = r"^(\w+)-\d+$"  # conftest labels are "<split>-<k>": the key is the old split name
+    output = tmp_path / "merged"
+    merge(SimpleNamespace(inputs=[cache], output=output, split_key=prefix))
+    groups = {}
+    for uid, split in split_by_uid(output).items():
+        groups.setdefault(uid.split("-")[0], set()).add(split)
+    assert groups == {key: {speaker_split(key, 42)} for key in ("train", "val", "test")}
+    meta = json.loads((output / "metadata.json").read_text())
+    assert meta["split_key"] == prefix and meta["split_version"] == "split_key_sha256_98_1_1_v1"
+    assert meta["split_map"] is None
+
+    by_key = tmp_path / "by_key.json"
+    by_key.write_text(json.dumps({"val": "test"}))  # a key entry moves the whole group
+    merge(SimpleNamespace(inputs=[cache], output=tmp_path / "by-key", split_key=prefix, split_map=by_key))
+    moved = split_by_uid(tmp_path / "by-key")
+    assert {moved[f"val-{k}-{i}"] for k in range(4) for i in range(3)} == {"test"}
+    assert {moved[f"test-{k}-0"] for k in range(4)} == {speaker_split("test", 42)}
+
+    divided = tmp_path / "divided.json"
+    other = next(s for s in ("train", "val", "test") if s != speaker_split("val", 42))
+    divided.write_text(json.dumps({"val-1": other}))
+    with pytest.raises(ValueError, match="Split-key group appears across splits: val"):
+        merge(SimpleNamespace(inputs=[cache], output=tmp_path / "divided", split_key=prefix, split_map=divided))
+    with pytest.raises(ValueError, match="Invalid --split-key"):
+        merge(SimpleNamespace(inputs=[cache], output=tmp_path / "bad", split_key="("))
+    assert not (tmp_path / "bad" / "index.sqlite").exists()
+
+    keyed = tmp_path / "keyed"
+    shutil.copytree(cache, keyed)
+    meta = json.loads((keyed / "metadata.json").read_text())
+    (keyed / "metadata.json").write_text(json.dumps({**meta, "split_key": prefix}))
+    with pytest.raises(ValueError, match="Incompatible partitions: split_key"):
+        merge(SimpleNamespace(inputs=[cache, keyed], output=tmp_path / "mixed"))
+    merge(SimpleNamespace(inputs=[keyed], output=tmp_path / "recorded"))  # recorded key, consistent groups
+    with sqlite3.connect(keyed / "index.sqlite") as db:
+        db.execute("UPDATE samples SET speaker='val-9' WHERE speaker='train-3'")  # a "val" key label in train
+    with pytest.raises(ValueError, match="Split-key group appears across splits"):
+        merge(SimpleNamespace(inputs=[keyed], output=tmp_path / "recorded-divided"))
+
+
+def test_prepare_split_key_holds_episodes_out(tmp_path, monkeypatch):
+    from test_prepare_fast import ToyCodec, args_for
+
+    import dacvae_tts.prepare as module
+
+    monkeypatch.setattr(module, "Codec", lambda *args, **kwargs: ToyCodec())
+    labels = ["epA_speaker_0", "epA_speaker_1", "epB_speaker_0", "epB_speaker_1", "epC_speaker_0", "anonymous"]
+    rows = []
+    for i, label in enumerate(labels):
+        path = tmp_path / f"{i}.wav"
+        sf.write(path, np.random.default_rng(i).normal(0, 0.1, 400 + i).astype(np.float32), 8000, subtype="FLOAT")
+        rows.append(dict(id=str(i), audio=path.name, text=f"Sentence {i}.", speaker_id=label))
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text("\n".join(map(json.dumps, rows)))
+
+    default = tmp_path / "default"
+    prepare(args_for(manifest, default))
+    meta = json.loads((default / "metadata.json").read_text())
+    assert meta["accepted"] == 6 and meta["split_version"] == "speaker_sha256_98_1_1_v1" and "split_key" not in meta
+    with sqlite3.connect(default / "index.sqlite") as db:
+        assert all(split == speaker_split(s, 42) for s, split in db.execute("SELECT speaker, split FROM samples"))
+
+    keyed = tmp_path / "keyed"
+    prepare(args_for(manifest, keyed, split_key=EPISODE, seed=3))
+    meta = json.loads((keyed / "metadata.json").read_text())
+    assert (meta["accepted"], meta["rejected"]) == (5, 1)
+    assert meta["split_key"] == EPISODE and meta["split_version"] == "split_key_sha256_98_1_1_v1"
+    assert "does not match --split-key" in (keyed / "rejected.jsonl").read_text()
+    with sqlite3.connect(keyed / "index.sqlite") as db:
+        for speaker, split in db.execute("SELECT speaker, split FROM samples"):
+            assert split == speaker_split(speaker.split("_")[0], 3)
+
+    monkeypatch.setattr(module, "Codec", lambda *args, **kwargs: pytest.fail("codec loaded before validation"))
+    with pytest.raises(ValueError, match="Invalid --split-key"):
+        prepare(args_for(manifest, tmp_path / "bad", split_key="("))

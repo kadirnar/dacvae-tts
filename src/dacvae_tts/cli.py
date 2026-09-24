@@ -76,6 +76,7 @@ def main():
         action="store_true",
         help="Keep the original encoder weight-normalization hooks for comparison",
     )
+    add_split_key_arg(p)
     add_partition_args(p)
 
     p = sub.add_parser("merge", help="Merge partitions, deduplicate, check splits and calculate statistics")
@@ -91,6 +92,13 @@ def main():
         "--keep-singletons",
         action="store_true",
         help="Keep speakers with one recording (usable only with within-utterance pairing)",
+    )
+    add_split_key_arg(p, " Re-splits every row while merging (no re-encoding).")
+    p.add_argument(
+        "--split-map",
+        help="JSON {speaker label or split key: train|val|test} applied while merging, e.g. split_map.json "
+        "of scripts/speaker_clusters.py (one split per cross-episode voice cluster); labels without an "
+        "entry fall back to --split-key, else keep their split",
     )
 
     p = sub.add_parser("train", help="Pretrain from scratch; launch with torchrun for DDP")
@@ -319,6 +327,15 @@ def add_partition_args(parser):
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--num-shards", type=positive_int, default=1)
     parser.add_argument("--seed", type=int, default=42)
+
+
+def add_split_key_arg(parser, note=""):
+    parser.add_argument(
+        "--split-key",
+        help="Regex extracting the key the split hash uses from the speaker label (named group `key`, else "
+        "group 1, else the whole match), e.g. '^(.+)_speaker_\\d+$' holds whole episodes out; labels it does "
+        "not match are errors." + note,
+    )
 
 
 def add_codec_args(parser):

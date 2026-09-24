@@ -19,6 +19,7 @@ from tqdm import tqdm
 from .codec import Codec, backend_options, check_compatibility, file_digest, read_audio
 from .data import SCHEMA, ShardWriter, save_stats, speaker_split
 from .parallel import initialize_worker
+from .speakers import assign_split, check_split_groups, compile_split_key, load_split_map, split_group
 from .text import encode_ids, normalize
 
 ENGLISH_TAGS = {"en", "eng", "English", "english", "en-US", "en-GB"}
@@ -153,7 +154,9 @@ def prepare_record(row, args, root, sample_rate):
         language = row.get("language", next(iter(accepted)))
         if accepted != {"any"} and language not in accepted:
             raise ValueError(f"Language tag not accepted: {language}")
-        split = row.get("split") or speaker_split(speaker, args.seed)
+        # --split-key hashes an episode/program key instead of the label, so whole episodes are held out.
+        split_key = getattr(args, "split_key", None)
+        split = row.get("split") or speaker_split(split_group(speaker, split_key), args.seed)
         if split not in {"train", "val", "test"}:
             raise ValueError("split must be train, val or test")
         source = row[args.audio_column]
@@ -245,6 +248,7 @@ def prepare(args):
         raise ValueError("Encoder precision must be fp32 or bf16")
     if not 0 <= args.shard_index < args.num_shards:
         raise ValueError("Invalid shard index")
+    split_key = compile_split_key(getattr(args, "split_key", None))  # fail before loading the codec
     out = Path(args.output).resolve()
     out.mkdir(parents=True, exist_ok=True)
     if (out / "index.sqlite").exists():
@@ -414,6 +418,8 @@ def prepare(args):
             **counters,
         },
     }
+    if split_key:
+        metadata.update(split_key=split_key.pattern, split_version="split_key_sha256_98_1_1_v1")
     save_stats(out / "stats.pt", count, sums, squares)
     # A completion marker is written only after both the index and statistics exist.
     (out / "metadata.json").write_text(json.dumps(metadata, indent=2))
@@ -421,8 +427,16 @@ def prepare(args):
 
 
 def merge(args):
-    """Merge partitions without copying large binary shards; recompute retained train statistics."""
+    """Merge partitions without copying large binary shards; recompute retained train statistics.
+
+    --split-key/--split-map re-split every row while merging (no re-encoding): the map entry of the label,
+    else of its split key, else the split-key hash, else the partition's split. Statistics follow the new
+    train split."""
     out = Path(args.output).resolve()
+    # Validated before the output index exists, so a bad option never leaves a half-created cache.
+    split_key = compile_split_key(getattr(args, "split_key", None))
+    split_map = load_split_map(args.split_map) if getattr(args, "split_map", None) else None
+    resplit, reassigned = split_key is not None or split_map is not None, 0
     out.mkdir(parents=True, exist_ok=True)
     if (out / "index.sqlite").exists():
         raise ValueError("Merged output already exists")
@@ -461,8 +475,14 @@ def merge(args):
             for key in ("checkpoint", "latent_dim", "sample_rate", "hop_length", "posterior", "seed"):
                 if meta[key] != current[key]:
                     raise ValueError(f"Incompatible partitions: {key}")
+            if not resplit and meta.get("split_key") != current.get("split_key"):
+                raise ValueError("Incompatible partitions: split_key (re-split them with --split-key)")
             with sqlite3.connect(directory / "index.sqlite") as source:
                 for row in source.execute(f"SELECT {fields} FROM samples"):
+                    if resplit:
+                        split = assign_split(row[1], row[7], meta["seed"], split_key, split_map)
+                        reassigned += split != row[7]
+                        row = (*row[:7], split, *row[8:])
                     # IDs must be globally unique. Duplicate content is dropped; ID collisions are errors.
                     exists = db.execute("SELECT digest FROM samples WHERE uid=?", (row[0],)).fetchone()
                     if exists and exists[0] != row[-1]:
@@ -503,6 +523,9 @@ def merge(args):
         ).fetchone()
         if leakage:
             raise ValueError(f"Speaker appears across splits: {leakage[0]}")
+        group_key = split_key if resplit else compile_split_key(meta.get("split_key"))
+        if group_key is not None:
+            check_split_groups(db, group_key)
         if getattr(args, "drop_uids", None):
             # Quality filtering after encoding (ASR CER / DNSMOS tails): a JSON list or one uid per line.
             text = Path(args.drop_uids).read_text()
@@ -560,6 +583,14 @@ def merge(args):
                 "preparation_partitions": preparation_partitions,
             }
         )
+        if resplit:
+            meta.update(
+                split_key=split_key.pattern if split_key else None,
+                split_map=str(Path(args.split_map).resolve()) if split_map is not None else None,
+                split_map_sha256=file_digest(args.split_map) if split_map is not None else None,
+                split_version="split_map_v1" if split_map is not None else "split_key_sha256_98_1_1_v1",
+                split_reassigned_rows=reassigned,
+            )
         (out / "metadata.json").write_text(json.dumps(meta, indent=2))
         print(json.dumps(meta, indent=2))
     finally:
