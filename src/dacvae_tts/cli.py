@@ -217,7 +217,7 @@ def main():
     p.add_argument("--before", required=True)
     p.add_argument("--after", required=True)
     p.add_argument("--output", required=True)
-    p.add_argument("--bootstrap", type=positive_int, default=2000)
+    p.add_argument("--bootstrap", type=positive_int, default=5000)
     p.add_argument("--seed", type=int, default=42)
 
     p = sub.add_parser("rank-pairs", help="Select non-regressing metric-ranked training pairs")
