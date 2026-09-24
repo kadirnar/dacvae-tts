@@ -1,5 +1,6 @@
 """Sampler guidance variants: interval CFG, CFG rescale, APG, independent text/speaker guidance, padded batches."""
 
+import pytest
 import torch
 
 from dacvae_tts.config import ModelConfig
@@ -143,3 +144,20 @@ def test_speaker_guidance_acts_when_the_text_scale_is_one():
                         speaker_guidance=3.0, text_only=branch)
     assert not torch.allclose(late[target], early_only[target], atol=1e-3)
     assert stats["late_window"]["guided_steps"] == 2 and stats["branch_evaluations"] == 2 * 3 + 2 * 2
+
+
+def test_speaker_guidance_rejects_update_shaping_it_cannot_apply():
+    # The three-branch update bypasses guided_update: rescale/APG (either window) used to be recorded in the stats
+    # as applied while the audio was identical to running without them.
+    model = trained_looking_model()
+    batch, (only_tokens, only_segments) = rows(["Merhaba dünya.", "Kısa."])
+    branch = text_only_rows(model, batch["valid"], batch["prompt_mask"], only_tokens, only_segments)
+    for shaping in (dict(cfg_rescale=0.9), dict(apg_eta=0.2), dict(apg_norm=1.0), dict(apg_momentum=-0.5),
+                    dict(guidance_split=0.5, apg_eta_late=0.5), dict(guidance_split=0.5, cfg_rescale_late=0.7),
+                    dict(guidance_split=0.5, apg_norm_late=2.0), dict(guidance_split=0.5, apg_momentum_late=-0.3)):
+        with pytest.raises(ValueError, match="speaker_guidance"):
+            sample(model, **batch, steps=2, guidance=3.0, speaker_guidance=2.0, text_only=branch, **shaping)
+    # Neutral values and a late text scale remain accepted.
+    out = sample(model, **batch, steps=2, guidance=3.0, speaker_guidance=2.0, text_only=branch, cfg_rescale=0.0,
+                 apg_eta=1.0, guidance_split=0.5, guidance_late=2.0, apg_eta_late=1.0)
+    assert torch.isfinite(out).all()

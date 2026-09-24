@@ -902,7 +902,7 @@ def sample(
     defaults give plain CFG. `speaker_guidance` enables independent text/speaker guidance with a third, prompt-free
     branch built by `text_only_rows` (pass it as `text_only`): v_null + g (v_text - v_null) + g_s (v_full - v_text),
     which equals plain CFG for g_s = g. It also acts where the text scale is 1 (then v_text + g_s (v_full - v_text),
-    without the null branch, which cancels).
+    without the null branch, which cancels). It is not combined with the update shaping (rescale/APG, either window).
 
     `guidance_split` cuts the guided interval into an early window [guidance_from, guidance_split), which uses the
     settings above, and a late window [guidance_split, guidance_until), whose scale and update shape come from
@@ -926,6 +926,12 @@ def sample(
     early = dict(guidance=guidance, rescale=cfg_rescale, eta=apg_eta, norm=apg_norm, momentum=apg_momentum)
     late = guidance_windows(early, guidance_split, guidance_from, guidance_until, guidance=guidance_late,
                             rescale=cfg_rescale_late, eta=apg_eta_late, norm=apg_norm_late, momentum=apg_momentum_late)
+    if speaker_guidance is not None and any(
+        (window["rescale"], window["eta"], window["norm"], window["momentum"]) != (0, 1, 0, 0)
+        for window in (early, late)
+    ):
+        # The three-branch update does not go through guided_update: these would be reported but not applied.
+        raise ValueError("speaker_guidance supports only plain CFG shaping: no cfg_rescale, apg_* or their *_late")
     split = guidance_until if guidance_split is None else guidance_split
     gen = torch.Generator(device=prompt.device).manual_seed(seed)
     audio_shapes(prompt, prompt, prompt_mask, valid, prompt.size(-1))
