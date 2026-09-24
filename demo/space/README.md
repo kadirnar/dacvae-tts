@@ -1,5 +1,5 @@
 ---
-title: DACVAE-TTS Türkçe (Vyvo)
+title: DACVAE-TTS Turkish (Vyvo)
 emoji: 🗣️
 colorFrom: red
 colorTo: yellow
@@ -32,7 +32,7 @@ Turkish zero-shot voice-cloning TTS demo for [VoiceHub/dacvae-tts-tr-w512](https
 - **Synthesis:** 3–15 s reference (upload or microphone; transcript filled in by Whisper and editable) + any length of text.
   Long text is split into sentences and generated in one batched GPU call; numbers, dates, clock times, currencies, units,
   abbreviations, acronyms and symbols are rewritten into spoken Turkish.
-- **Speaking rate:** *Otomatik* follows the prompt but slows down prompts faster than 17 characters/s (rushed podcast
+- **Speaking rate:** *Automatic* follows the prompt but slows down prompts faster than 17 characters/s (rushed podcast
   prompts were the main source of errors on Freya-TR-Eval).
 - **Best-of-N:** N candidates per sentence in one batch; Whisper picks the one it transcribes best.
 - **Research tools:** any checkpoint from the Hub (log in for private repos — your own read permission is used, the Space

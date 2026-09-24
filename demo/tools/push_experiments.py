@@ -18,7 +18,7 @@ EXTRA = {
     "freya-tr-w512-clean-60000": "baseline: rule duration, CFG 5 (published numbers)",
     "freya-w512-dur1.15": "duration x1.15 for every prompt",
     "freya-w512-dur1.3": "duration x1.3 for every prompt",
-    "freya-w512-rate15": "fixed 15 chars/s (old demo 'Sabit hız')",
+    "freya-w512-rate15": "fixed 15 chars/s (old demo 'Fixed rate')",
     "freya-w512-rate13": "fixed 13 chars/s",
 }
 

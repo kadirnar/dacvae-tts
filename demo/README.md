@@ -8,4 +8,4 @@ copy of `src/dacvae_tts/` and the pre-generated `samples/`.
 into the Space and model-repo bundles, `deploy_space.py` uploads and waits for the Space, `make_samples.py` renders the
 showcase samples through a running app, `demo_experiments.sh`/`demo_run.sh` run the Freya-TR-Eval experiments behind the
 demo defaults, `hybrid_sim.py`/`compare_runs.py` analyse them, `push_experiments.py` publishes them and
-`update_model_repo.py` refreshes `VoiceHub/dacvae-tts-tr-w512`. Results: `docs/turkce-arastirma-2026-09-22.md` §8.
+`update_model_repo.py` refreshes `VoiceHub/dacvae-tts-tr-w512`. Results: `docs/turkish-experiments-2026-09-22.md` §8.

@@ -17,7 +17,7 @@ from dacvae_tts.text import normalize  # noqa: E402
 
 
 def load(folder):
-    rows = [json.loads(l) for l in open(f"/workspace/outputs/{folder}/results.jsonl") if l.strip()]
+    rows = [json.loads(line) for line in open(f"/workspace/outputs/{folder}/results.jsonl") if line.strip()]
     return {r["id"]: r for r in rows if "wer" in r}
 
 

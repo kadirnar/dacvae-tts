@@ -1,4 +1,4 @@
-"""DACVAE-TTS Türkçe demo: sıfır-atış ses klonlama, checkpoint karşılaştırma ve Whisper ile doğrulama."""
+"""DACVAE-TTS Turkish demo: zero-shot voice cloning, checkpoint comparison and Whisper verification."""
 
 import json
 import random
@@ -16,14 +16,15 @@ import numpy as np  # noqa: E402
 from dacvae_tts.duration import speaking_rate  # noqa: E402
 from dacvae_tts.frontend import speakable  # noqa: E402
 
-CUSTOM = "Özel checkpoint (aşağıdaki depo)"
-RATE_AUTO, RATE_PROMPT, RATE_FIXED = "Otomatik (önerilen)", "Prompt'un hızı", "Sabit hız"
-GUIDE_CFG, GUIDE_RESCALE, GUIDE_APG, GUIDE_SPLIT = "CFG (en düşük WER)", "CFG + rescale", "APG (daha temiz ses)", "Ayrı metin/konuşmacı"
-DURATION_MODELS = {"Otomatik": None, "Prompt hızı (kural)": "rule", "Kural + hızlı prompt sınırı": "clamp",
-                   "Süre tahmincisi": "predictor", "Karma (yavaşta tahminci, hızlıda sınır)": "auto",
-                   "Hece kuralı": "syllable"}
+CUSTOM = "Custom checkpoint (repository below)"
+RATE_AUTO, RATE_PROMPT, RATE_FIXED = "Automatic (recommended)", "Prompt rate", "Fixed rate"
+GUIDE_CFG, GUIDE_RESCALE, GUIDE_APG, GUIDE_SPLIT = "CFG (lowest WER)", "CFG + rescale", "APG (cleaner audio)", "Separate text/speaker"
+DURATION_MODELS = {"Automatic": None, "Prompt rate (rule)": "rule", "Rule + fast-prompt clamp": "clamp",
+                   "Duration predictor": "predictor", "Hybrid (predictor when slow, clamp when fast)": "auto",
+                   "Syllable rule": "syllable"}
 EXAMPLES = json.loads((ROOT / "examples" / "prompts.json").read_text(encoding="utf-8"))
 SAMPLES = json.loads((ROOT / "samples" / "samples.json").read_text(encoding="utf-8")) if (ROOT / "samples" / "samples.json").exists() else []
+# Turkish example inputs for the model (the interface is English, the speech is Turkish).
 SENTENCES = [
     "Yarın öğleden sonra sağanak bekleniyormuş, şemsiyeni unutma.",
     "Toplantı 23.09.2026 tarihinde saat 14:30'da başlayacak; lütfen sunum dosyalarınızı öğleden önce paylaşın.",
@@ -36,8 +37,8 @@ CUSTOM5 = [
     "Toplantı yarın saat 14'te başlayacak; lütfen sunum dosyalarınızı öğleden önce paylaşın ve %20'lik bütçe artışı önerisini gündeme eklemeyi unutmayın.",
     "İstanbul'da akşam trafiği başlamadan Boğaz Köprüsü'nden geçmek istiyorsanız en geç dörtte yola çıkmalısınız, yoksa bir saatlik yol üçe katlanır.",
 ]
-BATCH_SETS = ["5 örnek cümle", "Freya-TR-Eval · ilk 20", "Freya-TR-Eval · rastgele 20", "Kendi listem"]
-VOICES = ["Sentez sekmesindeki referans"] + [f"Örnek ses {i + 1}" for i in range(len(EXAMPLES))]
+BATCH_SETS = ["5 sample sentences", "Freya-TR-Eval · first 20", "Freya-TR-Eval · random 20", "My own list"]
+VOICES = ["Reference from the Synthesis tab"] + [f"Example voice {i + 1}" for i in range(len(EXAMPLES))]
 
 
 def fail(error):
@@ -61,11 +62,11 @@ def reference_inputs(ref_audio, ref_text):
     if ref_text and ref_text.strip():
         transcript, changes = speakable(ref_text)
         if changes:
-            notes.append("referans transkripti okunuşa çevrildi")
+            notes.append("reference transcript converted to its spoken form")
     else:
         cut = E.cut_for_transcript(audio)
         if len(cut) < len(audio):
-            notes.append(f"otomatik transkript için referans {len(cut) / E.SAMPLE_RATE:.1f} s'ye kısaltıldı")
+            notes.append(f"reference shortened to {len(cut) / E.SAMPLE_RATE:.1f} s for the automatic transcript")
             audio = cut
     return audio, transcript, notes
 
@@ -107,11 +108,11 @@ def metrics_markdown(result, final_info, audio, label, changes, chunks):
     text_chars = sum(len(c) for c in chunks)
     quality = E.dnsmos(audio)
     lines = [
-        f"**Model:** {label} · adım {result.get('step')} · {len(chunks)} parça · "
-        f"{result['meta'].get('candidates', 1)} aday/parça",
-        f"**Ses:** {seconds:.1f} s · konuşma hızı {text_chars / max(seconds - 0.32, 0.1):.1f} kar/s · "
-        f"üretim {result['generation_seconds']:.1f} s · GPU {result.get('gpu_seconds', 0):.1f} s"
-        + (f" (model yükleme {result['model_load_seconds']:.1f} s)" if result.get("model_load_seconds", 0) > 0.5 else ""),
+        f"**Model:** {label} · step {result.get('step')} · {len(chunks)} chunks · "
+        f"{result['meta'].get('candidates', 1)} candidates/chunk",
+        f"**Audio:** {seconds:.1f} s · speaking rate {text_chars / max(seconds - 0.32, 0.1):.1f} chars/s · "
+        f"generation {result['generation_seconds']:.1f} s · GPU {result.get('gpu_seconds', 0):.1f} s"
+        + (f" (model loading {result['model_load_seconds']:.1f} s)" if result.get("model_load_seconds", 0) > 0.5 else ""),
     ]
     metrics = {"seconds": seconds, "chunks": len(chunks), "generation_seconds": result["generation_seconds"],
                "gpu_seconds": result.get("gpu_seconds"), "duration_mode": result["meta"].get("duration_mode"),
@@ -119,8 +120,8 @@ def metrics_markdown(result, final_info, audio, label, changes, chunks):
     if summary:
         selected = result["meta"].get("candidates", 1) > 1
         lines.append(f"**Whisper ({E.ASR_NAME.split('/')[-1]}):** WER {summary['wer']:.3f} · CER {summary['cer']:.3f}"
-                     + (f" · konuşmacı benzerliği {summary['similarity']:.3f}" if "similarity" in summary else "")
-                     + (" · *adaylar bu Whisper ile seçildiği için iyimser bir ölçüm*" if selected else ""))
+                     + (f" · speaker similarity {summary['similarity']:.3f}" if "similarity" in summary else "")
+                     + (" · *optimistic, since the candidates were selected with this Whisper*" if selected else ""))
         lines.append(f"> {summary['hypothesis']}")
         metrics.update(wer=summary["wer"], cer=summary["cer"], similarity=summary.get("similarity"),
                        hypothesis=summary["hypothesis"])
@@ -128,15 +129,15 @@ def metrics_markdown(result, final_info, audio, label, changes, chunks):
         lines.append(f"**DNSMOS:** OVRL {quality['dnsmos_ovrl']:.2f} · SIG {quality['dnsmos_sig']:.2f} · BAK {quality['dnsmos_bak']:.2f}")
         metrics.update(quality)
     if any(len(c["candidates"]) > 1 for c in result["chunks"]):
-        rows = ["| Parça | Seçilen | Aday CER'leri |", "|---:|---:|---|"]
+        rows = ["| Chunk | Selected | Candidate CERs |", "|---:|---:|---|"]
         for i, c in enumerate(result["chunks"], 1):
             cers = ", ".join(f"{r['counts']['cer']:.3f}" for r in c["candidates"])
             rows.append(f"| {i} | {c['selected'] + 1} | {cers} |")
         lines.append("\n".join(rows))
     if result.get("reference_asr"):
-        lines.append(f"**Referans transkripti (Whisper):** {result['reference_asr']}")
+        lines.append(f"**Reference transcript (Whisper):** {result['reference_asr']}")
     if changes:
-        lines.append("<details><summary>Metin ön işleme ({} değişiklik)</summary>\n\n{}\n</details>".format(
+        lines.append("<details><summary>Text preprocessing ({} changes)</summary>\n\n{}\n</details>".format(
             len(changes), "\n".join(f"- {c}" for c in changes[:40])))
     return "\n\n".join(lines), metrics
 
@@ -151,7 +152,7 @@ def on_reference(ref_audio):
         text = E.run_transcribe(cut)
         transcript = speakable(text)[0] if text.strip() else ""
         if len(cut) < len(audio):
-            notes.append(f"transkript ilk {len(cut) / E.SAMPLE_RATE:.1f} s için; sentezde de o kısım kullanılır")
+            notes.append(f"the transcript covers the first {len(cut) / E.SAMPLE_RATE:.1f} s; synthesis uses that part too")
         return text, E.reference_report(cut, transcript, notes)
     except ValueError as error:
         return gr.update(), f"⚠️ {error}"
@@ -187,7 +188,7 @@ def compare(models, ref_audio, ref_text, text, rate_mode, cps, candidates, seed,
     try:
         models = list(models or [])[:4]
         if len(models) < 2:
-            raise ValueError("Karşılaştırmak için en az iki model seçin")
+            raise ValueError("Select at least two models to compare")
         audio, transcript, _ = reference_inputs(ref_audio, ref_text)
         if transcript is None:
             transcript, _ = speakable(E.run_transcribe(audio))
@@ -208,7 +209,7 @@ def compare(models, ref_audio, ref_text, text, rate_mode, cps, candidates, seed,
             final, info = E.assemble(result, pauses)
             summary = E.summarize_chunks(result["chunks"]) or {}
             quality = E.dnsmos(final) or {}
-            audios.append(gr.update(value=E.write_wav(final, "karsilastirma"), label=result["label"], visible=True))
+            audios.append(gr.update(value=E.write_wav(final, "comparison"), label=result["label"], visible=True))
             table.append([result["label"], round(len(final) / E.SAMPLE_RATE, 1), round(summary.get("wer", float("nan")), 3),
                           round(summary.get("cer", float("nan")), 3), round(summary.get("similarity", float("nan")), 3),
                           round(quality.get("dnsmos_ovrl", float("nan")), 2), round(result["gpu_seconds"], 1),
@@ -231,7 +232,7 @@ def batch_test(choice, sentence_set, own, voice, ref_audio, ref_text, rate_mode,
             freya = E.freya_sentences()
             sentences = freya[:20] if sentence_set == BATCH_SETS[1] else random.Random(int(seed)).sample(freya, 20)
         if not sentences:
-            raise ValueError("Test edilecek cümle yok")
+            raise ValueError("No sentences to test")
         sentences = sentences[: E.MAX_BATCH_SENTENCES]
         if voice == VOICES[0]:
             audio, transcript, _ = reference_inputs(ref_audio, ref_text)
@@ -271,10 +272,10 @@ def batch_test(choice, sentence_set, own, voice, ref_audio, ref_text, rate_mode,
             "settings": {k: v for k, v in job.items() if k not in {"reference", "chunks", "model"}},
             "seconds": time.time() - started,
         }
-        text = (f"**{label}** · {len(rows)} cümle · WER **{summary['wer']:.3f}** · CER **{summary['cer']:.3f}** · "
+        text = (f"**{label}** · {len(rows)} sentences · WER **{summary['wer']:.3f}** · CER **{summary['cer']:.3f}** · "
                 f"SIM {summary['similarity']:.3f}"
                 + (f" · DNSMOS {summary['dnsmos_ovrl']:.2f}" if summary.get("dnsmos_ovrl") else "")
-                + f" · hatasız {summary['sentences_without_error']}/{len(rows)} · {summary['seconds']:.0f} s")
+                + f" · error-free {summary['sentences_without_error']}/{len(rows)} · {summary['seconds']:.0f} s")
         return text, table, E.make_zip(files, rows, summary)
     except ValueError as error:
         fail(error)
@@ -284,9 +285,9 @@ def list_files(repo, repo_type, oauth_token: gr.OAuthToken | None = None):
     try:
         kind, files = E.list_checkpoint_files(repo, repo_type, token_of(oauth_token))
     except Exception as error:
-        raise gr.Error(f"Depo okunamadı: {str(error)[:200]}") from error
+        raise gr.Error(f"Could not read the repository: {str(error)[:200]}") from error
     if not files:
-        raise gr.Error("Bu depoda .pt/.pth dosyası yok")
+        raise gr.Error("This repository has no .pt/.pth file")
     return gr.update(choices=files, value=files[-1]), gr.update(value=kind)
 
 
@@ -301,169 +302,175 @@ def toggle_guidance(mode):
 
 ABOUT = """
 ### Model
-[VoiceHub/dacvae-tts-tr-w512](https://huggingface.co/VoiceHub/dacvae-tts-tr-w512): 66,5M parametreli akış eşleştirme (flow
-matching) DiT; donmuş Meta DACVAE latent uzayında (48 kHz, 25 kare/s) sıfırdan eğitildi (`Vyvo/tr-dataset-12`, ~70 saat
-Türkçe podcast). Checkpoint ve ayar seçimi yalnızca **Freya-TR-Eval**'e göre yapılır (eğitimde görülmemiş 495 cümle,
-görülmemiş 24 konuşmacı, faster-whisper large-v3; iki ayrı konuşmacı çekilişi: seed 42 ve 1000).
+[VoiceHub/dacvae-tts-tr-w512](https://huggingface.co/VoiceHub/dacvae-tts-tr-w512): a 66.5M-parameter flow-matching DiT,
+trained from scratch in the frozen Meta DACVAE latent space (48 kHz, 25 frames/s) (`Vyvo/tr-dataset-12`, ~70 hours of
+Turkish podcasts). Checkpoints and settings are chosen on **Freya-TR-Eval** only (495 sentences unseen in training,
+24 unseen speakers, faster-whisper large-v3; two separate speaker draws: seed 42 and 1000).
 
-| Ayar (aynı model, guidance 5, 32 adım) | WER % (s42) | CER % (s42) | WER % (s1000) | CER % (s1000) |
+| Setting (same model, guidance 5, 32 steps) | WER % (s42) | CER % (s42) | WER % (s1000) | CER % (s1000) |
 |---|---:|---:|---:|---:|
-| Prompt hızı kuralı (yayımlanan sayılar) | 4,32 | 2,50 | 4,40 | 2,20 |
-| Sabit 15 kar/s (eski "Sabit hız") | 5,96 | 3,39 | – | – |
-| Hızlı prompt sınırı | 3,61 | 2,03 | 3,73 | 1,99 |
-| **Otomatik süre** (yavaşta süre tahmincisi, hızlıda sınır) | 3,61 | 1,81 | 3,50 | 1,91 |
-| **Otomatik süre + 3 aday (varsayılan)** | **1,59** | **0,72** | **1,92** | **0,72** |
-| *Makale: FreyaTTS-183M / XTTS-v2* | *8,0 / 11,1* | *3,0 / –* | | |
+| Prompt-rate rule (published numbers) | 4.32 | 2.50 | 4.40 | 2.20 |
+| Fixed 15 chars/s (old "Fixed rate") | 5.96 | 3.39 | – | – |
+| Fast-prompt clamp | 3.61 | 2.03 | 3.73 | 1.99 |
+| **Automatic duration** (duration predictor when slow, clamp when fast) | 3.61 | 1.81 | 3.50 | 1.91 |
+| **Automatic duration + 3 candidates (default)** | **1.59** | **0.72** | **1.92** | **0.72** |
+| *Paper: FreyaTTS-183M / XTTS-v2* | *8.0 / 11.1* | *3.0 / –* | | |
 
-Adayları Whisper-turbo seçer, puanı Whisper-large-v3 verir (turbo, large-v3'ten damıtıldığı için kazancın bir kısmı ortak
-ASR tercihlerini yansıtabilir). Benzerlik (0,947) ve DNSMOS (2,93) varsayılan ayarlarla değişmedi.
+Whisper-turbo picks the candidates and Whisper-large-v3 scores them (turbo is distilled from large-v3, so part of the gain
+may reflect shared ASR preferences). Similarity (0.947) and DNSMOS (2.93) did not change with the default settings.
 
-### Ayarlar
-- **Konuşma hızı · Otomatik:** 13–17 kar/s'lik prompt'larda prompt'un hızı korunur; daha yavaş prompt'larda (uzun
-  duraklamalar) korpustan öğrenilmiş süre tahmincisi, daha hızlılarda ~16 kar/s'ye yavaşlatma kullanılır. *Prompt'un hızı*
-  kuralı sınırsız kopyalar (+ süre ölçeği). *Sabit hız* Freya'da daha çok hata yaptı (15 kar/s: WER %6,0).
-- **Aday sayısı (best-of-N):** her cümle N farklı gürültüyle tek toplu çağrıda üretilir; Whisper'ın en az hata yaptığı aday
-  seçilir. Gösterilen WER bu seçimi yapan Whisper'la ölçüldüğü için iyimserdir (bağımsız ölçüm yukarıdaki tabloda).
-- **Uzun metin:** cümlelere bölünür (referans + parça ≈ eğitimdeki ≤ 20–25 s), parçalar tek toplu GPU çağrısında üretilip
-  kısa duraklarla birleştirilir. Sayılar, tarih/saat, para birimleri (ek uyumuyla), birimler, kısaltmalar ve semboller
-  okunuşa çevrilir; modelin okuduğu metin "Modelin okuduğu metin" bölümünde görünür.
-- **Guidance:** CFG 5 en düşük WER'i verir ama çıktıyı doyurur (yüksek ses, decoder tavanında kırpılma). *APG* bunu büyük
-  ölçüde giderir (daha doğal seviye, biraz daha yüksek DNSMOS/benzerlik) ama Freya WER'i %4,3'ten %5,0'a çıkarır;
-  *CFG + rescale* benzer (%5,2). *Ayrı metin/konuşmacı* üç dallı bağımsız guidance'tır (metin = Guidance, konuşmacı = ayrı ölçek).
-- Çıktılar −16 LUFS'a normalleştirilir, kısa fade ve boşlukla 48 kHz / 16-bit WAV olarak verilir. DACVAE decoder'ı Meta'nın
-  gömülü filigranını (watermark) korur.
+### Settings
+- **Speaking rate · Automatic:** prompts at 13–17 chars/s keep the prompt's rate; slower prompts (long pauses) use a
+  duration predictor learned from the corpus, faster ones are slowed down to ~16 chars/s. The *Prompt rate* rule copies the
+  rate without limits (+ duration scale). *Fixed rate* made more errors on Freya (15 chars/s: WER 6.0 %).
+- **Number of candidates (best-of-N):** every sentence is generated with N different noises in one batched call; the
+  candidate on which Whisper makes the fewest errors is kept. The WER shown is optimistic because it is measured with the
+  Whisper that made the selection (independent measurement in the table above).
+- **Long text:** split into sentences (reference + chunk ≈ the ≤ 20–25 s seen in training); the chunks are generated in one
+  batched GPU call and joined with short pauses. Numbers, dates/clock times, currencies (with suffix harmony), units,
+  abbreviations and symbols are converted to their spoken form; the text the model reads is shown in the "Text read by the
+  model" section.
+- **Guidance:** CFG 5 gives the lowest WER but saturates the output (loud audio, clipping at the decoder ceiling). *APG*
+  largely removes this (more natural level, slightly higher DNSMOS/similarity) but raises Freya WER from 4.3 % to 5.0 %;
+  *CFG + rescale* is similar (5.2 %). *Separate text/speaker* is three-branch independent guidance (text = Guidance,
+  speaker = its own scale).
+- Outputs are normalized to −16 LUFS and delivered as 48 kHz / 16-bit WAV with a short fade and padding. The DACVAE decoder
+  keeps Meta's embedded watermark.
 
-### Kendi modelinizi test etme
-*Gelişmiş ayarlar → Checkpoint → Özel checkpoint*: `kurum/ad` ya da tam Hub URL'si girin, **Dosyaları listele** ile `.pt`
-seçin. Özel depolar için önce **Giriş yap** (kendi okuma izninizle indirilir; Space'te token yoktur). *A/B karşılaştırma* aynı
-ses/metin/seed ile 2–4 modeli yan yana üretir; *Toplu test* bir cümle listesinde (5 örnek cümle, Freya-TR-Eval'den 20 cümle
-veya kendi listeniz) WER/CER/benzerlik/DNSMOS hesaplar ve tüm sesleri zip olarak verir.
+### Testing your own model
+*Advanced settings → Checkpoint → Custom checkpoint*: enter `org/name` or a full Hub URL and pick a `.pt` with **List
+files**. For private repositories **Log in** first (the file is downloaded with your own read permission; the Space holds no
+token). *A/B comparison* generates 2–4 models side by side with the same audio/text/seed; *Batch test* computes
+WER/CER/similarity/DNSMOS on a sentence list (5 sample sentences, 20 sentences from Freya-TR-Eval or your own list) and
+returns all audio as a zip.
 
 ### API
 ```python
 from gradio_client import Client, handle_file
-client = Client("Vyvo/dacvae-tts-tr-demo", token="hf_...")   # token: ZeroGPU kotası hesabınızdan kullanılır
+client = Client("Vyvo/dacvae-tts-tr-demo", token="hf_...")   # token: the ZeroGPU quota of your account is used
 audio, info, text, metrics, transcript, reference = client.predict(
-    handle_file("referans.wav"), "Referans kaydın tam transkripti.", "Söylenecek metin.",
-    "Otomatik (önerilen)", 15, 3, 42, True,                       # hız modu, sabit hız, aday sayısı, seed, doğrulama
-    "w512-clean 60k · yayımlanan (Freya WER %4,3)", "", "", "dataset",   # checkpoint (veya özel depo/dosya/tür)
-    5.0, 32, "CFG (en düşük WER)", 0.7, 0.5, 3.0, 1.0, 1.0, "Otomatik",  # guidance, adım, guidance türü ve parametreleri
+    handle_file("reference.wav"), "Referans kaydın tam transkripti.", "Söylenecek metin.",  # Turkish transcript, Turkish text
+    "Automatic (recommended)", 15, 3, 42, True,                   # rate mode, fixed rate, candidates, seed, verification
+    "w512-clean 60k · published (Freya WER 4.3 %)", "", "", "dataset",   # checkpoint (or custom repo/file/type)
+    5.0, 32, "CFG (lowest WER)", 0.7, 0.5, 3.0, 1.0, 1.0, "Automatic",  # guidance, steps, guidance type and parameters
     api_name="/synthesize")
 ```
 
-### Sınırlar
-Eğitim verisi podcast MP3'leri (çoğunlukla 12–16 kHz bant genişliği) olduğundan DNSMOS ≈ 2,9 (codec tavanı 3,27).
-Nadir yabancı özel adlarda harf hataları olabilir; kalite referans kaydına bağlıdır (temiz, tek konuşmacı, 3–15 s).
-Lisans: CC-BY-NC-4.0 (ticari olmayan kullanım). Freya-TR-Eval cümleleri CC-BY-4.0 (freyavoice).
+### Limits
+The training data are podcast MP3s (mostly 12–16 kHz bandwidth), so DNSMOS ≈ 2.9 (codec ceiling 3.27). Rare foreign proper
+names may get letter errors; quality depends on the reference recording (clean, single speaker, 3–15 s).
+License: CC-BY-NC-4.0 (non-commercial use). Freya-TR-Eval sentences: CC-BY-4.0 (freyavoice).
 """
 
-with gr.Blocks(title="DACVAE-TTS Türkçe") as demo:
+with gr.Blocks(title="DACVAE-TTS Turkish") as demo:
     gr.Markdown(
-        "# DACVAE-TTS Türkçe · sıfır-atış ses klonlama\n"
-        "3–15 saniyelik temiz bir Türkçe kayıt yükleyin; transkripti otomatik çıkarılır (düzeltebilirsiniz). Metniniz aynı "
-        "sesle 48 kHz üretilir; uzun metinler cümlelere bölünür, sayılar ve semboller okunuşa çevrilir. "
-        "Model: [VoiceHub/dacvae-tts-tr-w512](https://huggingface.co/VoiceHub/dacvae-tts-tr-w512) · 66,5M · Freya-TR-Eval WER "
-        "%4,3 (tek örnek) → **%1,6 bu demonun varsayılan ayarlarıyla** (otomatik hız + 3 aday; ayrıntı: Hakkında).\n\n"
-        "ℹ️ GPU kotası (ZeroGPU) Hugging Face hesabına göre verilir: siteye giriş yapmamış ziyaretçiler yalnızca birkaç istek "
-        "yapabilir, giriş yaptığınızda kendi kotanız kullanılır. API'de `Client(\"Vyvo/dacvae-tts-tr-demo\", token=\"hf_...\")` kullanın."
+        "# DACVAE-TTS Turkish · zero-shot voice cloning\n"
+        "Upload a clean 3–15 second Turkish recording; its transcript is extracted automatically (you can correct it). Your "
+        "text is generated in the same voice at 48 kHz; long texts are split into sentences, numbers and symbols are converted "
+        "to their spoken form. "
+        "Model: [VoiceHub/dacvae-tts-tr-w512](https://huggingface.co/VoiceHub/dacvae-tts-tr-w512) · 66.5M · Freya-TR-Eval WER "
+        "4.3 % (single sample) → **1.6 % with this demo's default settings** (automatic rate + 3 candidates; details: About).\n\n"
+        "ℹ️ The GPU quota (ZeroGPU) is granted per Hugging Face account: visitors who are not logged in can make only a few "
+        "requests; once you log in, your own quota is used. For the API use "
+        "`Client(\"Vyvo/dacvae-tts-tr-demo\", token=\"hf_...\")`."
     )
     with gr.Tabs():
-        with gr.Tab("🎙️ Sentez"):
+        with gr.Tab("🎙️ Synthesis"):
             with gr.Row():
                 with gr.Column():
-                    ref_audio = gr.Audio(label="Referans ses (3–15 s, tek konuşmacı)", type="filepath",
+                    ref_audio = gr.Audio(label="Reference audio (3–15 s, single speaker)", type="filepath",
                                          sources=["upload", "microphone"])
                     ref_info = gr.Markdown()
                     with gr.Row():
-                        ref_text = gr.Textbox(label="Referansın transkripti (otomatik doldurulur, düzeltilebilir)",
+                        ref_text = gr.Textbox(label="Reference transcript (filled in automatically, editable)",
                                               lines=2, scale=4)
-                        retranscribe = gr.Button("Yeniden yazıya dök", scale=1, size="sm")
-                    text = gr.Textbox(label="Söylenecek metin (uzun metin de olur)", lines=5, value=SENTENCES[0])
+                        retranscribe = gr.Button("Transcribe again", scale=1, size="sm")
+                    text = gr.Textbox(label="Text to speak (long text is fine)", lines=5, value=SENTENCES[0])
                     with gr.Row():
-                        rate_mode = gr.Radio([RATE_AUTO, RATE_PROMPT, RATE_FIXED], value=RATE_AUTO, label="Konuşma hızı")
+                        rate_mode = gr.Radio([RATE_AUTO, RATE_PROMPT, RATE_FIXED], value=RATE_AUTO, label="Speaking rate")
                         cps = gr.Slider(10, 20, value=15, step=0.5, visible=False,
-                                        label="Sabit hız (kar/s) · Freya'da prompt hızından daha çok hata (15: %6,0 WER)")
-                        duration_scale = gr.Slider(0.8, 1.3, value=1.0, step=0.05, label="Süre ölçeği", visible=False)
+                                        label="Fixed rate (chars/s) · more errors than the prompt rate on Freya (15: 6.0 % WER)")
+                        duration_scale = gr.Slider(0.8, 1.3, value=1.0, step=0.05, label="Duration scale", visible=False)
                     with gr.Row():
                         candidates = gr.Slider(1, 4, value=E.DEFAULTS["candidates"], step=1,
-                                               label="Aday sayısı (best-of-N, Whisper seçer)")
+                                               label="Number of candidates (best-of-N, Whisper picks)")
                         seed = gr.Number(value=42, precision=0, label="Seed")
                         dice = gr.Button("🎲", size="sm", scale=0, min_width=40)
-                    verify = gr.Checkbox(value=True, label="Whisper ile doğrula (WER/CER + konuşmacı benzerliği)")
-                    with gr.Accordion("Gelişmiş ayarlar", open=False):
+                    verify = gr.Checkbox(value=True, label="Verify with Whisper (WER/CER + speaker similarity)")
+                    with gr.Accordion("Advanced settings", open=False):
                         choice = gr.Dropdown(list(E.CHECKPOINTS) + [CUSTOM], value=E.DEFAULT_MODEL, label="Checkpoint")
                         with gr.Group():
-                            gr.Markdown("**Özel checkpoint:** `kurum/ad` veya tam Hub URL'si. Özel depolar için giriş yapın.")
+                            gr.Markdown("**Custom checkpoint:** `org/name` or a full Hub URL. Log in for private repositories.")
                             with gr.Row():
-                                repo = gr.Textbox(label="Depo", placeholder="VoiceHub/dacvae-tts-tr-w512-clean", scale=3)
-                                repo_type = gr.Radio(["dataset", "model"], value="dataset", label="Depo türü", scale=1)
+                                repo = gr.Textbox(label="Repository", placeholder="VoiceHub/dacvae-tts-tr-w512-clean", scale=3)
+                                repo_type = gr.Radio(["dataset", "model"], value="dataset", label="Repository type", scale=1)
                             with gr.Row():
-                                file = gr.Dropdown([], label="Dosya", allow_custom_value=True, scale=3)
-                                list_button = gr.Button("Dosyaları listele", scale=1)
-                            gr.LoginButton(value="Hugging Face ile giriş yap (özel depolar için)")
+                                file = gr.Dropdown([], label="File", allow_custom_value=True, scale=3)
+                                list_button = gr.Button("List files", scale=1)
+                            gr.LoginButton(value="Log in with Hugging Face (for private repositories)")
                         with gr.Row():
-                            guidance = gr.Slider(1.0, 8.0, value=E.DEFAULTS["guidance"], step=0.5, label="Guidance (metin)")
-                            steps = gr.Slider(8, 64, value=E.DEFAULTS["steps"], step=4, label="Euler adımı")
+                            guidance = gr.Slider(1.0, 8.0, value=E.DEFAULTS["guidance"], step=0.5, label="Guidance (text)")
+                            steps = gr.Slider(8, 64, value=E.DEFAULTS["steps"], step=4, label="Euler steps")
                         guide_mode = gr.Radio([GUIDE_CFG, GUIDE_RESCALE, GUIDE_APG, GUIDE_SPLIT], value=GUIDE_CFG,
-                                              label="Guidance türü")
+                                              label="Guidance type")
                         with gr.Row():
                             rescale = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Rescale φ", visible=False)
-                            apg_eta = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="APG η (paralel bileşen)",
+                            apg_eta = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="APG η (parallel component)",
                                                 visible=False)
-                            speaker_guidance = gr.Slider(1.0, 8.0, value=3.0, step=0.5, label="Konuşmacı guidance",
+                            speaker_guidance = gr.Slider(1.0, 8.0, value=3.0, step=0.5, label="Speaker guidance",
                                                          visible=False)
                         with gr.Row():
                             guidance_until = gr.Slider(0.3, 1.0, value=1.0, step=0.05,
-                                                       label="Guidance t < … iken (1 = her adım)")
-                            duration_model = gr.Dropdown(list(DURATION_MODELS), value="Otomatik", label="Süre modeli")
-                    button = gr.Button("Sentezle", variant="primary")
+                                                       label="Guidance while t < … (1 = every step)")
+                            duration_model = gr.Dropdown(list(DURATION_MODELS), value="Automatic", label="Duration model")
+                    button = gr.Button("Synthesize", variant="primary")
                 with gr.Column():
-                    audio_out = gr.Audio(label="Üretilen ses (48 kHz)", type="filepath", buttons=["download"])
+                    audio_out = gr.Audio(label="Generated audio (48 kHz)", type="filepath", buttons=["download"])
                     info = gr.Markdown()
-                    with gr.Accordion("Modelin okuduğu metin", open=False):
+                    with gr.Accordion("Text read by the model", open=False):
                         normalized = gr.Markdown()
-                    with gr.Accordion("Ölçümler (JSON)", open=False):
+                    with gr.Accordion("Measurements (JSON)", open=False):
                         metrics = gr.JSON()
             gr.Examples(
                 examples=[[str(ROOT / e["audio"]), e["text"], s] for e, s in zip(EXAMPLES, SENTENCES)],
                 inputs=[ref_audio, ref_text, text],
-                label="Örnek referanslar (eğitimde görülmemiş konuşmacılar, normal konuşma hızı)",
+                label="Example references (speakers unseen in training, normal speaking rate)",
             )
-        with gr.Tab("⚖️ A/B karşılaştırma"):
-            gr.Markdown("Referans ses, transkript, metin ve ayarlar **Sentez** sekmesinden alınır; seçilen modeller aynı "
-                        "seed ile üretilir ve Whisper + WavLM + DNSMOS ile ölçülür.")
+        with gr.Tab("⚖️ A/B comparison"):
+            gr.Markdown("The reference audio, transcript, text and settings are taken from the **Synthesis** tab; the "
+                        "selected models generate with the same seed and are measured with Whisper + WavLM + DNSMOS.")
             compare_models = gr.CheckboxGroup(list(E.CHECKPOINTS) + [CUSTOM], value=list(E.CHECKPOINTS)[:2],
-                                              label="Modeller (2–4)")
-            compare_button = gr.Button("Karşılaştır", variant="primary")
+                                              label="Models (2–4)")
+            compare_button = gr.Button("Compare", variant="primary")
             with gr.Row():
                 compare_audio = [gr.Audio(type="filepath", visible=False, buttons=["download"]) for _ in range(4)]
-            compare_table = gr.Dataframe(headers=["Model", "Süre (s)", "WER", "CER", "SIM", "DNSMOS", "GPU (s)",
+            compare_table = gr.Dataframe(headers=["Model", "Duration (s)", "WER", "CER", "SIM", "DNSMOS", "GPU (s)",
                                                   "Whisper"], wrap=True)
-        with gr.Tab("🧪 Toplu test"):
-            gr.Markdown(f"Bir checkpoint'i cümle listesinde ölçün (en fazla {E.MAX_BATCH_SENTENCES} cümle). Ayarlar "
-                        "**Sentez** sekmesinden alınır; sonuçlar ve sesler zip olarak indirilebilir.")
+        with gr.Tab("🧪 Batch test"):
+            gr.Markdown(f"Measure a checkpoint on a sentence list (at most {E.MAX_BATCH_SENTENCES} sentences). Settings are "
+                        "taken from the **Synthesis** tab; the results and audio can be downloaded as a zip.")
             with gr.Row():
                 batch_model = gr.Dropdown(list(E.CHECKPOINTS) + [CUSTOM], value=E.DEFAULT_MODEL, label="Checkpoint")
-                batch_voice = gr.Radio(VOICES, value=VOICES[1], label="Ses")
-            batch_set = gr.Radio(BATCH_SETS, value=BATCH_SETS[0], label="Cümle seti")
-            batch_own = gr.Textbox(lines=6, label="Kendi cümleleriniz (satır başına bir)")
-            batch_button = gr.Button("Testi çalıştır", variant="primary")
+                batch_voice = gr.Radio(VOICES, value=VOICES[1], label="Voice")
+            batch_set = gr.Radio(BATCH_SETS, value=BATCH_SETS[0], label="Sentence set")
+            batch_own = gr.Textbox(lines=6, label="Your own sentences (one per line)")
+            batch_button = gr.Button("Run the test", variant="primary")
             batch_summary = gr.Markdown()
-            batch_table = gr.Dataframe(headers=["#", "Metin", "Whisper", "WER", "CER", "SIM", "DNSMOS", "Süre (s)"],
+            batch_table = gr.Dataframe(headers=["#", "Text", "Whisper", "WER", "CER", "SIM", "DNSMOS", "Duration (s)"],
                                        wrap=True)
-            batch_zip = gr.File(label="Sesler + results.jsonl + summary.json")
-        with gr.Tab("🎧 Örnekler"):
+            batch_zip = gr.File(label="Audio + results.jsonl + summary.json")
+        with gr.Tab("🎧 Samples"):
             if SAMPLES:
-                gr.Markdown("Varsayılan ayarlarla önceden üretilmiş örnekler (görülmemiş konuşmacılar).")
+                gr.Markdown("Samples pre-generated with the default settings (unseen speakers).")
                 for sample in SAMPLES:
                     gr.Audio(value=str(ROOT / sample["audio"]), label=sample["label"], type="filepath", interactive=False)
             else:
-                gr.Markdown("Örnekler hazırlanıyor.")
-        with gr.Tab("ℹ️ Hakkında"):
+                gr.Markdown("Samples are being prepared.")
+        with gr.Tab("ℹ️ About"):
             gr.Markdown(ABOUT)
-            with gr.Accordion("Ortam tanılama", open=False):
-                diag_button = gr.Button("Ortamı test et")
-                diag_out = gr.Textbox(label="Tanılama", lines=4)
+            with gr.Accordion("Environment diagnostics", open=False):
+                diag_button = gr.Button("Test the environment")
+                diag_out = gr.Textbox(label="Diagnostics", lines=4)
                 diag_button.click(lambda: E.run_diagnostics(), [], [diag_out], api_name="diag")
 
     shared = [rate_mode, cps, candidates, seed]

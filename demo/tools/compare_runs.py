@@ -9,7 +9,7 @@ from dacvae_tts.text import normalize
 
 
 def load(folder):
-    rows = [json.loads(l) for l in open(f"/workspace/outputs/{folder}/results.jsonl") if l.strip()]
+    rows = [json.loads(line) for line in open(f"/workspace/outputs/{folder}/results.jsonl") if line.strip()]
     return {r["id"]: r for r in rows if "wer" in r}
 
 
@@ -24,7 +24,7 @@ def main():
     base_name, others = sys.argv[1], sys.argv[2:]
     base = load(base_name)
     rate = group_rates(base)
-    groups = (("yavaş <13", lambda p: rate[p] < 13), ("normal 13-17", lambda p: 13 <= rate[p] <= 17), ("hızlı >17", lambda p: rate[p] > 17))
+    groups = (("slow <13", lambda p: rate[p] < 13), ("normal 13-17", lambda p: 13 <= rate[p] <= 17), ("fast >17", lambda p: rate[p] > 17))
     for name in [base_name] + others:
         rows = load(name)
         line = f"{name:28s}"
