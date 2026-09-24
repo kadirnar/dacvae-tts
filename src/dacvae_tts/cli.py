@@ -189,6 +189,11 @@ def main():
     p.add_argument("--limit", type=positive_int, default=1000)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cross-session", action="store_true")
+    p.add_argument(
+        "--exclude-speakers",
+        help="Speaker labels never used in cases (JSON list, JSON object keys such as leakage.json of "
+        "scripts/speaker_clusters.py, or one per line), so cases use only truly unseen speakers",
+    )
 
     p = sub.add_parser(
         "run-eval", help="Run a bounded, configured duration/sampler/profile comparison on frozen cases"

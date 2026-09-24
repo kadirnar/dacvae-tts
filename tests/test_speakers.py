@@ -1,6 +1,8 @@
+import importlib.util
 import json
 import shutil
 import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,6 +11,7 @@ import soundfile as sf
 import torch
 
 from dacvae_tts.data import LatentDataset, speaker_split
+from dacvae_tts.experiments import make_cases
 from dacvae_tts.prepare import merge, prepare
 from dacvae_tts.speakers import (
     RowAudio,
@@ -392,3 +395,46 @@ def test_prepare_split_key_holds_episodes_out(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "Codec", lambda *args, **kwargs: pytest.fail("codec loaded before validation"))
     with pytest.raises(ValueError, match="Invalid --split-key"):
         prepare(args_for(manifest, tmp_path / "bad", split_key="("))
+
+
+def case_args(cache, output, **overrides):
+    return SimpleNamespace(
+        **{**dict(cache=cache, split="val", seed=42, output=output, cross_session=False, limit=10), **overrides}
+    )
+
+
+def test_make_cases_excludes_leaked_speakers_and_default_is_unchanged(cache, tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    with sqlite3.connect(cache / "index.sqlite") as db:
+        db.execute("UPDATE samples SET audio=?", (str(audio),))
+    make_cases(case_args(cache, tmp_path / "default.jsonl"))
+    make_cases(case_args(cache, tmp_path / "none.jsonl", exclude_speakers=None))
+    assert (tmp_path / "default.jsonl").read_bytes() == (tmp_path / "none.jsonl").read_bytes()
+    default_meta = json.loads((tmp_path / "default.metadata.json").read_text())
+    assert "excluded_speakers" not in default_meta
+    speakers = {json.loads(line)["speaker"] for line in (tmp_path / "default.jsonl").read_text().splitlines()}
+    assert {"val-0", "val-1"} <= speakers
+
+    leakage_file = tmp_path / "leakage.json"
+    leakage_file.write_text(json.dumps({"val-0": {"score": 0.9}, "val-1": {"score": 0.8}}))
+    make_cases(case_args(cache, tmp_path / "unseen.jsonl", exclude_speakers=leakage_file))
+    cases = [json.loads(line) for line in (tmp_path / "unseen.jsonl").read_text().splitlines()]
+    assert cases and not {"val-0", "val-1"} & {c["speaker"] for c in cases}
+    meta = json.loads((tmp_path / "unseen.metadata.json").read_text())
+    assert meta["excluded_speakers"] == 2 and meta["speakers"] == len({c["speaker"] for c in cases})
+    leakage_file.write_text(json.dumps([f"val-{k}" for k in range(4)]))
+    with pytest.raises(ValueError, match="No eligible"):
+        make_cases(case_args(cache, tmp_path / "none-left.jsonl", exclude_speakers=leakage_file))
+
+
+def test_monitor_case_selection_excludes_speakers(cache):
+    path = Path(__file__).resolve().parents[1] / "scripts" / "monitor.py"
+    spec = importlib.util.spec_from_file_location("monitor_script", path)
+    monitor = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(monitor)
+    _, cases = monitor.select_cases(cache, 8, 42, min_frames=1, max_frames=100)
+    _, again = monitor.select_cases(cache, 8, 42, min_frames=1, max_frames=100, exclude=())
+    assert cases == again and "val-0" in {c["speaker"] for c in cases}
+    _, unseen = monitor.select_cases(cache, 8, 42, min_frames=1, max_frames=100, exclude={"val-0"})
+    assert unseen and "val-0" not in {c["speaker"] for c in unseen}

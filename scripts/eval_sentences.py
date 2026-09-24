@@ -23,6 +23,7 @@ from monitor import select_cases  # noqa: E402
 
 from dacvae_tts.inference import Synthesizer, VoiceReference  # noqa: E402
 from dacvae_tts.metrics import Evaluator, summarize  # noqa: E402
+from dacvae_tts.speakers import read_speaker_list  # noqa: E402
 
 
 def load_sentences(path, limit=0):
@@ -178,6 +179,9 @@ def main():
     parser.add_argument("--dnsmos")
     parser.add_argument("--speaker-model", default="microsoft/wavlm-base-plus-sv")
     parser.add_argument(
+        "--exclude-speakers", help="Labels never used as prompts, e.g. leakage.json of speaker_clusters.py"
+    )
+    parser.add_argument(
         "--asr-backend", choices=["faster-whisper", "hf"], default="faster-whisper",
         help="hf = transformers Whisper on the GPU with cross-clip batching (~30x faster than CPU faster-whisper; greedy decoding)",
     )
@@ -188,7 +192,8 @@ def main():
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
     sentences = load_sentences(args.sentences, args.limit)
-    data, cases = select_cases(args.cache, args.prompts, args.seed)
+    exclude = read_speaker_list(args.exclude_speakers) if args.exclude_speakers else ()
+    data, cases = select_cases(args.cache, args.prompts, args.seed, exclude=exclude)
     wavs_exist = all((out / f"{s['id']}.wav").exists() for s in sentences)
     reuse = args.rescore and ((out / "results.jsonl").exists() or wavs_exist)
     tts = None if reuse else Synthesizer(args.checkpoint, device=args.device)
