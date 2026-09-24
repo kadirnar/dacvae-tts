@@ -102,6 +102,41 @@ def test_reference_asr_accepts_waveform_pairs(monkeypatch):
     assert heard[-1][:2] == (np.float32, (48000,))
 
 
+def test_reference_asr_defaults_follow_the_checkpoint_language(monkeypatch, cache, tmp_path):
+    # The defaults were small.en / en for every checkpoint: a Turkish prompt without --reference-text was
+    # transcribed by an English-only model, and the wrong transcript then set the byte-rule duration.
+    import dacvae_tts.inference as module
+    from dacvae_tts.inference import asr_defaults
+
+    assert asr_defaults("unicode-v1") == asr_defaults("english-explicit-v2") == ("small.en", "en")
+    assert asr_defaults("turkish-v1") == asr_defaults("turkish-v2") == ("large-v3-turbo", "tr")
+    assert asr_defaults("turkish-v2", asr_model="small") == ("small", "tr")  # explicit choices are kept
+    assert asr_defaults("turkish-v2", asr_language="en") == ("small.en", "en")
+    assert asr_defaults("turkish-v2", asr_model="small.en") == ("small.en", "en")  # an .en model is English
+    assert asr_defaults("unicode-v1", asr_language="de") == ("large-v3-turbo", "de")
+    data = LatentDataset(cache)
+    config = Config(ModelConfig(latent_dim=4, width=16, depth=1, heads=2, text_depth=1, text_layout="joined",
+                                duration="rule"))
+    path = tmp_path / "model.pt"
+    state = FlowTTS(config.model).state_dict()
+    torch.save({"model": state, "ema": state, "config": config.to_dict(), "codec": {**data.meta,
+                "text_normalization": "turkish-v2"}, "mean": data.mean, "std": data.std}, path)
+    monkeypatch.setattr(module, "Codec", FakeCodec)
+    tts = Synthesizer(path, device="cpu", precision="fp32")
+    assert (tts.asr_model, tts.asr_language) == ("large-v3-turbo", "tr")
+    tts = Synthesizer(path, device="cpu", precision="fp32", asr_model="medium", asr_language="az")
+    assert (tts.asr_model, tts.asr_language) == ("medium", "az")
+    # The CLI's unset --asr-model / --asr-language (None) resolve the same way.
+    built = []
+    monkeypatch.setattr(module.Synthesizer, "synthesize",
+                        lambda self, *a, **k: built.append(self) or SimpleNamespace(metadata={}))
+    module.infer(SimpleNamespace(checkpoint=path, device="cpu", precision="fp32", compile=False, asr_model=None,
+                                 asr_device="cpu", profile=False, asr_language=None, text="x", reference="r.wav",
+                                 reference_text=None, output=None, seconds=None, duration_scale=1.0, steps=1,
+                                 guidance=1.0, seed=0, sway=-1.0))
+    assert (built[0].asr_model, built[0].asr_language) == ("large-v3-turbo", "tr")
+
+
 def test_text_versions_and_accent_preservation():
     assert normalize("  José’s   café. ") == "José's café."
     assert metric_text("JOSÉ’S café!") == "josé's café"

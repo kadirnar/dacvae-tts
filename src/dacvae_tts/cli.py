@@ -146,9 +146,16 @@ def main():
     p.add_argument(
         "--reference-text", help="Optional; omitted transcripts use ASR, not a transcript-free TTS model"
     )
-    p.add_argument("--asr-model", default="small.en")
+    p.add_argument(
+        "--asr-model",
+        help="faster-whisper model of the reference ASR (default: small.en, or large-v3-turbo for a Turkish "
+        "checkpoint or a non-English --asr-language)",
+    )
     p.add_argument("--asr-device", choices=["cpu", "cuda"], default="cpu")
-    p.add_argument("--asr-language", default="en", help="Whisper language code of the reference audio")
+    p.add_argument(
+        "--asr-language",
+        help="Whisper language code of the reference audio (default: tr for turkish-* checkpoints, else en)",
+    )
     p.add_argument("--profile", action="store_true")
     p.add_argument("--text", required=True)
     p.add_argument("--seconds", type=float)

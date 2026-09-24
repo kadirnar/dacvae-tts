@@ -24,6 +24,23 @@ WINDOW_OPTIONS = ("guidance_split", "guidance_late", "apg_eta_late", "apg_norm_l
 SAMPLER_OPTIONS += WINDOW_OPTIONS
 # Applied after sampling (Synthesizer._finish): per-channel moment matching and the decoder's pre-tanh gain.
 OUTPUT_OPTIONS = ("moment_match", "pre_tanh_gain")
+# faster-whisper models of the reference-transcript fallback: the English-only one for English checkpoints, a
+# multilingual one otherwise (an .en model cannot transcribe a Turkish prompt).
+ASR_MODELS = {"en": "small.en", "multilingual": "large-v3-turbo"}
+
+
+def asr_defaults(text_version, asr_model=None, asr_language=None):
+    """(Whisper model, language) for reference ASR: explicit choices are kept, the rest follow the checkpoint.
+
+    A turkish-* text normalization means Turkish prompts (language tr, multilingual model); other checkpoints keep
+    English (small.en). An explicitly chosen English-only (.en) model implies language en.
+    """
+    if asr_language is None:
+        turkish = str(text_version).startswith("turkish") and not str(asr_model or "").endswith(".en")
+        asr_language = "tr" if turkish else "en"
+    if asr_model is None:
+        asr_model = ASR_MODELS["en" if asr_language == "en" else "multilingual"]
+    return asr_model, asr_language
 
 
 @dataclass
@@ -52,16 +69,18 @@ class Synthesizer:
         device="cuda",
         precision="bf16",
         compile_model=False,
-        asr_model="small.en",
+        asr_model=None,
         asr_device="cpu",
         profile=False,
         codec_options=None,
-        asr_language="en",
+        asr_language=None,
         codec=None,
         duration_model=None,
     ):
-        """`codec`: an already loaded Codec to share between checkpoints (same DACVAE weights and loudness)."""
-        self.asr_language = asr_language
+        """`codec`: an already loaded Codec to share between checkpoints (same DACVAE weights and loudness).
+
+        `asr_model`/`asr_language` (reference ASR fallback): None follows the checkpoint (see `asr_defaults`).
+        """
         started = time.perf_counter()
         self.device = torch.device(device)
         self.precision = precision
@@ -81,9 +100,10 @@ class Synthesizer:
         self.mean = self.checkpoint["mean"].to(device)
         self.std = self.checkpoint["std"].to(device)
         normalization_stats(self.mean, self.std, self.codec.latent_dim)
-        self.asr_model, self.asr_device, self._asr = asr_model, asr_device, None
         self.profile = profile
         self.text_version = self.checkpoint["codec"].get("text_normalization", "unicode-v1")
+        self.asr_model, self.asr_language = asr_defaults(self.text_version, asr_model, asr_language)
+        self.asr_device, self._asr = asr_device, None
         self.duration_profile = {}
         if compile_model:
             self.model.forward = torch.compile(self.model.forward, dynamic=True)
@@ -662,7 +682,7 @@ def infer(args):
         args.asr_device,
         args.profile,
         codec_options=backend_options(args),
-        asr_language=getattr(args, "asr_language", "en"),
+        asr_language=getattr(args, "asr_language", None),
     )
     result = tts.synthesize(
         args.text,

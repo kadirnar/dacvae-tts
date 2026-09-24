@@ -311,7 +311,8 @@ dacvae-tts infer --checkpoint runs/tiny/last.pt \
   --steps 16 --guidance 1.5 --output outputs/example.wav
 ```
 
-Omitting `reference_text` invokes optional English ASR (`small.en`, CPU by default).
+Omitting `reference_text` invokes optional ASR (CPU by default): English `small.en`, or Turkish
+`large-v3-turbo` for checkpoints with a `turkish-*` text normalization (`--asr-model/--asr-language` override).
 The TTS model still needs the transcript internally; this is not a transcript-free
 architecture. Supply `--reference-text "The exact words in the reference."` to bypass
 ASR. See [the runnable example](../examples/voice_clone.py); `dacvae-tts codec-reconstruct`,

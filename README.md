@@ -57,7 +57,8 @@ dacvae-tts infer --checkpoint runs/nano/step-0200000.pt \
 
 Python: `Synthesizer("runs/nano/step-0200000.pt").synthesize(text, ref_audio="prompt.wav",
 reference_text="...")`. Omit the transcript to let optional Whisper ASR produce it
-(`--asr-language tr` for Turkish). Prompts are loudness-normalized the same way as training data.
+(Turkish checkpoints default to `--asr-language tr` with `large-v3-turbo`, others to `small.en`).
+Prompts are loudness-normalized the same way as training data.
 
 ## 4. Evaluate
 
