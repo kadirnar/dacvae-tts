@@ -16,6 +16,7 @@ from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
+from .alignment import teacher_layers, teacher_terms
 from .config import Config
 from .contracts import sanitize, target_mask
 from .data import BucketBatchSampler, LatentDataset, collate, move_batch
@@ -32,8 +33,11 @@ from .negatives import (
 from .optim import build_optimizer
 from .parallel import device_batches, loader_options
 from .speed import NonfiniteWatch, compile_blocks, training_epoch_costs, training_loader
+from .teacher import teacher_sources
 from .text import BYTE_OFFSET, corrupt_transcript
 from .tracking import Tracker
+
+TEACHER_LOGS = ("repa", "tla", "tla_entropy")
 
 
 class Objective(nn.Module):
@@ -65,6 +69,10 @@ class Objective(nn.Module):
         skip_coverage=(0.4, 0.8),
         negative_cap=0.0,
         silence=None,
+        repa_weight=0.0,
+        repa_frames="all",
+        tla_weight=0.0,
+        tla_entropy=0.01,
     ):
         super().__init__()
         self.model = model
@@ -79,6 +87,10 @@ class Objective(nn.Module):
         self.random_weight, self.aug_weight, self.negative_cap = random_weight, aug_weight, negative_cap
         self.augment = dict(span=tuple(span), repeat_coverage=repeat_coverage, skip_coverage=skip_coverage)
         self.silence = silence
+        # Teacher alignment (alignment.py); the train loop clears `repa_active` at repa_stop_step.
+        self.repa_weight, self.repa_frames = repa_weight, repa_frames
+        self.tla_weight, self.tla_entropy = tla_weight, tla_entropy
+        self.repa_active = True
 
     def negatives(self, batch):
         """Corrupted transcripts [B,S'] plus a mask of the examples that could be corrupted."""
@@ -135,6 +147,9 @@ class Objective(nn.Module):
         if self.expansion > 1 and self.training:
             expanded = {key: value.repeat_interleave(self.expansion, 0) for key, value in batch.items()}
             shared = tuple(value.repeat_interleave(self.expansion, 0) for value in cached)
+        repa = self.training and self.repa_weight > 0 and self.repa_active
+        tla = self.training and self.tla_weight > 0
+        layers = teacher_layers(self.model, repa, tla)
         details = flow_loss(
             self.model,
             expanded,
@@ -142,8 +157,14 @@ class Objective(nn.Module):
             return_details=True,
             cached=shared,
             time_sampling=self.time_sampling,
+            **({"hidden_layers": layers} if layers else {}),
         )
         prediction = details.pop("prediction")
+        if self.training:
+            hidden = details.pop("hidden", {})
+            times, drop = details["times"], details["drop"]
+            terms = teacher_terms(self.model, expanded, hidden, times, drop, repa, tla, self.repa_frames)
+            details.update(terms)
         flow = details["flow"]
         if self.model.duration is None:
             duration_loss = flow.new_zeros(batch["latents"].size(0))
@@ -186,7 +207,23 @@ class Objective(nn.Module):
             terms.append(self.ctc_weight * losses["ctc"])
         if "contrastive" in losses:
             terms.append(self.contrastive_weight * losses["contrastive"])
+        if "repa" in losses:
+            terms.append(self.repa_weight * losses["repa"])
+        if "tla" in losses:
+            terms.append(self.tla_weight * (losses["tla"] + self.tla_entropy * losses["tla_entropy"]))
+        if "teacher_idle" in losses:
+            terms.append(losses["teacher_idle"])
         return sum(terms) if terms else None
+
+    def teacher_sums(self, losses):
+        """Summed [repa, tla, tla_entropy] terms of one micro-batch, for logging."""
+        zero = losses["flow"].new_zeros(())
+        return torch.stack([losses[k].detach().sum() if k in losses else zero for k in TEACHER_LOGS])
+
+    def teacher_record(self, means):
+        """Logged means of the enabled teacher terms; no keys at all when both are off."""
+        enabled = (self.repa_weight > 0, self.tla_weight > 0, self.tla_weight > 0)
+        return {key: float(value) for key, value, on in zip(TEACHER_LOGS, means, enabled) if on}
 
 
 def distributed_device(requested="auto"):
@@ -342,6 +379,7 @@ def train(args):
             prompt_dropout=cfg.train.prompt_dropout,
             **pairing,
             **pair_options(cfg),
+            **teacher_sources(cfg.train, args.cache),
         )
         if not data.meta.get("merged"):
             raise ValueError("Run merge on all prepared partitions before training")
@@ -454,6 +492,10 @@ def train(args):
             skip_coverage=cfg.train.contrastive_skip_coverage,
             negative_cap=cfg.train.contrastive_negative_cap,
             silence=silence,
+            repa_weight=cfg.train.repa_weight,
+            repa_frames=cfg.train.repa_frames,
+            tla_weight=cfg.train.tla_weight,
+            tla_entropy=cfg.train.tla_entropy,
         ).train()
         raw_objective = objective  # compile/DDP wrap the module; helper methods stay reachable here
         eager_forward = model.forward
@@ -581,6 +623,8 @@ def train(args):
             optimizer.zero_grad(set_to_none=True)
             metrics = torch.zeros(5, device=device)
             negative_metrics = torch.zeros(5, device=device)  # latent_delta only, see delta_sums
+            teacher_metrics = torch.zeros(len(TEACHER_LOGS), device=device)
+            raw_objective.repa_active = not cfg.train.repa_stop_step or step < cfg.train.repa_stop_step
             buckets = torch.zeros(9, 2, device=device)
             diagnostics = {}
             diagnose = cfg.train.diagnostics_every > 0 and step % cfg.train.diagnostics_every == 0
@@ -648,6 +692,7 @@ def train(args):
                 )
                 if "latent_delta" in losses:
                     negative_metrics += delta_sums(losses, flow_weights)
+                teacher_metrics += raw_objective.teacher_sums(losses)
             norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             if watch is not None:
                 watch.note("gradient", norm, step)
@@ -671,6 +716,7 @@ def train(args):
                     dist.all_reduce(buckets)
                     if cfg.train.contrastive_mode == "latent_delta":
                         dist.all_reduce(negative_metrics)
+                    dist.all_reduce(teacher_metrics)
                 if rank == 0:
                     record = {
                         "step": step + 1,
@@ -684,6 +730,7 @@ def train(args):
                         "duration": (metrics[2] / denominator).item(),
                         "ctc": (metrics[3] / flow_examples).item(),
                         "contrastive": (metrics[4] / flow_examples).item(),
+                        **raw_objective.teacher_record(teacher_metrics / flow_examples),
                         "elapsed_seconds": time.monotonic() - last_time,
                         "valid_target_frames": int(frame_denominator),
                         "gradient_norm_before_clip": float(norm),

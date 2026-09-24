@@ -1,0 +1,65 @@
+# nano_tr_w512 + speech-REPA + TLA-SA. Only the teacher lines differ from configs/nano_tr_w512.yaml;
+# A/B at 20k updates: pass --steps 20000 to every arm, the baseline included (issue #10).
+model:
+  width: 512
+  depth: 12
+  heads: 8
+  text_depth: 4
+  text_attention: 4
+  patch_size: 1
+  latent_dim: 128
+  positions: rope
+  qk_norm: true
+  prediction: edm
+  text_layout: joined
+  duration: rule
+  cond_dropout: 0.2
+  ctc_layer: 8
+  adaln_rank: 64
+  # speech-REPA (issue #10): block 10 predicts mHuBERT-147 frames; CTC stays on block 8 (A-DMA: never the
+  # same block, speech after text). repa_dim must equal the store's metadata.json "dim" (PCA 768 -> 256).
+  repa_layer: 10
+  repa_dim: 256
+  # TLA-SA (issue #10): every block, time-dependent block weights; tla_dim = SpeechBrain ECAPA width.
+  tla_layers: all
+  tla_dim: 192
+  tla_hidden: 256
+train:
+  steps: 60000
+  batch_size: 96
+  accumulation: 1
+  learning_rate: 0.0008
+  warmup: 2000
+  weight_decay: 0.01
+  optimizer: muon
+  muon_momentum: 0.95
+  ema_decay: 0.9999
+  precision: bf16
+  workers: 4
+  prefetch_factor: 4
+  checkpoint_every: 1000
+  keep_every: 5000
+  validate_every: 1000
+  log_every: 100
+  grad_checkpoint: true    # eager on 24 GB needs recomputation at frame budget 12000
+  compile: false           # generator-only compile spent >15 min on the first step here (dynamic-shape recompiles); eager + checkpointing instead
+  seed: 42
+  flow_reduction: frame
+  pairing: within
+  prompt_fraction_min: 0.1
+  prompt_fraction_max: 0.6
+  prompt_dropout: 0.3
+  time_sampling: logit_normal
+  batch_expansion: 4       # run B (Ke=4) led run A (Ke=2) by 0.02-0.04 WER at 25k-30k updates and kept SIM higher
+  ctc_weight: 0.1
+  contrastive_weight: 0.2
+  contrastive_margin: 0.1
+  wandb_project: dacvae-tts-tr
+  # Teacher stores from scripts/extract_teacher_features.py, relative to the cache directory.
+  teacher_features: teacher/mhubert147-l12-pca256
+  repa_weight: 1.0         # A-DMA lambda_speech; 0.5 if the flow loss lags
+  repa_stop_step: 0        # HASTE: e.g. 15000 aligns only during the first 15k updates; 0 keeps it on
+  repa_frames: all         # prompt frames are real speech the network sees clean
+  speaker_embeddings: teacher/ecapa-speechbrain   # not WavLM: the evaluation's SIM-o uses WavLM-large ECAPA
+  tla_weight: 0.5          # TLA-SA lambda
+  tla_entropy: 0.01        # alpha of the negative-entropy regularizer on the block weights

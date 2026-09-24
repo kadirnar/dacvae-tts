@@ -14,6 +14,7 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, Sampler
 
 from .contracts import normalization_stats
+from .teacher import TeacherInputs, collate_teacher, pair_teacher
 from .text import assemble, char_ctc_targets, decode_ids, join_ids, tokenize, tokenize_bytes
 
 SCHEMA = """
@@ -118,6 +119,8 @@ class LatentDataset(Dataset):
         layout="segments",
         prompt_fraction=(0.1, 0.5),
         prompt_dropout=0.0,
+        teacher_features=None,
+        speaker_embeddings=None,
         **pair_options,
     ):
         if pairing not in {"cross", "within"} or layout not in {"segments", "joined"}:
@@ -172,6 +175,11 @@ class LatentDataset(Dataset):
             self.costs = self.lengths + self.max_ref_lengths
         self.configure_pairs(**pair_options)
         self._pid, self._db, self._maps = None, None, OrderedDict()
+        # Precomputed teacher targets (teacher.py) for the alignment losses; None leaves items unchanged.
+        self.teacher = None
+        if teacher_features or speaker_embeddings:
+            rate = self.meta["sample_rate"] / self.meta["hop_length"]
+            self.teacher = TeacherInputs(self.db_path, split, rate, teacher_features, speaker_embeddings)
 
     def __len__(self):
         return len(self.ids)
@@ -220,6 +228,7 @@ class LatentDataset(Dataset):
             "token_ids": decode_ids(ids),
             "speaker": speaker,
             "latents": (z - self.mean) / self.std,
+            **(self.teacher.lookup(uid, frames) if self.teacher is not None else {}),
         }
 
     def __getitem__(self, index):
@@ -254,6 +263,7 @@ class LatentDataset(Dataset):
                 "speaker": row["speaker"],
                 "text_normalization": self.meta.get("text_normalization", "unicode-v1"),
                 "layout": self.layout,
+                **pair_teacher(row, row, cut),
             }
             return self.finish_item(item, epoch, index)
         start, end = int(self.group_start[index]), int(self.group_end[index])
@@ -274,6 +284,7 @@ class LatentDataset(Dataset):
             "speaker": target["speaker"],
             "text_normalization": self.meta.get("text_normalization", "unicode-v1"),
             "layout": self.layout,
+            **pair_teacher(ref, target),
         }
         return self.finish_item(item, epoch, index)
 
@@ -465,6 +476,7 @@ def collate(items):
         "valid": torch.arange(max(lengths))[None] < torch.tensor(lengths)[:, None],
         "tokens": pad_sequence(tokens, batch_first=True),
         "segments": pad_sequence(segments, batch_first=True),
+        **collate_teacher(items),
     }
     labels = {item.get("ctc_targets", "bytes") for item in items}
     if labels != {"bytes"}:

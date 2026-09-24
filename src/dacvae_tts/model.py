@@ -6,6 +6,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .alignment import RepaProjector, SpeakerAlignment
 from .config import ModelConfig
 from .contracts import audio_shapes, mask_values, sanitize, text_shapes
 from .reference import ReferencePool, TemporalReference
@@ -307,6 +308,12 @@ class FlowTTS(nn.Module):
         if cfg.cond_text_pool:
             self.text_pool = nn.Linear(d, d, bias=False)
             nn.init.zeros_(self.text_pool.weight)
+        # Training-only teacher heads (alignment.py): created last and only when configured, so models
+        # without them keep their initialization and old checkpoints load strictly.
+        self.repa = RepaProjector(d, cfg.repa_dim, p) if cfg.repa_layer else None
+        self.tla = (
+            SpeakerAlignment(d, cfg.tla_dim, len(cfg.tla_layers), cfg.tla_hidden) if cfg.tla_layers else None
+        )
         self.grad_checkpoint = False
         self.strict_checks = True  # train.strict_checks: false skips value checks that wait for the GPU
         self.block_runner = run_block  # train.compile: blocks swaps in a compiled runner (speed.py)
@@ -363,8 +370,22 @@ class FlowTTS(nn.Module):
         return self.duration(torch.cat(features, -1)).squeeze(-1)
 
     def forward(
-        self, x, time, prompt, prompt_mask, valid, tokens, segments, drop=None, cached=None, return_ctc=False
+        self,
+        x,
+        time,
+        prompt,
+        prompt_mask,
+        valid,
+        tokens,
+        segments,
+        drop=None,
+        cached=None,
+        return_ctc=False,
+        return_hidden=(),
     ):
+        """Velocity [B,L,C]; with `return_ctc`, (velocity, CTC logits, packed mask). A nonempty
+        `return_hidden` (1-based block indices) wraps that result as (result, {block: [B,N,D]}) for
+        training-only objectives that read intermediate states."""
         audio_shapes(x, prompt, prompt_mask, valid, self.cfg.latent_dim)
         text_shapes(tokens, segments, x.size(0), x.device)
         if time.shape != (x.size(0),) or time.device != x.device or not time.is_floating_point():
@@ -427,6 +448,7 @@ class FlowTTS(nn.Module):
         ctc_logits = None
         first = h  # input embedding h_0, for the optional long skip
         first_value = None  # first block's self-attention values, for the optional value residual
+        hidden = {}
         for number, block in enumerate(self.blocks, 1):
             args = (h, text, packed_valid, text_valid, cond, *angles, shared)
             if self.cfg.value_residual:
@@ -438,6 +460,8 @@ class FlowTTS(nn.Module):
                 h, first_value = h
             if return_ctc and number == self.cfg.ctc_layer:
                 ctc_logits = self.ctc(h)
+            if number in return_hidden:
+                hidden[number] = h
         if self.skip is not None:
             h = h + self.skip(torch.cat([first, h], -1))
         if self.final_ada is None:
@@ -450,7 +474,8 @@ class FlowTTS(nn.Module):
             raise ValueError("Velocity projection returned an unexpected packed length or width")
         # Remove only the explicitly added packing padding, then mask at frame resolution.
         velocity = sanitize(output.reshape(b, length + pad, channels)[:, :length], valid)
-        return (velocity, ctc_logits, packed_valid) if return_ctc else velocity
+        result = (velocity, ctc_logits, packed_valid) if return_ctc else velocity
+        return (result, hidden) if return_hidden else result
 
 
 def per_example_mse(prediction, target, mask, strict=True):
@@ -521,7 +546,10 @@ def flow_loss(
     return_details=False,
     cached=None,
     time_sampling="uniform",
+    hidden_layers=(),
 ):
+    """Per-example flow losses; `return_details` adds diagnostics, the CTC term and, for nonempty
+    `hidden_layers`, the requested block outputs under "hidden" (training-only teacher terms)."""
     if not 0 <= dropout <= 1:
         raise ValueError("dropout must lie in [0,1]")
     strict = getattr(model, "strict_checks", True)
@@ -542,6 +570,7 @@ def flow_loss(
     # Remove reference from the state too, otherwise CFG's null branch leaks the voice.
     xt = xt.masked_fill((drop[:, None] & batch["prompt_mask"])[..., None], 0)
     with_ctc = return_details and getattr(model, "ctc", None) is not None and model.training
+    with_hidden = return_details and bool(hidden_layers)
     pred = model(
         xt,
         time,
@@ -553,7 +582,11 @@ def flow_loss(
         drop=drop,
         **({} if cached is None else {"cached": cached}),
         **({"return_ctc": True} if with_ctc else {}),
+        **({"return_hidden": tuple(hidden_layers)} if with_hidden else {}),
     )
+    hidden = None
+    if with_hidden:
+        pred, hidden = pred
     ctc = None
     if with_ctc:
         pred, logits, token_valid = pred
@@ -574,6 +607,8 @@ def flow_loss(
         }
         if ctc is not None:
             details["ctc"] = ctc
+        if hidden is not None:
+            details["hidden"] = hidden
         return details
     return losses
 
