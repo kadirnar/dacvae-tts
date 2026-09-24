@@ -67,6 +67,8 @@ V1_PINS = {
     "%4'ü": "yüzde dörtü",
     "2024'e": "iki bin yirmi dörte",
     "14'ün": "on dörtün",
+    "2'incisi": "ikiincisi",
+    "6'ıncısı": "altııncısı",
     "T.C. vatandaşı": "T.C. vatandaşı",
     "Koç Holding A.Ş.": "Koç Holding A.Ş.",
     "Yılmaz Ltd. Şti.": "Yılmaz Ltd. Şti.",
@@ -119,6 +121,13 @@ def test_turkish_v1_outputs_are_pinned(raw, v1):
         ("3'e", "üçe"),
         ("40'a", "kırka"),
         ("8'e", "sekize"),
+        # An ordinal suffix followed by further suffixes is still an ordinal.
+        ("2'incisi", "ikincisi"),
+        ("7'inciye", "yedinciye"),
+        ("20'incisi", "yirmincisi"),
+        ("6'ıncısı", "altıncısı"),
+        ("4'üncüsü", "dördüncüsü"),
+        ("2'nci", "ikinci"),
         # Issue #5 table: abbreviations are expanded.
         ("T.C. vatandaşıyım.", "te ce vatandaşıyım."),
         ("Koç Holding A.Ş.", "Koç Holding anonim şirketi."),
@@ -182,6 +191,7 @@ METRIC_V1_PINS = {
     "e-posta": "e posta",
     "COVID-19": "covıd on dokuz",
     "4'e": "dörte",
+    "2'incisi": "ikiincisi",
 }
 
 
@@ -258,6 +268,8 @@ def test_metric_v1_outputs_are_pinned(raw, v1):
         # numbers, apostrophes, words that must not change
         ("4'e", "dörde"),
         ("%4'ü", "yüzde dördü"),
+        ("2'incisi", "ikincisi"),
+        ("6'ıncısı", "altıncısı"),
         ("İsveç'ten 86 kişi!", "isveçten seksen altı kişi"),
         ("İsveç´ten", "isveçten"),
         ("‘Merhaba’ dedi", "merhaba dedi"),

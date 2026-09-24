@@ -156,13 +156,16 @@ def expand_safe_abbreviations(text):
     return text
 
 
-def normalize_numbers(text, soften=False):
+def normalize_numbers(text, v2=False):
     """Spell out the numeric expressions Turkish podcast transcripts contain.
 
-    `soften` (turkish-v2) voices the final t of "dört" before a vowel-initial suffix, as Turkish does: 4'e -> dörde,
-    14'ün -> on dördün, %4'ü -> yüzde dördü, 2024'e -> iki bin yirmi dörde (without it: dörte, on dörtün). No other
-    number word changes (üçe, kırka, sekize are right as written) and ordinals are dördüncü either way; the suffix
-    vowels were written for "dört" already, so its harmony stays correct.
+    `v2` (turkish-v2 training and metric text) repairs the apostrophe suffixes that turkish-v1 appends verbatim:
+    - "dört" voices its final t before a vowel-initial suffix, as Turkish does: 4'e -> dörde, 14'ün -> on dördün,
+      %4'ü -> yüzde dördü, 2024'e -> iki bin yirmi dörde (v1: dörte, on dörtün). No other number word changes
+      (üçe, kırka, sekize are right as written) and ordinals are dördüncü either way; the suffix vowels were
+      written for "dört" already, so its harmony stays correct;
+    - an ordinal suffix followed by further suffixes is still an ordinal: 2'incisi -> ikincisi, 7'inciye ->
+      yedinciye, 6'ıncısı -> altıncısı (v1 only reads a bare ordinal suffix: ikiincisi, altııncısı).
     """
     # 50% / %50 / % 50 -> yüzde 50
     text = re.sub(r"%\s?(\d+(?:[.,]\d+)?)", r"yüzde \1", text)
@@ -184,10 +187,11 @@ def normalize_numbers(text, soften=False):
     # apostrophe suffixes 2010'da -> iki bin onda ; 3'üncü -> üçüncü
     def suffixed(m):
         number, suffix = m.group(1), m.group(2)
-        if re.fullmatch(r"[iıuü]?nc[iıuü]", suffix):
-            return ordinal_words(int(number))
+        ordinal = (re.match if v2 else re.fullmatch)(r"[iıuü]?nc[iıuü]", suffix)
+        if ordinal:
+            return ordinal_words(int(number)) + suffix[ordinal.end():]
         words = _int_words(number)
-        if soften and words.endswith("dört") and tr_lower(suffix[0]) in VOWELS:
+        if v2 and words.endswith("dört") and tr_lower(suffix[0]) in VOWELS:
             words = words[:-1] + "d"
         return words + suffix
 
@@ -210,8 +214,9 @@ def check_script(text):
 def normalize_turkish(text, version="turkish-v1"):
     """Turkish transcript -> model text: NFKC, numbers as words, script check, whitespace.
 
-    `turkish-v2` also expands SAFE_ABBREVIATIONS (T.C. -> te ce, A.Ş. -> anonim şirketi) and softens "dört" before
-    a vowel suffix (4'e -> dörde); everything else is byte-identical to `turkish-v1`.
+    `turkish-v2` also expands SAFE_ABBREVIATIONS (T.C. -> te ce, A.Ş. -> anonim şirketi), softens "dört" before
+    a vowel suffix (4'e -> dörde) and reads ordinals with further suffixes (2'incisi -> ikincisi); everything else
+    is byte-identical to `turkish-v1`.
     """
     if version not in {"turkish-v1", "turkish-v2"}:
         raise ValueError(f"Unknown Turkish normalization version: {version}")
@@ -221,7 +226,7 @@ def normalize_turkish(text, version="turkish-v1"):
     text = text.replace("‘", "'").replace("’", "'").replace("–", "-").replace("—", "-").replace("…", "...")
     if v2:
         text = expand_safe_abbreviations(text)
-    text = normalize_numbers(text, soften=v2)
+    text = normalize_numbers(text, v2=v2)
     text = re.sub(r"\s+([.,;:!?])", r"\1", text)  # "kelime ." -> "kelime."
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
@@ -337,7 +342,8 @@ def metric_text_turkish_v2(text):
     - clock times: saat 3.30 -> saat üç otuz, 3.30'a -> üç otuza, 14:00 -> on dört (v1: "üç nokta otuza");
     - ordinals without a space: 21.yüzyıl -> yirmi birinci yüzyıl;
     - currency symbols and units after a number: €50 -> elli avro, 5km'de -> beş kilometrede, 3 TL'ye -> üç liraya;
-    - numbers as in turkish-v1 with "dört" softening (4'e -> dörde);
+    - numbers as in turkish-v1 with the v2 suffix repairs of `normalize_numbers` (4'e -> dörde, 2'incisi ->
+      ikincisi);
     - combining marks are removed after lower-casing, so "i̇stanbul" (a non-Turkish lower() of İstanbul) is
       "istanbul" rather than "i stanbul"; â/î/û/ô and foreign accents fold (kâr -> kar);
     - apostrophes are deleted (İsveç'ten -> isveçten), other punctuation separates words;
@@ -367,7 +373,7 @@ def metric_text_turkish_v2(text):
         text = re.sub(rf"(\d)\s?{s}", rf"\1 {word}", text)
     text = rules["lira_suffix"].sub(lambda m: f"{m.group(1)} lira" + m.group(2).translate(_BACK_VOWELS), text)
     text = rules["unit"].sub(lambda m: f"{m.group(1)} {METRIC_UNITS[m.group(2)]}", text)
-    text = normalize_numbers(text, soften=True)
+    text = normalize_numbers(text, v2=True)
     text = _fold_marks(tr_lower(text))
     text = "".join(c if c.isalnum() or c.isspace() else ("" if c == "'" else " ") for c in text)
     return " ".join(" ".join(METRIC_VARIANTS.get(word, word) for word in text.split()).split())

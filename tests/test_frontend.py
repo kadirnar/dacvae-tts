@@ -101,6 +101,9 @@ def test_dort_softening_currency_suffixes_and_combining_marks():
     assert speakable("Saat 14.04'e kadar, 4'te ve 4'üncü sırada.")[0] == (
         "Saat on dört sıfır dörde kadar, dörtte ve dördüncü sırada."
     )
+    # An ordinal suffix with further suffixes reads as the ordinal (turkish-v1 keeps its old spelling).
+    assert speakable("2'incisi geldi, 7'inciye gitti.")[0] == "ikincisi geldi, yedinciye gitti."
+    assert speakable("2'incisi geldi.", "turkish-v1")[0] == "ikiincisi geldi."
     # The suffix after a currency symbol was written for the number; it moves to the currency word.
     assert speakable("$4'e, 4$'a, €4'ü, ₺4'ün, $5'in ve €2'ye aldım.")[0] == (
         "dört dolara, dört dolara, dört avroyu, dört liranın, beş doların ve iki avroya aldım."
