@@ -10,7 +10,7 @@ from torch.utils.checkpoint import checkpoint
 from .config import ModelConfig
 from .contracts import audio_shapes, mask_values, sanitize, text_shapes
 from .reference import ReferencePool, TemporalReference
-from .text import BYTE_OFFSET, VOCAB_SIZE
+from .text import BYTE_OFFSET, CHAR_VOCAB_SIZE, VOCAB_SIZE, char_ctc_targets
 
 
 def sinusoidal(positions, width):
@@ -199,8 +199,10 @@ class FlowTTS(nn.Module):
             else None
         )
         # Auxiliary CTC head on intermediate frames (A-DMA, arXiv:2505.19595): training only. It makes
-        # the generator route every transcript byte to its frames early, i.e. learn the alignment.
-        self.ctc = nn.Linear(d, VOCAB_SIZE) if cfg.ctc_layer else None
+        # the generator route every transcript byte (or letter, ctc_targets: chars) to its frames early,
+        # i.e. learn the alignment.
+        labels = CHAR_VOCAB_SIZE if cfg.ctc_targets == "chars" else VOCAB_SIZE
+        self.ctc = nn.Linear(d, labels) if cfg.ctc_layer else None
         self.grad_checkpoint = False
 
     def reference_summary(self, prompt, prompt_mask):
@@ -423,7 +425,7 @@ def flow_loss(
     ctc = None
     if with_ctc:
         pred, logits, token_valid = pred
-        ctc = ctc_alignment_loss(logits, token_valid, batch["tokens"], drop)
+        ctc = ctc_alignment_loss(logits, token_valid, batch["tokens"], drop, *ctc_labels(model, batch))
     target = x1 - noise
     if prediction_kind(model) == "edm":
         t = time[:, None, None]
@@ -446,18 +448,36 @@ def flow_loss(
     return losses
 
 
-def ctc_alignment_loss(logits, token_valid, tokens, drop):
+def ctc_labels(model, batch):
+    """(targets [B,T], lengths [B]) of a character CTC head, () for the byte head.
+
+    The loader normally builds them (collate); batches from elsewhere get them from their tokens here.
+    """
+    if getattr(getattr(model, "cfg", None), "ctc_targets", "bytes") != "chars":
+        return ()
+    if "ctc_targets" in batch:
+        return batch["ctc_targets"], batch["ctc_target_lengths"]
+    device = batch["tokens"].device
+    return tuple(value.to(device) for value in char_ctc_targets(batch["tokens"].cpu()))
+
+
+def ctc_alignment_loss(logits, token_valid, tokens, drop, targets=None, target_lengths=None):
     """Per-example CTC between generator frames and transcript bytes; PAD (0) is the blank.
 
     Examples whose text was dropped for classifier-free guidance cannot be aligned and get zero.
+    `targets` (padded [B,T] character ids, blank 0) with `target_lengths` replace the byte targets.
     """
     from .text import BYTE_OFFSET
 
-    targets = [row[row >= BYTE_OFFSET] for row in tokens]
-    lengths = torch.tensor([len(row) for row in targets], device=logits.device)
+    if targets is None:
+        targets = [row[row >= BYTE_OFFSET] for row in tokens]
+        lengths = torch.tensor([len(row) for row in targets], device=logits.device)
+        targets = torch.cat(targets)
+    else:
+        lengths = target_lengths.to(logits.device)
     loss = F.ctc_loss(
         logits.float().log_softmax(-1).transpose(0, 1),
-        torch.cat(targets),
+        targets,
         token_valid.sum(1),
         lengths,
         blank=0,

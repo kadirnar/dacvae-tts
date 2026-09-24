@@ -26,6 +26,10 @@ class ModelConfig:
     duration: str = "head"
     ctc_layer: int = 0
     adaln_rank: int = 0  # 0: one D->9D modulation per block; r>0: shared modulation + rank-r per block
+    # CTC labels of the auxiliary head. `chars`: Turkish lower-case letters + space, no punctuation (34
+    # classes with the blank). A two-byte Turkish letter is one phone but two byte labels, and fast speakers
+    # (16-19 bytes/s against 25 fps) leave byte CTC barely feasible; zero_infinity then zeroes those examples.
+    ctc_targets: str = "bytes"
 
     def __post_init__(self):
         if min(self.latent_dim, self.width, self.depth, self.heads, self.patch_size) < 1:
@@ -58,6 +62,8 @@ class ModelConfig:
             raise ValueError("ctc_layer must be 0 (off) or the index of a generator block")
         if self.text_layout == "joined" and self.duration == "head":
             raise ValueError("The duration head needs separate transcripts; use duration: rule when joined")
+        if self.ctc_targets not in {"bytes", "chars"} or (self.ctc_targets == "chars" and not self.ctc_layer):
+            raise ValueError("ctc_targets must be bytes or chars; chars needs a CTC head (ctc_layer > 0)")
 
 
 @dataclass

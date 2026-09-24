@@ -14,7 +14,7 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, Sampler
 
 from .contracts import normalization_stats
-from .text import assemble, decode_ids, join_ids, tokenize, tokenize_bytes
+from .text import assemble, char_ctc_targets, decode_ids, join_ids, tokenize, tokenize_bytes
 
 SCHEMA = """
 CREATE TABLE samples (
@@ -290,6 +290,7 @@ class LatentDataset(Dataset):
         tail_silence_prob=0.0,
         tail_silence_max_seconds=0.8,
         prompt_cut="random",
+        ctc_targets="bytes",
     ):
         """Validate the options and widen `costs` to an upper bound of every prompt+target they can form.
 
@@ -303,8 +304,8 @@ class LatentDataset(Dataset):
             raise ValueError("Cross-prompt and tail-silence limits must be positive")
         if long_prompt_prob and not self.prompt_fraction[1] <= prompt_fraction_long_max < 1:
             raise ValueError("Need prompt_fraction_max <= prompt_fraction_long_max < 1")
-        if prompt_cut not in {"random", "quiet"}:
-            raise ValueError("prompt_cut must be random or quiet")
+        if prompt_cut not in {"random", "quiet"} or ctc_targets not in {"bytes", "chars"}:
+            raise ValueError("prompt_cut must be random or quiet; ctc_targets bytes or chars")
         if self.pairing != "within" and (cross_prompt_prob or long_prompt_prob or prompt_cut != "random"):
             raise ValueError("Cross prompts, long prompts and quiet cuts act on within pairing")
         frame_rate = self.meta["sample_rate"] / self.meta["hop_length"]
@@ -316,6 +317,7 @@ class LatentDataset(Dataset):
             max(round(tail_silence_max_seconds * frame_rate), 1) if tail_silence_prob else 0
         )
         self.prompt_cut, self.quiet_window = prompt_cut, round(QUIET_CUT_SECONDS * frame_rate)
+        self.ctc_targets = ctc_targets
         self.silence = None
         if tail_silence_prob or prompt_cut == "quiet":
             self.silence = (load_silence(self.directory, self.meta) - self.mean) / self.std
@@ -409,7 +411,9 @@ class LatentDataset(Dataset):
         return low + last + 1
 
     def finish_item(self, item, epoch, index):
-        """Tail silence; the item itself when it is off."""
+        """Tail silence and the CTC label flag; the item itself when both are off."""
+        if self.ctc_targets == "chars":
+            item = {**item, "ctc_targets": "chars"}
         if not self.tail_silence_prob:
             return item
         rng = random.Random(self.seed + epoch * len(self) + index + TAIL_STREAM)
@@ -454,7 +458,7 @@ def collate(items):
         tokens.append(tok)
         segments.append(seg)
         lengths.append(len(z))
-    return {
+    batch = {
         "latents": pad_sequence(latents, batch_first=True),
         "prompt": pad_sequence(prompts, batch_first=True),
         "prompt_mask": pad_sequence(masks, batch_first=True),
@@ -462,6 +466,13 @@ def collate(items):
         "tokens": pad_sequence(tokens, batch_first=True),
         "segments": pad_sequence(segments, batch_first=True),
     }
+    labels = {item.get("ctc_targets", "bytes") for item in items}
+    if labels != {"bytes"}:
+        # Character CTC targets are built here, in the loader workers, from the exact model tokens.
+        if labels != {"chars"}:
+            raise ValueError("A batch cannot mix byte and character CTC targets")
+        batch["ctc_targets"], batch["ctc_target_lengths"] = char_ctc_targets(tokens)
+    return batch
 
 
 class BucketBatchSampler(Sampler):

@@ -151,3 +151,56 @@ def join_ids(parts):
             raise ValueError("Empty transcript ids")
         bodies += [np.asarray(ids[1:-1], dtype=ID_DTYPE), np.array([SPACE], dtype=ID_DTYPE)]
     return np.concatenate([np.array([BOS], dtype=ID_DTYPE), *bodies[:-1], np.array([EOS], dtype=ID_DTYPE)])
+
+
+# Character CTC labels (model.ctc_targets: chars): blank 0, space 1, then the Turkish lower-case alphabet
+# plus q, w, x for loanwords. The circumflex vowels are the same phones as their plain forms.
+CTC_CHARS = " abcdefghijklmnopqrstuvwxyzçğıöşü"
+CTC_INDEX = {c: i + 1 for i, c in enumerate(CTC_CHARS)}
+CHAR_VOCAB_SIZE = len(CTC_CHARS) + 1
+CTC_FOLD = str.maketrans({"â": "a", "î": "i", "û": "u"})
+
+
+def ctc_text(text):
+    """Transcript -> CTC character string: Turkish lower case (İ->i, I->ı), letters and single spaces.
+
+    Apostrophes vanish inside a word ("İstanbul'da" -> "istanbulda"); other punctuation and digits
+    separate words, as in the Turkish WER normalization. Foreign accented letters keep their base letter.
+    """
+    from .turkish import tr_lower
+
+    characters = []
+    for c in tr_lower(unicodedata.normalize("NFC", text)).translate(CTC_FOLD):
+        if c in "'’":
+            continue
+        if c in CTC_INDEX:
+            characters.append(c)
+        elif c.isalpha():
+            base = unicodedata.normalize("NFKD", c)[0]
+            characters.append(base if base in CTC_INDEX else "")
+        else:
+            characters.append(" ")
+    return " ".join("".join(characters).split())
+
+
+def char_ctc_targets(rows):
+    """Assembled token rows ([B,S] or a list of [S]) -> padded character targets [B,T] and lengths [B].
+
+    The byte runs between special tokens (BOS/SEP/EOS/PAD) are decoded and joined by a space, so both
+    layouts and multi-utterance prompts give "reference words target words", like the byte targets.
+    """
+    targets = []
+    for row in rows:
+        runs, current = [], []
+        for value in row.tolist() + [PAD]:
+            if value >= BYTE_OFFSET:
+                current.append(value - BYTE_OFFSET)
+            elif current:
+                runs.append(bytes(current).decode("utf-8", errors="ignore"))
+                current = []
+        targets.append(torch.tensor([CTC_INDEX[c] for c in ctc_text(" ".join(runs))], dtype=torch.int64))
+    lengths = torch.tensor([len(t) for t in targets], dtype=torch.int64)
+    padded = torch.zeros(len(targets), max(int(lengths.max()), 1), dtype=torch.int64)
+    for i, target in enumerate(targets):
+        padded[i, : len(target)] = target
+    return padded, lengths

@@ -1,22 +1,53 @@
-"""Training pairs (issue #11): cross-utterance prompts, short targets, tail silence, quiet cuts."""
+"""Training pairs (issue #11): cross-utterance prompts, short targets, tail silence, quiet cuts, char CTC."""
 
 import hashlib
 import json
 import sqlite3
+import types
 
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
+import yaml
 
-from dacvae_tts.config import TrainConfig
+from dacvae_tts.config import Config, ModelConfig, TrainConfig
 from dacvae_tts.data import SCHEMA, BucketBatchSampler, LatentDataset, ShardWriter, collate, save_stats
-from dacvae_tts.text import BOS, BYTE_OFFSET, EOS, assemble, encode_ids, join_ids, tokenize_bytes
+from dacvae_tts.model import FlowTTS, ctc_alignment_loss, flow_loss
+from dacvae_tts.text import (
+    BOS,
+    BYTE_OFFSET,
+    CHAR_VOCAB_SIZE,
+    CTC_CHARS,
+    EOS,
+    VOCAB_SIZE,
+    assemble,
+    char_ctc_targets,
+    ctc_text,
+    encode_ids,
+    join_ids,
+    tokenize_bytes,
+)
+from dacvae_tts.training import Objective, load_model
 
 CHANNELS = 4
 TEXTS = ["İstanbul'da KIRMIZI elma.", "Işık hâlâ yanıyor!", "Bugün kitap okudum", "Çok güzel, değil mi?"]
 SPEAKERS = {"a": [30, 42, 25, 38], "b": [50, 20, 33]}
 # Multiples of 1/8 off the 1/4 grid of the utterance frames: exact in float16, never equal to a speech frame.
 SILENCE = torch.tensor([0.125, -0.375, 0.625, -0.875])
+NANO = dict(
+    latent_dim=4,
+    width=32,
+    heads=2,
+    depth=2,
+    text_depth=1,
+    patch_size=1,
+    positions="rope",
+    prediction="edm",
+    text_layout="joined",
+    duration="rule",
+    ctc_layer=1,
+)
 WITHIN = dict(pairing="within", layout="joined")
 
 
@@ -108,7 +139,42 @@ def test_options_off_reproduce_the_previous_data_stream(tmp_path):
     for token_ids, digest in expected.items():
         cache = build_cache(tmp_path / f"ids{token_ids}", token_ids=token_ids)
         assert stream_digest(cache) == digest
-        assert stream_digest(cache, **off) == digest
+        assert stream_digest(cache, **off, ctc_targets="bytes") == digest
+
+
+def legacy_ctc(logits, token_valid, tokens, drop):
+    """ctc_alignment_loss before issue #11, verbatim."""
+    targets = [row[row >= BYTE_OFFSET] for row in tokens]
+    lengths = torch.tensor([len(row) for row in targets], device=logits.device)
+    loss = F.ctc_loss(
+        logits.float().log_softmax(-1).transpose(0, 1),
+        torch.cat(targets),
+        token_valid.sum(1),
+        lengths,
+        blank=0,
+        reduction="none",
+        zero_infinity=True,
+    )
+    return (loss / lengths.clamp_min(1)).masked_fill(drop, 0)
+
+
+def test_byte_ctc_is_unchanged_and_ignores_character_targets(tmp_path):
+    torch.manual_seed(0)
+    rows = [tokenize_bytes(b"", b"abc de", "joined")[0], tokenize_bytes(b"", b"xyzxy z", "joined")[0]]
+    tokens = torch.nn.utils.rnn.pad_sequence(rows, batch_first=True)
+    logits, valid = torch.randn(2, 30, VOCAB_SIZE), torch.ones(2, 30, dtype=torch.bool)
+    drop = torch.tensor([False, True])
+    assert torch.equal(
+        ctc_alignment_loss(logits, valid, tokens, drop), legacy_ctc(logits, valid, tokens, drop)
+    )
+    model = FlowTTS(ModelConfig(**NANO)).train()
+    assert model.ctc.out_features == VOCAB_SIZE
+    batch = long_batch(labels="chars")
+    plain = {k: v for k, v in batch.items() if not k.startswith("ctc_")}
+    torch.manual_seed(3)
+    with_keys = flow_loss(model, batch, dropout=0.0, return_details=True)["ctc"]
+    torch.manual_seed(3)
+    assert torch.equal(with_keys, flow_loss(model, plain, dropout=0.0, return_details=True)["ctc"])
 
 
 def test_cross_prompts_join_other_utterances_of_the_speaker(tmp_path):
@@ -265,6 +331,116 @@ def test_quiet_cut_ends_the_prompt_on_the_silence_closest_frame(tmp_path):
     assert len(dropped[(0, 0)]["reference"]) == 0
 
 
+def test_character_ctc_text():
+    assert ctc_text("İstanbul'da KIRMIZI elma!") == "istanbulda kırmızı elma"
+    assert ctc_text("IŞIK ılık, İĞNE") == "ışık ılık iğne"
+    assert ctc_text("Hâlâ kâr   ediyor... 3 kez") == "hala kar ediyor kez"
+    assert ctc_text("Café-bar: ÇÖĞÜŞ") == "cafe bar çöğüş"
+    assert ctc_text("İzmir") == "izmir"  # decomposed dotted capital I
+    assert ctc_text("!!! 42") == ""
+    assert CHAR_VOCAB_SIZE == 34 and CTC_CHARS[0] == " "
+
+
+def decode(row, length):
+    return "".join(CTC_CHARS[int(v) - 1] for v in row[:length])
+
+
+def test_character_ctc_targets_from_model_tokens():
+    joined, _ = tokenize_bytes(b"", "İstanbul'da KIRMIZI.".encode(), "joined")
+    segments, _ = tokenize_bytes("Merhaba.".encode(), "Dünya!".encode())
+    padded = torch.nn.utils.rnn.pad_sequence([joined, segments], batch_first=True)
+    targets, lengths = char_ctc_targets(padded)
+    assert decode(targets[0], lengths[0]) == "istanbulda kırmızı"
+    assert decode(targets[1], lengths[1]) == "merhaba dünya"  # reference and target words, one space
+    assert (targets[1, lengths[1] :] == 0).all() and targets.shape == (2, int(lengths.max()))
+    assert int(lengths[0]) < int((joined >= BYTE_OFFSET).sum())  # fewer labels than bytes
+    cross, _ = assemble(
+        join_ids([encode_ids(b"bir"), encode_ids(b"iki")]), encode_ids("ÜÇ".encode()), "joined"
+    )
+    targets, lengths = char_ctc_targets([cross])
+    assert decode(targets[0], lengths[0]) == "bir iki üç"
+
+
+def long_batch(labels="bytes", frames=64):
+    torch.manual_seed(0)
+    items = []
+    for index, prompt in enumerate((5, 0)):
+        latents = torch.randn(frames + 3 * index, 4)
+        item = dict(reference=latents[:prompt], target=latents[prompt:], reference_text="", layout="joined")
+        item["text"] = ["İstanbul'da KIRMIZI elma.", "Işık hâlâ yanıyor!"][index]
+        if labels == "chars":
+            item["ctc_targets"] = "chars"
+        items.append(item)
+    return collate(items)
+
+
+def test_character_ctc_head_and_loss():
+    model = FlowTTS(ModelConfig(**NANO, ctc_targets="chars")).train()
+    assert model.ctc.out_features == CHAR_VOCAB_SIZE
+    batch = long_batch("chars")
+    assert batch["ctc_targets"].shape[0] == 2 and batch["ctc_target_lengths"].tolist() == [23, 17]
+    torch.manual_seed(1)
+    ctc = flow_loss(model, batch, dropout=0.0, return_details=True)["ctc"]
+    assert ctc.shape == (2,) and torch.isfinite(ctc).all() and (ctc > 0).all()
+    plain = {k: v for k, v in batch.items() if not k.startswith("ctc_")}
+    torch.manual_seed(1)
+    assert torch.equal(
+        flow_loss(model, plain, dropout=0.0, return_details=True)["ctc"], ctc
+    )  # built on the fly
+    losses = Objective(model, expansion=2, ctc_weight=0.1).train()(batch)
+    assert losses["ctc"].shape == (4,)
+    (losses["loss"].mean() + losses["ctc"].mean()).backward()
+    assert model.ctc.weight.grad.abs().sum() > 0
+    with pytest.raises(ValueError, match="mix"):
+        collate(
+            [
+                dict(
+                    reference=torch.zeros(0, 4),
+                    target=torch.ones(3, 4),
+                    text="a",
+                    reference_text="",
+                    layout="joined",
+                    ctc_targets="chars",
+                ),
+                dict(
+                    reference=torch.zeros(0, 4),
+                    target=torch.ones(3, 4),
+                    text="b",
+                    reference_text="",
+                    layout="joined",
+                ),
+            ]
+        )
+
+
+def test_dataset_flags_character_targets(tmp_path):
+    cache = build_cache(tmp_path / "c")
+    data = LatentDataset(cache, **WITHIN, ctc_targets="chars")
+    batch = collate([data[(0, i)] for i in range(3)])
+    expected = char_ctc_targets(batch["tokens"])
+    assert torch.equal(batch["ctc_targets"], expected[0]) and torch.equal(
+        batch["ctc_target_lengths"], expected[1]
+    )
+    assert "ctc_targets" not in collate([LatentDataset(cache, **WITHIN)[(0, 0)]])
+
+
+def test_old_checkpoints_load_strictly_and_heads_differ(tmp_path):
+    config = Config(ModelConfig(**NANO), TrainConfig(pairing="within")).to_dict()
+    del config["model"]["ctc_targets"]
+    for name in ("cross_prompt_prob", "long_prompt_prob", "tail_silence_prob", "prompt_cut"):
+        del config["train"][name]
+    model = FlowTTS(ModelConfig(**NANO))
+    torch.save(
+        {"config": config, "model": model.state_dict(), "ema": model.state_dict()}, tmp_path / "old.pt"
+    )
+    loaded, _ = load_model(tmp_path / "old.pt")  # strict load_state_dict
+    assert loaded.ctc.out_features == VOCAB_SIZE and loaded.cfg.ctc_targets == "bytes"
+    chars = FlowTTS(ModelConfig(**NANO, ctc_targets="chars"))
+    assert chars.ctc.weight.shape == (CHAR_VOCAB_SIZE, 32)
+    with pytest.raises(RuntimeError):
+        model.load_state_dict(chars.state_dict())
+
+
 def test_configuration_guards():
     with pytest.raises(ValueError):
         TrainConfig(pairing="within", cross_prompt_prob=1.5)
@@ -280,3 +456,55 @@ def test_configuration_guards():
         TrainConfig(pairing="within", cross_prompt_max_utterances=0)
     TrainConfig(tail_silence_prob=0.3)  # tail silence also pads cross-pairing targets
     TrainConfig(pairing="within", prompt_fraction_max=0.9)  # long max is only checked when enabled
+    with pytest.raises(ValueError):
+        ModelConfig(ctc_targets="chars")  # no CTC head
+    with pytest.raises(ValueError):
+        ModelConfig(**{**NANO, "ctc_targets": "phones"})
+
+
+def test_training_runs_with_every_pair_option(cache, tmp_path):
+    from dacvae_tts import training
+
+    torch.save({"raw": torch.zeros(4), "codec": {"checkpoint": "test-codec"}}, cache / "silence.pt")
+    config = tmp_path / "pairs.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "model": {**NANO, "ctc_targets": "chars"},
+                "train": {
+                    "steps": 3,
+                    "warmup": 1,
+                    "batch_size": 2,
+                    "accumulation": 2,
+                    "workers": 0,
+                    "precision": "fp32",
+                    "log_every": 1,
+                    "checkpoint_every": 3,
+                    "validate_every": 3,
+                    "pairing": "within",
+                    "ctc_weight": 0.1,
+                    "cross_prompt_prob": 0.5,
+                    "cross_prompt_max_seconds": 0.5,
+                    "long_prompt_prob": 0.5,
+                    "tail_silence_prob": 0.5,
+                    "prompt_cut": "quiet",
+                },
+            }
+        )
+    )
+    names = "steps batch_size accumulation workers precision learning_rate optimizer worker_threads".split()
+    names += "prefetch_factor loader_start_method cuda_prefetch compile stop_after init_from resume".split()
+    args = types.SimpleNamespace(
+        **dict.fromkeys(names),
+        config=str(config),
+        cache=str(cache),
+        output=str(tmp_path / "run"),
+        device="cpu",
+        frame_budget=120,
+        no_validation=False,
+    )
+    training.train(args)
+    _, saved = load_model(tmp_path / "run" / "last.pt")
+    assert saved["step"] == 3 and Config.from_dict(saved["config"]).train.prompt_cut == "quiet"
+    records = [json.loads(line) for line in (tmp_path / "run" / "train.jsonl").read_text().splitlines()]
+    assert all(np.isfinite(r["ctc"]) for r in records if "ctc" in r)

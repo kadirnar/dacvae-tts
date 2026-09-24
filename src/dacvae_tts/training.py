@@ -233,7 +233,7 @@ def pair_options(cfg):
         "tail_silence_max_seconds",
         "prompt_cut",
     )
-    return {name: getattr(cfg.train, name) for name in names}
+    return {**{name: getattr(cfg.train, name) for name in names}, "ctc_targets": cfg.model.ctc_targets}
 
 
 def train(args):
