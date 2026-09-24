@@ -1,6 +1,7 @@
 # Issue #11 training pairs on run C (nano_tr_w512.yaml): every option on. Experimental; quality has not been
-# established. Everything except the pair options and the 20k-update A/B schedule is identical to run C, so the
-# baseline arm is `configs/nano_tr_w512.yaml --steps 20000` on the same cache and frame budget.
+# established. Everything except the pair options and `steps` is identical to run C. For an A/B, run every arm
+# (the baseline `configs/nano_tr_w512.yaml` included) with `--steps 60000 --stop-after 20000` on the same cache and
+# frame budget, as scripts/gpu/30_ab_training.sh does: one LR schedule for all arms.
 # Each option should also be A/B'd on its own (base / +cross prompts / +tail silence + short targets + quiet cut /
 # +char CTC): they target different failures and one may hide another's effect.
 # Needs <cache>/silence.pt for tail silence and quiet cuts: python scripts/silence_latent.py --cache <cache>.

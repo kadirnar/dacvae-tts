@@ -53,12 +53,12 @@ MAX_BATCH_SENTENCES = 30
 # Label -> (repo id, file, repo type). All public: downloads never use a token.
 CHECKPOINTS = OrderedDict(
     [
-        ("w512-clean 60k · yayımlanan (Freya WER %4,3)", ("VoiceHub/dacvae-tts-tr-w512", "model.pt", "model")),
-        ("w512-stage2-hq 10k (Freya %4,6)", ("VoiceHub/dacvae-tts-tr-w512-stage2-hq", "checkpoints/step-0010000.pt", "dataset")),
-        ("stage3-hq 10k · 51M (Freya %6,9)", ("VoiceHub/dacvae-tts-tr-stage3-hq", "checkpoints/step-0010000.pt", "dataset")),
-        ("stage2-b 20k · 51M (Freya %7,1)", ("VoiceHub/dacvae-tts-tr-stage2-b", "checkpoints/step-0020000.pt", "dataset")),
-        ("nano-b-ke4 40k · 51M (Freya %9,1)", ("VoiceHub/dacvae-tts-tr-nano-b-ke4", "checkpoints/step-0040000.pt", "dataset")),
-        ("nano-a 40k · 51M (Freya %10,5)", ("VoiceHub/dacvae-tts-tr-nano-a", "checkpoints/step-0040000.pt", "dataset")),
+        ("w512-clean 60k · published (Freya WER 4.3 %)", ("VoiceHub/dacvae-tts-tr-w512", "model.pt", "model")),
+        ("w512-stage2-hq 10k (Freya 4.6 %)", ("VoiceHub/dacvae-tts-tr-w512-stage2-hq", "checkpoints/step-0010000.pt", "dataset")),
+        ("stage3-hq 10k · 51M (Freya 6.9 %)", ("VoiceHub/dacvae-tts-tr-stage3-hq", "checkpoints/step-0010000.pt", "dataset")),
+        ("stage2-b 20k · 51M (Freya 7.1 %)", ("VoiceHub/dacvae-tts-tr-stage2-b", "checkpoints/step-0020000.pt", "dataset")),
+        ("nano-b-ke4 40k · 51M (Freya 9.1 %)", ("VoiceHub/dacvae-tts-tr-nano-b-ke4", "checkpoints/step-0040000.pt", "dataset")),
+        ("nano-a 40k · 51M (Freya 10.5 %)", ("VoiceHub/dacvae-tts-tr-nano-a", "checkpoints/step-0040000.pt", "dataset")),
     ]
 )
 DEFAULT_MODEL = next(iter(CHECKPOINTS))
@@ -82,7 +82,7 @@ def gpu(duration):
             except ValueError as error:
                 raise gr.Error(str(error)) from error
             except torch.cuda.OutOfMemoryError as error:
-                raise gr.Error("GPU belleği yetmedi; metni kısaltın veya aday sayısını azaltın") from error
+                raise gr.Error("Out of GPU memory; shorten the text or lower the number of candidates") from error
 
         run.__name__, run.__doc__ = function.__name__, function.__doc__
         return spaces.GPU(duration=duration)(run) if ZERO else run
@@ -178,11 +178,11 @@ def hub_errors(function):
         try:
             return function(*args, **kwargs)
         except (RepositoryNotFoundError, GatedRepoError) as error:
-            raise ValueError("Depo bulunamadı ya da erişim izniniz yok (özel depolar için 'Hugging Face ile giriş yap')") from error
+            raise ValueError("Repository not found or no access (for private repositories use 'Log in with Hugging Face')") from error
         except EntryNotFoundError as error:
-            raise ValueError("Dosya depoda bulunamadı") from error
+            raise ValueError("File not found in the repository") from error
         except HfHubHTTPError as error:
-            raise ValueError(f"Hub isteği başarısız: {str(error)[:160]}") from error
+            raise ValueError(f"Hub request failed: {str(error)[:160]}") from error
 
     return run
 
@@ -192,7 +192,7 @@ def list_checkpoint_files(repo, repo_type, token=None):
     repo, _, kind = parse_hub_url(repo)
     repo_type = kind or repo_type
     if not _REPO.match(repo or ""):
-        raise ValueError("Repo kimliği 'kurum/ad' biçiminde olmalı (ör. VoiceHub/dacvae-tts-tr-w512-clean)")
+        raise ValueError("The repo ID must have the form 'org/name' (e.g. VoiceHub/dacvae-tts-tr-w512-clean)")
     files = HfApi().list_repo_files(repo, repo_type=repo_type, token=token or False)
     return repo_type, sorted(f for f in files if f.endswith((".pt", ".pth")))
 
@@ -203,13 +203,13 @@ def resolve_custom(repo, filename, repo_type, token=None):
     repo, url_file, kind = parse_hub_url(repo)
     filename, repo_type = (url_file or (filename or "").strip()), (kind or repo_type or "dataset")
     if not _REPO.match(repo or "") or not filename.endswith((".pt", ".pth")) or ".." in filename:
-        raise ValueError("Özel checkpoint için 'kurum/ad' biçiminde bir repo ve .pt/.pth dosya yolu girin")
+        raise ValueError("For a custom checkpoint enter a repo of the form 'org/name' and a .pt/.pth file path")
     info = HfApi().get_paths_info(repo, [filename], repo_type=repo_type, token=token or False)
     if not info:
-        raise ValueError(f"Dosya bulunamadı: {repo}/{filename}")
+        raise ValueError(f"File not found: {repo}/{filename}")
     size = getattr(info[0], "size", 0) or 0
     if size > MAX_CUSTOM_BYTES:
-        raise ValueError(f"Checkpoint çok büyük ({size / 1e9:.1f} GB; sınır {MAX_CUSTOM_BYTES / 1e9:.1f} GB)")
+        raise ValueError(f"Checkpoint too large ({size / 1e9:.1f} GB; limit {MAX_CUSTOM_BYTES / 1e9:.1f} GB)")
     return _download(repo, filename, repo_type, token=token or False), f"{repo}/{filename}"
 
 
@@ -217,7 +217,7 @@ def resolve_custom(repo, filename, repo_type, token=None):
 def model_path(choice):
     """Main-process side: make sure a listed checkpoint is on disk. Returns (path, display name)."""
     if choice not in CHECKPOINTS:
-        raise ValueError(f"Bilinmeyen checkpoint: {choice}")
+        raise ValueError(f"Unknown checkpoint: {choice}")
     if choice not in PATHS:
         PATHS[choice] = _download(*CHECKPOINTS[choice])
     return PATHS[choice], choice
@@ -234,7 +234,7 @@ def model_for(path):
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         missing = {"config", "ema", "codec", "mean", "std"} - set(checkpoint)
         if missing:
-            raise ValueError(f"Bu dosya bir DACVAE-TTS checkpoint'i değil (eksik: {sorted(missing)})")
+            raise ValueError(f"This file is not a DACVAE-TTS checkpoint (missing: {sorted(missing)})")
         del checkpoint
         while len(_WORKER_MODELS) >= 3:
             _WORKER_MODELS.popitem(last=False)
@@ -354,7 +354,7 @@ def run_generate(job):
         try:
             job["reference_text"], _ = speakable(auto)
         except ValueError as error:
-            raise ValueError("Referans sesten metin çıkarılamadı; transkripti elle yazın") from error
+            raise ValueError("Could not extract text from the reference audio; type the transcript by hand") from error
     result = synthesize_job(tts, job)
     result.update(model_load_seconds=load, gpu_seconds=time.time() - started, reference_text=job["reference_text"],
                   reference_asr=auto)
@@ -397,7 +397,7 @@ def run_diagnostics():
     tts = MODELS[DEFAULT_MODEL]
     voice = tts.prepare_reference((audio, SAMPLE_RATE), speakable(example["text"])[0])
     results, _ = tts.synthesize_many(["Merhaba, bu bir deneme."], voice, steps=8, guidance=5.0)
-    report.append(f"synthesis: {results[0][0]['audio_seconds']:.1f} s ses ({time.time() - started:.1f} s)")
+    report.append(f"synthesis: {results[0][0]['audio_seconds']:.1f} s audio ({time.time() - started:.1f} s)")
     return "\n".join(report)
 
 
@@ -405,21 +405,21 @@ def run_diagnostics():
 def load_reference(path, max_seconds=15.0):
     """Read, mix to mono, resample to 48 kHz and trim silence. Returns (audio, notes)."""
     if not path:
-        raise ValueError("Bir referans ses yükleyin veya kaydedin (3–15 s, tek konuşmacı)")
+        raise ValueError("Upload or record a reference audio (3–15 s, single speaker)")
     audio = read_audio(path, SAMPLE_RATE).numpy()
     notes = []
     trimmed, start, end = trim_silence(audio, SAMPLE_RATE)
     if len(audio) - len(trimmed) > 0.3 * SAMPLE_RATE:
-        notes.append(f"baştaki/sondaki sessizlik kırpıldı ({(len(audio) - len(trimmed)) / SAMPLE_RATE:.1f} s)")
+        notes.append(f"leading/trailing silence trimmed ({(len(audio) - len(trimmed)) / SAMPLE_RATE:.1f} s)")
     seconds = len(trimmed) / SAMPLE_RATE
     if seconds < 1.0:
-        raise ValueError(f"Referans çok kısa ({seconds:.1f} s); en az 3 s konuşma önerilir")
+        raise ValueError(f"Reference too short ({seconds:.1f} s); at least 3 s of speech is recommended")
     if seconds > 30:
-        raise ValueError(f"Referans çok uzun ({seconds:.0f} s); 3–15 s'lik bir bölüm yükleyin")
+        raise ValueError(f"Reference too long ({seconds:.0f} s); upload a 3–15 s excerpt")
     if seconds > max_seconds:
-        notes.append(f"referans uzun ({seconds:.0f} s): model 3–15 s'lik prompt'larla eğitildi; kısaltmak kaliteyi artırabilir")
+        notes.append(f"long reference ({seconds:.0f} s): the model was trained on 3–15 s prompts; shortening it may improve quality")
     elif seconds < 3:
-        notes.append(f"referans kısa ({seconds:.1f} s): ses benzerliği düşebilir")
+        notes.append(f"short reference ({seconds:.1f} s): voice similarity may drop")
     return trimmed, notes
 
 
@@ -446,20 +446,20 @@ def dnsmos(audio_48k):
 
 def reference_report(audio, transcript, notes):
     seconds = len(audio) / SAMPLE_RATE
-    lines = [f"**Referans:** {seconds:.1f} s"]
+    lines = [f"**Reference:** {seconds:.1f} s"]
     if transcript:
         rate = speaking_rate(seconds * 25, transcript)
-        label = "hızlı" if rate > 17 else ("yavaş" if rate < 13 else "normal")
-        lines.append(f"konuşma hızı {rate:.1f} kar/s ({label}; korpus medyanı 15)")
+        label = "fast" if rate > 17 else ("slow" if rate < 13 else "normal")
+        lines.append(f"speaking rate {rate:.1f} chars/s ({label}; corpus median 15)")
         if rate > 17:
-            notes = notes + ["hızlı referans: 'Otomatik' hız çıktıyı ~16 kar/s'ye yavaşlatır (hızlı prompt'lar en çok hatayı üretiyordu)"]
+            notes = notes + ["fast reference: the 'Automatic' rate slows the output down to ~16 chars/s (fast prompts produced the most errors)"]
         elif rate < 13:
-            notes = notes + ["yavaş referans (uzun duraklamalar olabilir): 'Otomatik' hız süreyi süre tahmincisiyle belirler"]
+            notes = notes + ["slow reference (may contain long pauses): the 'Automatic' rate sets the duration with the duration predictor"]
     quality = dnsmos(audio)
     if quality:
         lines.append(f"DNSMOS {quality['dnsmos_ovrl']:.2f}")
         if quality["dnsmos_ovrl"] < 2.7:
-            notes = notes + ["referans gürültülü/yankılı görünüyor (DNSMOS < 2,7): çıktı kalitesi ve anlaşılırlık düşebilir"]
+            notes = notes + ["the reference sounds noisy/reverberant (DNSMOS < 2.7): output quality and intelligibility may drop"]
     text = " · ".join(lines)
     if notes:
         text += "\n\n" + "\n".join(f"- ⚠️ {n}" for n in notes)
@@ -469,7 +469,7 @@ def reference_report(audio, transcript, notes):
 def plan_text(text, reference_seconds, rate=15.0, fixed_rate=None):
     """Frontend + chunking. Chunks keep prompt + target within the lengths seen in training (~20-25 s)."""
     if not text or not text.strip():
-        raise ValueError("Söylenecek metni girin")
+        raise ValueError("Enter the text to speak")
     from dacvae_tts.frontend import prepare_text
 
     prepared = prepare_text(text)
@@ -486,7 +486,7 @@ def plan_text(text, reference_seconds, rate=15.0, fixed_rate=None):
         chunks.append(normalized)
         pauses.append(PAUSES[kind])
     if not chunks:
-        raise ValueError("Metinde okunabilir bir şey kalmadı")
+        raise ValueError("Nothing readable is left in the text")
     return chunks, pauses, changes
 
 
@@ -527,7 +527,7 @@ def summarize_chunks(chunks):
 
 def make_zip(files, rows, summary):
     folder = Path(tempfile.mkdtemp())
-    path = folder / "toplu-test.zip"
+    path = folder / "batch-test.zip"
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
         for name, wav in files:
             archive.write(wav, name)

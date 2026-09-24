@@ -15,9 +15,9 @@ alone has 107,671,171 parameters. Frame-budget limits can reduce the actual batc
 The tested `facebook/dacvae-watermarked` checkpoint is 48 kHz, 128 channels,
 25 latent frames/s; the adapter probes these properties instead of assuming them.
 
-The [Turkish architecture and quality research report](arastirma-raporu-2026-09-24.md)
+The [architecture and quality research report](research-report-2026-09-24.md) for the Turkish model
 reviews every block, layer and training technique against the 2024–2026 literature, with
-the evidence for each decision, and the [roadmap](yol-haritasi.md) links the resulting
+the evidence for each decision, and the [roadmap](roadmap.md) links the resulting
 GitHub issues. Core capabilities:
 
 - Parallel conditional flow generation with cross-attention to English byte text.
@@ -157,7 +157,7 @@ keep the partition directories and mount them at the same paths on every node.
 ## Nano recipe (`configs/nano.yaml`)
 
 `configs/nano.yaml` is a 49.9M-parameter configuration whose choices are reviewed in
-[the research report](arastirma-raporu-2026-09-24.md); every option is off in the Tiny/Small
+[the research report](research-report-2026-09-24.md); every option is off in the Tiny/Small
 configs, so the earlier baselines are untouched.
 
 - **No speaker labels needed.** `train.pairing: within` cuts the voice prompt from the start of the
@@ -248,7 +248,7 @@ separately) with AdamW for embeddings, convolution filters, boundary projections
 biases and gains. Its updates are RMS-matched to AdamW, so `learning_rate` and `weight_decay` keep
 their meaning. `train.optimizer: adamw` or `--optimizer adamw` restores the previous plain AdamW.
 Muon has not been compared against AdamW on real speech metrics here; the small-scale loss
-comparison is summarized in [the research report](arastirma-raporu-2026-09-24.md) (§3.7, §9).
+comparison is summarized in [the research report](research-report-2026-09-24.md) (§3.7, §9).
 Post-training reuses the optimizer recorded in the checkpoint unless `--optimizer` is passed.
 
 Tiny defaults to 16 pairs/GPU × 2 accumulation × 8 GPUs; small uses 8 × 4 × 8.

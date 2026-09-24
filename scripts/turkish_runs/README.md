@@ -1,6 +1,6 @@
 # Launchers of the Turkish runs (Vast.ai instance, 2x RTX 4090)
 
-The exact commands behind the runs in `docs/turkce-arastirma-2026-09-22.md` (paths refer to `/workspace`; credentials come
+The exact commands behind the runs in `docs/turkish-experiments-2026-09-22.md` (paths refer to `/workspace`; credentials come
 from `/workspace/.env`, which is not part of the repository):
 
 - `run_pilot.sh`, `run_pilot_monitor.sh`: 4-shard pilot, monitor, codec/ASR ceiling and corpus re-transcription.

@@ -1,4 +1,4 @@
-"""Pre-generate the showcase samples of the Space (Örnekler tab) with the default settings of a running app.
+"""Pre-generate the showcase samples of the Space (Samples tab) with the default settings of a running app.
 
   python make_samples.py http://127.0.0.1:7861
 """
@@ -34,13 +34,13 @@ def main():
             if (v + s) % 3 == 2:  # two sentences per voice keep the tab short
                 continue
             audio, info, normalized, metrics, _, _ = client.predict(
-                handle_file(str(SPACE / example["audio"])), example["text"], sentence, "Otomatik (önerilen)", 15,
-                candidates, 42 + s, True, "w512-clean 60k · yayımlanan (Freya WER %4,3)", "", "", "dataset",
-                5.0, 32, "CFG (en düşük WER)", 0.7, 0.5, 3.0, 1.0, 1.0, "Otomatik", api_name="/synthesize")
-            name = f"ses{v + 1}-cumle{s + 1}.wav"
+                handle_file(str(SPACE / example["audio"])), example["text"], sentence, "Automatic (recommended)", 15,
+                candidates, 42 + s, True, "w512-clean 60k · published (Freya WER 4.3 %)", "", "", "dataset",
+                5.0, 32, "CFG (lowest WER)", 0.7, 0.5, 3.0, 1.0, 1.0, "Automatic", api_name="/synthesize")
+            name = f"voice{v + 1}-sentence{s + 1}.wav"
             shutil.copy(audio, out / name)
-            label = (f"Ses {v + 1} · “{sentence}” · WER {metrics.get('wer', float('nan')):.2f}, "
-                     f"benzerlik {metrics.get('similarity', float('nan')):.2f}")
+            label = (f"Voice {v + 1} · “{sentence}” · WER {metrics.get('wer', float('nan')):.2f}, "
+                     f"similarity {metrics.get('similarity', float('nan')):.2f}")
             rows.append({"audio": f"samples/{name}", "label": label, "text": sentence, "voice": example["audio"],
                          "metrics": {k: metrics.get(k) for k in ("wer", "cer", "similarity", "dnsmos_ovrl", "seconds")}})
             print(label, flush=True)
