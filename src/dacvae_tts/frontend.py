@@ -1,10 +1,10 @@
-"""Turkish text frontend for synthesis: free user text -> text that `turkish-v1` accepts, and sentence chunks.
+"""Turkish text frontend for synthesis: free user text -> text the Turkish normalizations accept, and sentence chunks.
 
-`turkish.normalize_turkish` (version `turkish-v1`) is the training normalization: it spells out numbers and rejects
-every character the byte model never saw. Text typed into a demo is messier: currency and unit symbols, dates and
-clock times written with dots, abbreviations, acronyms, e-mail addresses, emoji and foreign letters. `prepare_text`
-rewrites these into spoken Turkish words first and drops what cannot be spoken, reporting every change, so that
-synthesis never fails on a stray symbol. Plain Turkish sentences pass through unchanged.
+`turkish.normalize_turkish` (versions `turkish-v1`, `turkish-v2`) is the training normalization: it spells out numbers
+and rejects every character the byte model never saw. Text typed into a demo is messier: currency and unit symbols,
+dates and clock times written with dots, abbreviations, acronyms, e-mail addresses, emoji and foreign letters.
+`prepare_text` rewrites these into spoken Turkish words first and drops what cannot be spoken, reporting every change,
+so that synthesis never fails on a stray symbol. Plain Turkish sentences pass through unchanged.
 
 `split_sentences` cuts long text into sentence-based chunks short enough for the model (training utterances were at
 most ~20 s including the voice prompt).
@@ -14,7 +14,16 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 
-from .turkish import LATIN_EXTRA, PUNCTUATION, ordinal_words, tr_lower
+from .turkish import (
+    ABBREVIATIONS,
+    LATIN_EXTRA,
+    PUNCTUATION,
+    abbreviation_rules,
+    ordinal_words,
+    tr_lower,
+    tr_title,
+    tr_upper,
+)
 
 LETTERS = "a-zA-ZçğıöşüâîûÇĞİÖŞÜÂÎÛ"
 UPPER = "A-ZÇĞİÖŞÜÂÎÛ"
@@ -36,15 +45,6 @@ SPOKEN_ACRONYMS = {
     "GIF": "gif", "JPEG": "jipeg", "LAN": "lan", "WAN": "van", "PDF": "pe de fe", "USB": "u se be",
     "NBA": "en bi ey", "BBC": "bi bi si", "CNN": "si en en", "FBI": "ef bi ay", "CIA": "si ay ey",
     "AI": "ey ay", "OK": "okey", "TV": "te ve", "DJ": "di cey", "PC": "pe ce", "CEO": "si i o",
-}
-ABBREVIATIONS = {
-    "Dr.": "doktor", "Prof.": "profesör", "Doç.": "doçent", "Yrd.": "yardımcı", "Av.": "avukat", "Uzm.": "uzman",
-    "Op.": "operatör", "Arş.": "araştırma", "Gör.": "görevlisi", "Öğr.": "öğretim", "Sn.": "sayın", "Hz.": "hazreti",
-    "Müh.": "mühendis", "Mah.": "mahallesi", "Cad.": "caddesi", "Sok.": "sokağı", "Apt.": "apartmanı",
-    "Blv.": "bulvarı", "Tel.": "telefon", "No.": "numara",
-    "vb.": "ve benzeri", "vs.": "vesaire", "vd.": "ve diğerleri", "örn.": "örneğin", "bkz.": "bakınız",
-    "yy.": "yüzyıl", "yak.": "yaklaşık", "ort.": "ortalama", "maks.": "maksimum", "mah.": "mahallesi",
-    "cad.": "caddesi", "sok.": "sokağı", "apt.": "apartmanı", "tel.": "telefon", "no.": "numara",
 }
 UNITS = {
     "km/sa": "kilometre", "km/s": "kilometre", "km/h": "kilometre",
@@ -69,15 +69,6 @@ FOREIGN = {"č": "ç", "ć": "ç", "Č": "Ç", "Ć": "Ç", "š": "ş", "ś": "ş
            "đ": "d", "Đ": "D", "ð": "d", "þ": "t", "ə": "e", "Ə": "E"}
 # `%` stays: turkish-v1 reads it next to a number (%50 -> yüzde elli); a lone % is rewritten before the final filter.
 ALLOWED = set(PUNCTUATION) | LATIN_EXTRA | set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 %")
-
-
-def tr_upper(text):
-    """Turkish upper-casing: i -> İ and ı -> I before the generic upper-casing."""
-    return text.replace("i", "İ").replace("ı", "I").upper()
-
-
-def tr_title(word):
-    return tr_upper(word[:1]) + tr_lower(word[1:])
 
 
 @dataclass
@@ -124,6 +115,8 @@ def harmonize(stem, suffix):
 
     "TL'dir" is harmonized to the spoken acronym ("te le"); once TL becomes "lira" the suffix must follow "lira":
     harmonize("lira", "dir") -> "dır", harmonize("dolar", "yi") -> "ı", harmonize("avro", "dan") -> "dan".
+    A suffix written for a number ("€4'e", written for "dört") gets the buffer a vowel-final stem needs:
+    harmonize("avro", "e") -> "ya", harmonize("lira", "ün") -> "nın" (genitive), harmonize("avro", "ü") -> "yu".
     """
     stem_lower = tr_lower(stem)
     vowels = [c for c in stem_lower if c in "aeıioöuü"]
@@ -132,6 +125,8 @@ def harmonize(stem, suffix):
     suffix = tr_lower(suffix)
     if stem_lower[-1] not in "aeıioöuü" and len(suffix) > 1 and suffix[0] in "yns" and suffix[1] in "aeıioöuü":
         suffix = suffix[1:]  # buffer consonants only follow vowel-final stems: dolar + (y)ı
+    elif stem_lower[-1] in "aeıioöuü" and suffix[:1] in "aeıioöuü" and suffix:
+        suffix = ("n" if re.fullmatch("[ıiuü]n", suffix) else "y") + suffix  # avro + (y)a, lira + (n)ın
     for index, c in enumerate(suffix):
         if c in "ae":
             c = "a" if last in "aıou" else "e"
@@ -220,15 +215,18 @@ def prepare_text(text):
     text = r.sub(r"((?:[Ss]aat\s+))(\d{1,2})[.](\d{2})\b(?![.,:]\d)", clock, text, "saat")
     text = r.sub(r"()(?<![\d.,])([01]?\d|2[0-3])[.](\d{2})(?=['’][" + LETTERS + r"])", clock, text, "saat")
     # Currency: symbols before or after the amount, and currency codes after it.
+    # A suffix after the amount was written for the number and moves to the currency word: $4'e -> 4 dolara.
+    def amount(m, word):
+        return f"{m.group(1)} {word}" + (harmonize(word, m.group(2)) if m.group(2) else "")
+
+    suffix = rf"(?:['’]([{LETTERS}]+))?"
     for symbol, word in CURRENCY_SYMBOLS.items():
         s = re.escape(symbol)
-        text = r.sub(rf"{s}\s?(\d+(?:[.,]\d+)*)", rf"\1 {word}", text, "para birimi")
-        text = r.sub(rf"(\d+(?:[.,]\d+)*)\s?{s}", rf"\1 {word}", text, "para birimi")
+        text = r.sub(rf"{s}\s?(\d+(?:[.,]\d+)*){suffix}", lambda m, w=word: amount(m, w), text, "para birimi")
+        text = r.sub(rf"(\d+(?:[.,]\d+)*)\s?{s}{suffix}", lambda m, w=word: amount(m, w), text, "para birimi")
         text = r.sub(s, f" {word} ", text, "para birimi")
     for code, word in CURRENCY_CODES.items():
-        text = r.sub(rf"(\d+(?:[.,]\d+)*)\s?{code}\b(?:['’]([{LETTERS}]+))?",
-                     lambda m, w=word: f"{m.group(1)} {w}" + (harmonize(w, m.group(2)) if m.group(2) else ""),
-                     text, "para birimi")
+        text = r.sub(rf"(\d+(?:[.,]\d+)*)\s?{code}\b{suffix}", lambda m, w=word: amount(m, w), text, "para birimi")
     # Temperatures and angles.
     text = r.sub(r"(\d)\s?°\s?C\b", r"\1 derece", text, "sıcaklık")
     text = r.sub(r"(\d)\s?°\s?F\b", r"\1 fahrenhayt", text, "sıcaklık")
@@ -267,13 +265,9 @@ def prepare_text(text):
     text = r.sub(r"\b([IVXLC]{1,7})\.(?=\s+[" + LETTERS + r"])()", roman, text, "Roma rakamı")
     text = r.sub(r"\b([IVXLC]{1,7})\.?( yüzyıl)", roman, text, "Roma rakamı")
     # Abbreviations with a period; keep a sentence end when the abbreviation closes the text.
-    for abbreviation, word in sorted(ABBREVIATIONS.items(), key=lambda item: -len(item[0])):
-        a = re.escape(abbreviation)
-        word = tr_title(word) if abbreviation[0].isupper() else word  # "Dr. Ahmet" -> "Doktor Ahmet"
-        text = r.sub(rf"(?<![{LETTERS}]){a}(?=\s*$)", word + ".", text, "kısaltma")
-        if abbreviation[0].islower():  # "armut vs. Sonra" keeps its sentence end; "Dr. Ahmet" does not
-            text = r.sub(rf"(?<![{LETTERS}]){a}(?=\s+[{UPPER}])", word + ".", text, "kısaltma")
-        text = r.sub(rf"(?<![{LETTERS}]){a}", word, text, "kısaltma")
+    # "Dr. Ahmet" -> "Doktor Ahmet"; "armut vs. Sonra" keeps its sentence end; T.C. -> te ce, A.Ş. -> anonim şirketi.
+    for pattern, word in abbreviation_rules(ABBREVIATIONS):
+        text = r.sub(pattern, word, text, "kısaltma")
     # Letters glued to digits (5G, 3D, Q3, A4, H2O, COVID-19): split, and spell a single capital letter.
     text = r.sub(rf"(?<![{LETTERS}])([{UPPER}])(?=\d)", lambda m: LETTER_NAMES.get(m.group(1), m.group(1)) + " ", text, "harf")
     text = r.sub(rf"(?<=[{LETTERS}])-(?=\d)", " ", text, "tire")
@@ -308,6 +302,9 @@ def prepare_text(text):
             out.append(FOREIGN[c])
             r.changes.append(f"yabancı harf: {c!r} → {FOREIGN[c]!r}")
             continue
+        if unicodedata.category(c) == "Mn":  # a mark NFKC could not attach: "i̇stanbul" from a non-Turkish lower()
+            r.changes.append(f"birleşik işaret çıkarıldı: U+{ord(c):04X}")
+            continue
         base = "".join(b for b in unicodedata.normalize("NFKD", c) if unicodedata.category(b) != "Mn")
         if base and all(b in ALLOWED for b in base):
             out.append(base)
@@ -329,15 +326,23 @@ def prepare_text(text):
     return PreparedText(text, r.changes)
 
 
-def speakable(text):
-    """prepare_text + turkish-v1 normalization; returns (normalized text, changes). Raises only on empty text."""
+def speakable(text, version="turkish-v2"):
+    """prepare_text + Turkish normalization; returns (normalized text, changes). Raises only on empty text.
+
+    The default `turkish-v2` spells numbers with Turkish consonant softening (4'e -> dörde, %4'ü -> yüzde dördü,
+    2024'e -> iki bin yirmi dörde). Its output is plain words and punctuation that `turkish-v1` and `turkish-v2`
+    both re-normalize unchanged, so it is the right input for checkpoints of either version; "turkish-v1"
+    reproduces the old spelling (dörte).
+    """
     from .text import normalize
 
+    if version not in {"turkish-v1", "turkish-v2"}:
+        raise ValueError(f"Unsupported frontend normalization: {version}")
     prepared = prepare_text(text)
     candidate = prepared.text
     for _ in range(8):
         try:
-            return normalize(candidate, "turkish-v1"), prepared.changes
+            return normalize(candidate, version), prepared.changes
         except ValueError as error:
             match = re.search(r"'(.)'", str(error))
             if not match or "Empty" in str(error):

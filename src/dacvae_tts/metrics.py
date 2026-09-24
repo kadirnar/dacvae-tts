@@ -19,6 +19,10 @@ def metric_text(text, version="english-unicode-v2"):
         from .turkish import metric_text_turkish
 
         return metric_text_turkish(text)
+    if version == "turkish-v2":  # opt-in; turkish-v1 stays the default for Turkish so scores remain comparable
+        from .turkish import metric_text_turkish_v2
+
+        return metric_text_turkish_v2(text)
     text = unicodedata.normalize("NFKC", text).lower().replace("’", "'")
     if version == "legacy-ascii-v1":
         text = re.sub(r"[^a-z0-9'\s]", " ", text)
