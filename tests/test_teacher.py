@@ -515,3 +515,17 @@ def test_extraction_script_runs_with_fake_models(cache, monkeypatch, capsys):
     merged = script.main(["merge", "--output", str(speakers), "--cache", str(cache)])
     assert merged["rows"] == 12 and merged["embedder"] == "speechbrain" and merged["kind"] == "speaker"
     assert '"kind": "speaker"' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("name", ["repa", "tla", "repa_tla"])
+def test_example_configs_differ_from_w512_only_in_teacher_options(name):
+    root = Path(__file__).resolve().parents[1] / "configs"
+    base = Config.load(root / "nano_tr_w512.yaml")
+    cfg = Config.load(root / "experiments" / f"tr_w512_{name}.yaml")
+    teacher = {"repa_layer", "repa_dim", "tla_layers", "tla_dim", "tla_hidden"}
+    teacher |= {"teacher_features", "repa_weight", "repa_stop_step", "repa_frames"}
+    teacher |= {"speaker_embeddings", "tla_weight", "tla_entropy"}
+    for part in ("model", "train"):
+        changed = {k for k, v in vars(getattr(cfg, part)).items() if getattr(getattr(base, part), k) != v}
+        assert changed and changed <= teacher, changed
+    assert (cfg.train.repa_weight > 0) == ("repa" in name) and (cfg.train.tla_weight > 0) == ("tla" in name)
