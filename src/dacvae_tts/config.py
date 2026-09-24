@@ -119,6 +119,10 @@ class TrainConfig:
     # UTMOS 3.70 -> 3.82, WER flat (2.86 -> 2.93).
     final_time_sampling: object = None  # null, uniform or logit_normal
     final_time_sampling_start: object = "decay"
+    # More EMA tracks, saved next to `ema` (which keeps `ema_decay`) as `ema_<decay>`, validated and loadable
+    # with load_model(..., ema=<decay>). The best EMA length depends on the run and on CFG (EDM2,
+    # arXiv:2312.02696); 0.9999 is too slow for <15k-update fine-tunes. `ema_decay` itself may be listed.
+    ema_decays: list = field(default_factory=list)
 
     def __post_init__(self):
         if self.worker_threads < 1 or self.prefetch_factor < 1:
@@ -178,6 +182,12 @@ class TrainConfig:
             raise ValueError("final_time_sampling: null, uniform or logit_normal; start: decay or in (0,1)")
         if self.final_time_sampling is not None and start == "decay" and self.lr_schedule != "wsd":
             raise ValueError("final_time_sampling_start: decay needs lr_schedule: wsd; give a fraction")
+        if (
+            not isinstance(self.ema_decays, list)
+            or len(set(self.ema_decays)) != len(self.ema_decays)
+            or not all(isinstance(d, float) and 0 <= d < 1 for d in self.ema_decays)
+        ):
+            raise ValueError("ema_decays must be a list of distinct decays in [0,1)")
 
 
 @dataclass

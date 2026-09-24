@@ -19,10 +19,14 @@ from dacvae_tts.model import FlowTTS
 from dacvae_tts.training import (
     decay_phase_loader,
     decay_start,
+    ema_key,
+    ema_tracks,
+    export_ema,
     load_model,
     lr_multiplier,
     schedule_multiplier,
     time_sampling_at,
+    weights_key,
 )
 
 CONFIGS = Path(__file__).resolve().parents[1] / "configs"
@@ -35,7 +39,7 @@ NEW_FIELDS = {
     "model": ("dropout",),
     "train": (
         "lr_schedule", "decay_fraction", "decay_shape", "min_lr_ratio", "decay_cache", "final_time_sampling",
-        "final_time_sampling_start",
+        "final_time_sampling_start", "ema_decays",
     ),
 }
 TINY = {"latent_dim": 4, "width": 16, "depth": 1, "heads": 2, "text_depth": 1}
@@ -161,12 +165,13 @@ def test_old_configurations_compare_equal_for_resume():
 def test_old_checkpoints_load_and_resume_exactly(cache, tmp_path):
     config = config_file(tmp_path, steps=4)
     full = run(config, cache, tmp_path / "full")
+    assert not any(k.startswith("ema_") for k in full)
     run(config, cache, tmp_path / "old", stop_after=2)
     path = tmp_path / "old" / "last.pt"
     saved = torch.load(path, weights_only=True)
     saved["config"] = as_before_issue_14(saved["config"])
     torch.save(saved, path)
-    for ema in (True, False):
+    for ema in (True, False, 0.999, "ema"):
         load_model(path, ema=ema)
     resumed = run(config, cache, tmp_path / "old", resume=str(path))
     for key in full["model"]:
@@ -198,8 +203,8 @@ def test_decay_loader_checks_the_codec_and_keeps_the_main_normalization(cache, d
 
 
 def test_options_resume_exactly_across_the_decay_switch(cache, decay_cache, tmp_path, monkeypatch):
-    """WSD + decay cache + uniform-t cooldown + dropout, interrupted before, exactly at and after the decay
-    start (update 3 of 6), must equal the uninterrupted run."""
+    """WSD + decay cache + uniform-t cooldown + dropout + an EMA track, interrupted before, exactly at and
+    after the decay start (update 3 of 6), must equal the uninterrupted run."""
     calls = []
     original = training.flow_loss
 
@@ -211,11 +216,12 @@ def test_options_resume_exactly_across_the_decay_switch(cache, decay_cache, tmp_
     config = config_file(
         tmp_path, model={**TINY, "dropout": 0.1}, lr_schedule="wsd", decay_fraction=0.5, decay_shape="1-sqrt",
         min_lr_ratio=0.0, decay_cache=str(decay_cache), time_sampling="logit_normal",
-        final_time_sampling="uniform",
+        final_time_sampling="uniform", ema_decays=[0.2],
     )
     full = run(config, cache, tmp_path / "full", no_validation=True)
     assert calls == ["logit_normal"] * 6 + ["uniform"] * 6  # two micro-batches per update
     assert full["batch_offset"] == 3  # 6 decay-phase batches from a 3-batch subset: the switch happened
+    assert "ema_0.2" in full
     records = [json.loads(line) for line in (tmp_path / "full" / "train.jsonl").read_text().splitlines()]
     decay = [1.0, 1 - (1 / 3) ** 0.5, 1 - (2 / 3) ** 0.5]
     assert [r["lr"] for r in records] == pytest.approx([3e-4 * m for m in [1.0, 1.0, 1.0, *decay]])
@@ -225,7 +231,7 @@ def test_options_resume_exactly_across_the_decay_switch(cache, decay_cache, tmp_
         resumed = run(config, cache, output, no_validation=True, resume=str(output / "last.pt"), stop_after=stop)
     assert resumed["step"] == 6
     for key in full["model"]:
-        for weights in ("model", "ema"):
+        for weights in ("model", "ema", "ema_0.2"):
             assert torch.equal(full[weights][key], resumed[weights][key]), (weights, key)
 
 
@@ -304,3 +310,49 @@ def test_warm_start_may_switch_dropout_but_nothing_else(cache, tmp_path):
 def test_regularization_configuration_guards():
     with pytest.raises(ValueError):
         ModelConfig(dropout=1.0)
+    for fields in (dict(ema_decays=[0.999, 0.999]), dict(ema_decays=[1.0]), dict(ema_decays=0.999)):
+        with pytest.raises(ValueError):
+            TrainConfig(**fields)
+    TrainConfig(ema_decays=[0.999, 0.9995])
+
+
+# ---------------------------------------------------------------------------------------------- EMA tracks
+
+
+def test_ema_keys_and_selection():
+    assert ema_key(0.999) == "ema_0.999" and ema_key(0.9995) == "ema_0.9995"
+    train = TrainConfig(ema_decay=0.9999, ema_decays=[0.9999, 0.999, 0.9995])
+    assert ema_tracks(train) == {"ema_0.999": 0.999, "ema_0.9995": 0.9995}
+    assert ema_tracks(TrainConfig()) == {}
+    checkpoint = {"config": Config(train=train).to_dict(), "model": 0, "ema": 1, "ema_0.999": 2}
+    assert weights_key(checkpoint) == "ema" and weights_key(checkpoint, False) == "model"
+    assert weights_key(checkpoint, 0.9999) == "ema" and weights_key(checkpoint, "0.9999") == "ema"
+    assert weights_key(checkpoint, 0.999) == weights_key(checkpoint, "ema_0.999") == "ema_0.999"
+    with pytest.raises(KeyError, match="ema_0.999"):
+        weights_key(checkpoint, 0.99)
+
+
+def test_extra_ema_track_matches_a_run_with_that_decay(cache, tmp_path):
+    """The track is updated exactly like the primary EMA: a run whose `ema_decay` is the track's decay
+    reproduces it bit for bit. Tracks are saved, kept, validated, selectable and exportable. (Decays this
+    short leave the warm-up min(decay, (1 + step) / (10 + step)) within six updates.)"""
+    tracked = run(config_file(tmp_path, "a.yaml", ema_decay=0.2, ema_decays=[0.2, 0.3], keep_every=3),
+                  cache, tmp_path / "tracked")
+    single = run(config_file(tmp_path, "b.yaml", ema_decay=0.3), cache, tmp_path / "single")
+    assert set(tracked) - set(single) == {"ema_0.3"}
+    for key in single["model"]:
+        assert torch.equal(tracked["model"][key], single["model"][key]), key
+        assert torch.equal(tracked["ema_0.3"][key], single["ema"][key]), key
+    assert any(not torch.equal(tracked["ema"][k], tracked["ema_0.3"][k]) for k in single["model"])
+    assert "ema_0.3" in torch.load(tmp_path / "tracked" / "step-0000003.pt", weights_only=True)
+    records = [json.loads(line) for line in (tmp_path / "tracked" / "train.jsonl").read_text().splitlines()]
+    validations = [r for r in records if "validation_flow" in r]
+    assert len(validations) == 3 and all(math.isfinite(r["ema_0_3/validation_flow"]) for r in validations)
+    track, _ = load_model(tmp_path / "tracked" / "last.pt", ema=0.3)
+    assert all(torch.equal(v, tracked["ema_0.3"][k]) for k, v in track.state_dict().items())
+    primary, _ = load_model(tmp_path / "tracked" / "last.pt", ema=0.2)
+    assert all(torch.equal(v, tracked["ema"][k]) for k, v in primary.state_dict().items())
+    export_ema(tmp_path / "tracked" / "last.pt", "0.3", tmp_path / "exported.pt")
+    exported, saved = load_model(tmp_path / "exported.pt")
+    assert saved["exported_ema"] == "ema_0.3" and "optimizer" not in saved and "ema_0.3" not in saved
+    assert all(torch.equal(v, tracked["ema_0.3"][k]) for k, v in exported.state_dict().items())

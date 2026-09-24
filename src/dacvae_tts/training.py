@@ -152,12 +152,48 @@ def atomic_save(obj, path):
     os.replace(temporary, path)
 
 
+def ema_key(decay):
+    """Checkpoint key of an extra EMA track, e.g. ema_0.999 (shortest round-trip float spelling)."""
+    return f"ema_{float(decay)!r}"
+
+
+def ema_tracks(train):
+    """Extra EMA tracks {checkpoint key: decay}; `ema_decay` itself always stays under `ema`."""
+    return {ema_key(decay): decay for decay in train.ema_decays if decay != train.ema_decay}
+
+
+def weights_key(checkpoint, ema=True):
+    """Checkpoint entry for `ema`: True -> "ema", False -> "model", a decay (0.999 or "0.999") or a key
+    ("ema_0.999") -> that EMA track; the primary decay maps to "ema"."""
+    if ema is True or ema is False:
+        return "ema" if ema else "model"
+    key = ema if str(ema).startswith("ema") else ema_key(float(ema))
+    if key == ema_key(Config.from_dict(checkpoint["config"]).train.ema_decay):
+        key = "ema"
+    if key not in checkpoint:
+        tracks = sorted(k for k in checkpoint if k == "ema" or k.startswith("ema_"))
+        raise KeyError(f"Checkpoint has no {key}; available weights: model, {', '.join(tracks)}")
+    return key
+
+
 def load_model(path, device="cpu", ema=True):
+    """`ema`: True loads the primary EMA, False the raw weights, a decay or key one of `train.ema_decays`."""
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     cfg = Config.from_dict(checkpoint["config"])
     model = FlowTTS(cfg.model)
-    model.load_state_dict(checkpoint["ema"] if ema else checkpoint["model"])
+    model.load_state_dict(checkpoint[weights_key(checkpoint, ema)])
     return model.to(device).eval(), checkpoint
+
+
+def export_ema(path, ema, output):
+    """Optimizer-free copy of a checkpoint whose `ema` holds another EMA track, for the evaluation tools
+    that load the default EMA (monitor, eval scripts, demo)."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    key = weights_key(checkpoint, ema)
+    dropped = {"optimizer", "rng"}
+    result = {k: v for k, v in checkpoint.items() if k not in dropped and not k.startswith("ema_")}
+    result.update(ema=checkpoint[key], exported_ema=key)
+    atomic_save(result, output)
 
 
 def decay_start(steps, decay_fraction):
@@ -389,6 +425,7 @@ def train(args):
         model = FlowTTS(cfg.model).to(device)
         model.grad_checkpoint = cfg.train.grad_checkpoint
         ema = copy.deepcopy(model).eval().requires_grad_(False)
+        averages = {key: (decay, copy.deepcopy(ema)) for key, decay in ema_tracks(cfg.train).items()}
         optimizer = build_optimizer(
             model,
             cfg.train.optimizer,
@@ -415,6 +452,8 @@ def train(args):
                 raise ValueError("Resume requires the same cache path and frame budget")
             model.load_state_dict(saved["model"])
             ema.load_state_dict(saved["ema"])
+            for key, (_, average) in averages.items():
+                average.load_state_dict(saved[key])
             optimizer.load_state_dict(saved["optimizer"])
             start_step, epoch, batch_offset = saved["step"], saved["epoch"], saved["batch_offset"]
             restore_rng(saved["rng"][rank], device)
@@ -429,6 +468,8 @@ def train(args):
                     raise ValueError("--init-from requires an identical model configuration (except dropout)")
                 model.load_state_dict(warm["model"])
                 ema.load_state_dict(warm["ema"])
+                for key, (_, average) in averages.items():
+                    average.load_state_dict(warm.get(key, warm["ema"]))
             torch.manual_seed(cfg.train.seed + rank)
             random.seed(cfg.train.seed + rank)
         objective = Objective(
@@ -636,6 +677,9 @@ def train(args):
                 # Warm-up keeps the average from being dominated by the random initialization.
                 decay = min(cfg.train.ema_decay, (1 + step) / (10 + step))
                 torch._foreach_lerp_(list(ema.parameters()), list(model.parameters()), 1 - decay)
+                for track_decay, average in averages.values():
+                    decay = min(track_decay, (1 + step) / (10 + step))
+                    torch._foreach_lerp_(list(average.parameters()), list(model.parameters()), 1 - decay)
             if (step + 1) % cfg.train.log_every == 0 or step == start_step or diagnose:
                 if world > 1:
                     dist.all_reduce(metrics)
@@ -677,6 +721,17 @@ def train(args):
                     reduction=cfg.train.flow_reduction,
                     duration_weight=cfg.train.duration_weight,
                 )
+                for key, (_, average) in averages.items():
+                    extra = validate(
+                        average,
+                        validation,
+                        device,
+                        cfg.train.precision,
+                        reduction=cfg.train.flow_reduction,
+                        duration_weight=cfg.train.duration_weight,
+                    )
+                    label = key.replace(".", "_")  # dots are W&B's nested-key separator
+                    val.update({f"{label}/{name}": value for name, value in extra.items()})
                 if rank == 0:
                     record = {"step": step + 1, **val}
                     print(json.dumps(record), flush=True)
@@ -716,6 +771,7 @@ def train(args):
                         "stage": "pretrain",
                         "init_from": getattr(args, "init_from", None),
                     }
+                    saved.update({key: average.state_dict() for key, (_, average) in averages.items()})
                     atomic_save(saved, out / "last.pt")
                     if keeping:
                         # Permanent, optimizer-free snapshot for later speech evaluation and selection.
