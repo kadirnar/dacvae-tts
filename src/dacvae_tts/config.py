@@ -31,6 +31,7 @@ class ModelConfig:
     value_residual: bool = False  # self-attention v_l <- l1 v_l + l2 v_1 (ResFormer); 2 scalars per block
     ffn_conv_kernel: int = 0  # odd k > 0: residual depthwise time conv on the FFN hidden units (5 suggested)
     attn_gate: str = "none"  # head: per-head 2*sigmoid output gate on generator self-/cross-attention
+    ffn_activation: str = "gelu"  # swiglu: generator FFN as SwiGLU at equal parameters (hidden 2/3 of GELU's)
 
     def __post_init__(self):
         if min(self.latent_dim, self.width, self.depth, self.heads, self.patch_size) < 1:
@@ -67,6 +68,8 @@ class ModelConfig:
             raise ValueError("ffn_conv_kernel must be 0 (off) or odd, so the convolution stays centred")
         if self.attn_gate not in {"none", "head"}:
             raise ValueError("attn_gate must be none or head")
+        if self.ffn_activation not in {"gelu", "swiglu"}:
+            raise ValueError("ffn_activation must be gelu or swiglu")
 
 
 @dataclass

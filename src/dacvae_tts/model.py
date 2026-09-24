@@ -138,6 +138,18 @@ class TextEncoder(nn.Module):
         return self.norm(x) * valid[..., None], valid
 
 
+class SwiGLU(nn.Module):
+    """silu(gate) * value from one fused projection; its two row halves are separate maps for Muon."""
+
+    def __init__(self, width, hidden):
+        super().__init__()
+        self.proj = nn.Linear(width, 2 * hidden)
+
+    def forward(self, x):
+        gate, value = self.proj(x).chunk(2, dim=-1)
+        return F.silu(gate) * value
+
+
 class Block(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -147,9 +159,15 @@ class Block(nn.Module):
         self.norm3 = nn.LayerNorm(d, elementwise_affine=False)
         self.self_attn = Attention(d, cfg.heads, cfg.qk_norm, cfg.attn_gate == "head")
         self.cross_attn = Attention(d, cfg.heads, cfg.qk_norm, cfg.attn_gate == "head")
-        self.ff = nn.Sequential(
-            nn.Linear(d, d * cfg.ff_mult), nn.GELU(approximate="tanh"), nn.Linear(d * cfg.ff_mult, d)
-        )
+        if cfg.ffn_activation == "swiglu":
+            # Equal parameters: hidden 2/3 of the GELU width, rounded to a multiple of 64 (1024 at 512 x 3).
+            # T5 and LightningDiT gain from GLUs; the 140M SR-DiT ablation was neutral: an A/B, not a default.
+            hidden = max(64, 64 * round(2 * d * cfg.ff_mult / 3 / 64))
+            self.ff = nn.Sequential(SwiGLU(d, hidden), nn.Linear(hidden, d))
+        else:
+            self.ff = nn.Sequential(
+                nn.Linear(d, d * cfg.ff_mult), nn.GELU(approximate="tanh"), nn.Linear(d * cfg.ff_mult, d)
+            )
         if cfg.adaln_rank:
             # Low-rank per-block correction on top of a modulation shared by every block
             # (PixArt-alpha / EzAudio SOLA / Echo-TTS style); the up projection starts at zero.

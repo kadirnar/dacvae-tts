@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from dacvae_tts.config import Config, ModelConfig
-from dacvae_tts.model import Attention, FlowTTS
+from dacvae_tts.model import Attention, Block, FlowTTS
 from dacvae_tts.optim import partition
 from dacvae_tts.training import Objective
 from tests.test_nano import NANO, nano_batch
@@ -17,7 +17,12 @@ OPTIONS = {
     "value_residual": dict(value_residual=True),
     "ffn_conv": dict(ffn_conv_kernel=5),
     "attn_gate": dict(attn_gate="head"),
+    "swiglu": dict(ffn_activation="swiglu"),
 }
+# Every option explicitly disabled: must be exactly the previous model.
+OFF = dict(
+    long_skip=False, value_residual=False, ffn_conv_kernel=0, attn_gate="none", ffn_activation="gelu"
+)
 # Options whose new parameters start at zero (or identity): the model starts as the baseline function.
 ZERO_INIT = ["long_skip", "value_residual", "ffn_conv", "attn_gate"]
 ALL = {key: value for option in OPTIONS.values() for key, value in option.items()}
@@ -83,8 +88,8 @@ def test_options_off_keep_the_previous_model(overrides, keys, layout, expected):
     assert len(model.state_dict()) == keys and layout_hash(model) == layout
     assert fingerprint(model) == pytest.approx(expected, rel=1e-5, abs=1e-5)
     # Explicitly disabled options are the default: an old checkpoint loads strictly.
-    off = {"long_skip": False, "value_residual": False, "ffn_conv_kernel": 0, "attn_gate": "none"}
-    FlowTTS(ModelConfig(**overrides, **off)).load_state_dict(model.state_dict(), strict=True)
+    assert OFF.keys() == ALL.keys() and all(getattr(ModelConfig(), k) == v for k, v in OFF.items())
+    FlowTTS(ModelConfig(**overrides, **OFF)).load_state_dict(model.state_dict(), strict=True)
 
 
 @pytest.mark.parametrize("name", ZERO_INIT)
@@ -140,18 +145,25 @@ def test_option_trains_with_checkpointing_and_ignores_padding(name):
     assert torch.allclose(full[0, :length], alone[0], atol=1e-5)
 
 
-def test_muon_partition_covers_the_new_parameters():
-    model = FlowTTS(ModelConfig(**BASE, **ALL))
+def split(model):
+    """Muon part counts and AdamW names; every trainable parameter lands in exactly one group."""
     matrices, parts, others = partition(model)
     names = {id(p): name for name, p in model.named_parameters()}
     assert sorted(names) == sorted(id(p) for p in (*matrices, *others))
     muon = {names[id(p)]: count for p, count in zip(matrices, parts, strict=True)}
-    adamw = {names[id(p)] for p in others}
+    return muon, {names[id(p)] for p in others}
+
+
+def test_muon_partition_covers_the_new_parameters():
+    muon, adamw = split(FlowTTS(ModelConfig(**BASE, **ALL)))
     assert muon["skip.1.weight"] == 1 and {"skip.0.weight", "skip.1.bias"} <= adamw  # hidden [D,2D] map
     assert "blocks.0.value_mix" in adamw  # two scalars
     assert {"blocks.0.ff_conv.weight", "blocks.1.ff_conv.bias"} <= adamw  # [H,1,k] filters
     assert {"blocks.0.self_attn.gate.weight", "blocks.1.cross_attn.gate.weight"} <= adamw  # [heads,D] heads
-    assert muon["blocks.0.ff.0.weight"] == 1 and muon["blocks.1.self_attn.kv.weight"] == 2
+    assert muon["blocks.0.ff.0.proj.weight"] == 2 and muon["blocks.0.ff.1.weight"] == 1  # SwiGLU gate | value
+    assert muon["blocks.1.self_attn.kv.weight"] == 2
+    gelu, _ = split(FlowTTS(ModelConfig(**{**BASE, **ALL, "ffn_activation": "gelu"})))
+    assert gelu["blocks.0.ff.0.weight"] == 1 and gelu["blocks.0.ff.2.weight"] == 1  # GELU: not a fused matrix
 
 
 def test_long_skip_fuses_the_input_embedding_before_the_output_head():
@@ -216,6 +228,19 @@ def test_head_gate_scales_each_attention_head():
         assert torch.allclose(closed, plain(x, x, valid), atol=1e-6)
     with pytest.raises(ValueError):
         ModelConfig(**BASE, attn_gate="elementwise")
+
+
+def test_swiglu_keeps_the_feed_forward_parameter_count():
+    w512 = Config.load("configs/nano_tr_w512.yaml").model
+    gelu, swiglu = Block(w512), Block(ModelConfig(**{**w512.__dict__, "ffn_activation": "swiglu"}))
+    assert swiglu.ff[0].proj.weight.shape == (2 * 1024, 512) and swiglu.ff[1].weight.shape == (512, 1024)
+    count = lambda module: sum(p.numel() for p in module.parameters())  # noqa: E731
+    assert count(swiglu.ff) - count(gelu.ff) == 512  # 2/3 of the GELU width: only the extra bias half differs
+    x = torch.randn(3, 512)
+    gate, value = swiglu.ff[0].proj(x).chunk(2, -1)
+    assert torch.allclose(swiglu.ff[0](x), torch.nn.functional.silu(gate) * value)
+    with pytest.raises(ValueError):
+        ModelConfig(**BASE, ffn_activation="relu")
 
 
 def test_example_configs_change_one_model_option_of_the_w512_recipe():
