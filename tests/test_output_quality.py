@@ -1,5 +1,6 @@
-"""Latent moment monitoring/matching and composite best-of-N selection (issue 13)."""
+"""Latent moment monitoring/matching, composite best-of-N selection and their synthesizer/CLI plumbing (issue 13)."""
 
+import argparse
 import warnings
 
 import numpy as np
@@ -121,3 +122,96 @@ def test_judge_overlap_flags_same_family_selection():
         warnings.simplefilter("always")
         overlap = warn_judge_overlap(rule, same_speaker, judge)
     assert "sim" in overlap and any("oracle" in str(w.message) for w in caught)
+
+
+class RecordingCodec:
+    calls = []
+
+    def __init__(self, checkpoint, device):
+        self.latent_dim, self.sample_rate, self.hop_length = 4, 24000, 512
+        self.metadata = dict(checkpoint="test-codec", sample_rate=24000, hop_length=512, latent_dim=4,
+                             posterior="mean", weights_sha256="fixture", preprocessing="fixture")
+
+    def decode(self, z, *args, **kwargs):
+        RecordingCodec.calls.append((args, kwargs))
+        if "stats" in kwargs:
+            kwargs["stats"].update(pre_tanh_gain=0.5, pre_tanh_mode=str(kwargs["pre_tanh_gain"]), pre_tanh_level=3.0)
+        return z.sum(-1).repeat_interleave(512)
+
+
+@pytest.fixture
+def synthesizer(monkeypatch, cache, tmp_path):
+    import dacvae_tts.inference as module
+    from dacvae_tts.config import Config, ModelConfig
+    from dacvae_tts.data import LatentDataset
+    from dacvae_tts.inference import Synthesizer
+    from dacvae_tts.model import FlowTTS
+
+    data = LatentDataset(cache)
+    config = Config(ModelConfig(latent_dim=4, width=16, depth=1, heads=2, text_depth=1, text_layout="joined",
+                                duration="rule", positions="rope", prediction="edm"))
+    path = tmp_path / "model.pt"
+    model = FlowTTS(config.model)
+    torch.save({"model": model.state_dict(), "ema": model.state_dict(), "config": config.to_dict(),
+                "codec": {**data.meta, "text_normalization": "turkish-v1"}, "mean": data.mean, "std": data.std}, path)
+    monkeypatch.setattr(module, "Codec", RecordingCodec)
+    RecordingCodec.calls = []
+    return Synthesizer(path, device="cpu", precision="fp32")
+
+
+def test_synthesizer_output_options_and_windows(synthesizer):
+    from dacvae_tts.inference import VoiceReference
+
+    voice = VoiceReference(torch.randn(40, 4), "Referans cümlesi burada.", "test", {})
+    plain = synthesizer.synthesize("Merhaba dünya.", reference=voice, steps=2, guidance=2.0)
+    assert RecordingCodec.calls == [((), {})]  # the default decode call is exactly the previous one
+    assert set(plain.metadata["latent_moments"]) >= {"std_ratio_mean", "kurtosis_generated"}
+    assert plain.metadata["guidance_split"] is None and plain.metadata["late_window"] is None
+    shaped = synthesizer.synthesize("Merhaba dünya.", reference=voice, steps=4, guidance=2.0, guidance_split=0.5,
+                                    apg_eta_late=0.5, moment_match="std", pre_tanh_gain="auto")
+    assert RecordingCodec.calls[-1][1]["pre_tanh_gain"] == "auto"
+    assert shaped.metadata["pre_tanh_gain"] == 0.5 and shaped.metadata["moment_match"] == "std"
+    assert shaped.metadata["late_window"]["eta"] == 0.5
+    assert not torch.equal(shaped.audio, plain.audio)
+    with pytest.raises(ValueError, match="moment_match"):
+        synthesizer.synthesize("Merhaba.", reference=voice, steps=1, moment_match="rms")
+    with pytest.raises(TypeError):
+        synthesizer.synthesize("Merhaba.", reference=voice, steps=1, loudness=3)
+
+
+def test_synthesize_many_selector_hook(synthesizer):
+    from dacvae_tts.inference import VoiceReference
+
+    voice = VoiceReference(torch.randn(40, 4), "Referans cümlesi burada.", "test", {})
+    texts = ["Merhaba dünya.", "İkinci cümle."]
+    seen = []
+
+    def selector(text, audios, sample_rate):
+        seen.append((text, len(audios), sample_rate))
+        scores = [dict(dnsmos=float(i == 1 + len(seen) % 2)) for i in range(len(audios))]
+        return rank_candidates(scores, parse_select_by("dnsmos"))[0], scores
+
+    results, metadata = synthesizer.synthesize_many(texts, voice, candidates=3, steps=2, guidance=2.0,
+                                                    selector=selector, moment_match="meanstd")
+    assert seen == [(texts[0], 3, 24000), (texts[1], 3, 24000)]
+    assert metadata["selected"] == [2, 1] and metadata["moment_match"] == "meanstd"
+    assert results[0][2]["selection"] == {"dnsmos": 1.0} and "latent_moments" in results[1][0]
+    plain, metadata = synthesizer.synthesize_many(texts, voice, candidates=1, steps=2, guidance=2.0)
+    assert "selected" not in metadata and "moment_match" not in metadata
+
+
+def test_cli_parses_output_quality_options():
+    from dacvae_tts.cli import add_inference_args
+
+    parser = argparse.ArgumentParser()
+    add_inference_args(parser)
+    base = ["--checkpoint", "c.pt", "--output", "o.wav"]
+    args = parser.parse_args(base)
+    assert args.guidance_split is None and args.pre_tanh_gain is None and args.moment_match is None
+    args = parser.parse_args(base + ["--guidance-split", "0.5", "--apg-eta-late", "0.5", "--apg-momentum-late",
+                                     "-0.3", "--pre-tanh-gain", "auto:0.9", "--moment-match", "std"])
+    assert (args.guidance_split, args.apg_eta_late, args.apg_momentum_late) == (0.5, 0.5, -0.3)
+    assert args.pre_tanh_gain == "auto:0.9" and args.moment_match == "std"
+    assert parser.parse_args(base + ["--pre-tanh-gain", "0.6"]).pre_tanh_gain == 0.6
+    with pytest.raises(SystemExit):
+        parser.parse_args(base + ["--pre-tanh-gain", "loud"])

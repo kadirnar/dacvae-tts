@@ -11,12 +11,19 @@ from .codec import Codec, backend_options, check_compatibility, normalize_loudne
 from .contracts import normalization_stats, target_mask
 from .duration import DurationPredictor, auto_mode, clamp_scale, rule_frames
 from .model import sample, text_only_rows
+from .quality import MOMENT_MATCH, latent_moments, match_moments
 from .text import BYTE_OFFSET, normalize, tokenize
 from .training import autocast, load_model
 
 DURATION_MODES = ("rule", "clamp", "syllable", "predictor", "auto")
 SAMPLER_OPTIONS = ("guidance_until", "guidance_from", "noise_scale", "cfg_rescale", "apg_eta", "apg_norm",
                    "apg_momentum", "speaker_guidance")
+# Two guidance windows (model.sample): the late window's settings, all None = the early window's.
+WINDOW_OPTIONS = ("guidance_split", "guidance_late", "apg_eta_late", "apg_norm_late", "apg_momentum_late",
+                  "cfg_rescale_late")
+SAMPLER_OPTIONS += WINDOW_OPTIONS
+# Applied after sampling (Synthesizer._finish): per-channel moment matching and the decoder's pre-tanh gain.
+OUTPUT_OPTIONS = ("moment_match", "pre_tanh_gain")
 
 
 @dataclass
@@ -162,11 +169,13 @@ class Synthesizer:
         """Use text + ref_audio; no speaker ID, enrollment table, or per-voice fine-tuning.
 
         `sampler` takes the further options of `model.sample` (guidance_from, cfg_rescale, apg_eta, apg_norm,
-        apg_momentum, speaker_guidance); `duration_mode` is one of rule, clamp, syllable, predictor.
+        apg_momentum, speaker_guidance, and the late guidance window: guidance_split, guidance_late, apg_eta_late,
+        apg_norm_late, apg_momentum_late, cfg_rescale_late) and the output options of `_finish` (moment_match,
+        pre_tanh_gain); `duration_mode` is one of rule, clamp, syllable, predictor.
         """
         if (ref_audio is None) == (reference is None):
             raise ValueError("Provide exactly one of ref_audio or a prepared VoiceReference")
-        unknown = set(sampler) - set(SAMPLER_OPTIONS)
+        unknown = set(sampler) - set(SAMPLER_OPTIONS) - set(OUTPUT_OPTIONS)
         if unknown:
             raise TypeError(f"Unknown sampler options: {sorted(unknown)}")
         started = time.perf_counter()
@@ -314,8 +323,42 @@ class Synthesizer:
             condition_cache=condition_cache, **sampler,
         )
 
+    @staticmethod
+    def _output_options(sampler):
+        """Remove the post-sampling options from `sampler` (in place) and validate them."""
+        from .codec import parse_pre_tanh_gain
+
+        output = {k: sampler.pop(k) for k in OUTPUT_OPTIONS if k in sampler}
+        output = {k: v for k, v in output.items() if v is not None}
+        if output.get("moment_match") not in (None, *MOMENT_MATCH):
+            raise ValueError(f"moment_match must be None or one of {MOMENT_MATCH}")
+        if "pre_tanh_gain" in output:
+            output["pre_tanh_gain"] = parse_pre_tanh_gain(output["pre_tanh_gain"])
+        return output
+
+    def _finish(self, target, reference, moment_match=None, pre_tanh_gain=None):
+        """Normalized target latents [T,C] -> (waveform, info) with the voice prompt's latents [P,C] as reference.
+
+        info always holds `latent_moments` (see quality.latent_moments). `moment_match` ("std"/"meanstd") rescales the
+        target's channels to the prompt's spread before decoding; `pre_tanh_gain` scales the codec decoder's output
+        tanh input (Codec.decode). Both default off, and then the decode call is exactly the previous one.
+        """
+        info = {}
+        if len(target) >= 2 and len(reference) >= 2:
+            info["latent_moments"] = latent_moments(target, reference)
+        if moment_match is not None:
+            target = match_moments(target, reference, moment_match)
+            info["moment_match"] = moment_match
+        latents = target * self.std + self.mean
+        if pre_tanh_gain is None:
+            return self.codec.decode(latents), info
+        decode_stats = {}
+        audio = self.codec.decode(latents, pre_tanh_gain=pre_tanh_gain, stats=decode_stats)
+        return audio, {**info, **decode_stats}
+
     @torch.inference_mode()
     def generate(self, batch, steps=16, guidance=1.5, seed=0, sway=-1, guidance_until=1.0, noise_scale=1.0, **sampler):
+        output = self._output_options(sampler)
         if batch["prompt"].size(0) != 1:
             raise ValueError(
                 "Waveform generation currently accepts a single request; sample() supports batches"
@@ -344,8 +387,10 @@ class Synthesizer:
             )
         target = result[0, target_mask(batch["valid"], batch["prompt_mask"])[0]]
         # Decode target alone: no reference audio leaks into the output waveform.
-        audio = self._measure(
-            lambda: self.codec.decode(target * self.std + self.mean), stages, "waveform_decode_seconds"
+        audio, finish = self._measure(
+            lambda: self._finish(target, batch["prompt"][0, batch["prompt_mask"][0]], **output),
+            stages,
+            "waveform_decode_seconds",
         )
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
@@ -368,6 +413,7 @@ class Synthesizer:
                 "codec_runtime": getattr(self.codec, "runtime", {"backend": "reference"}),
                 "profiled_stages": stages,
                 **sampler_stats,
+                **finish,
             },
         )
 
@@ -387,19 +433,24 @@ class Synthesizer:
         seed=42,
         sway=-1.0,
         max_rows=16,
+        selector=None,
         **sampler,
     ):
         """Generate every text (e.g. the sentence chunks of a long input) `candidates` times in padded batches.
 
         All rows share the prepared `reference` (a VoiceReference). Returns (results, metadata) where results[i][k]
         is a dict with the float32 waveform (`audio`, numpy) of candidate k of text i and its duration. Candidates
-        of a text differ only in their initial noise, which is what best-of-N reranking needs.
+        of a text differ only in their initial noise, which is what best-of-N reranking needs. `selector`, e.g.
+        quality.CandidateScorer.select, is called as selector(text, waveforms, sample_rate) -> (best index,
+        per-candidate scores): each candidate then carries its `selection` scores and metadata["selected"] lists
+        the best index per text (results keep the candidate order).
         """
         import numpy as np
 
-        unknown = set(sampler) - set(SAMPLER_OPTIONS)
+        unknown = set(sampler) - set(SAMPLER_OPTIONS) - set(OUTPUT_OPTIONS)
         if unknown:
             raise TypeError(f"Unknown sampler options: {sorted(unknown)}")
+        output = self._output_options(sampler)
         if not texts or candidates < 1 or max_rows < 1:
             raise ValueError("Need at least one text, one candidate and a positive batch size")
         started = time.perf_counter()
@@ -446,14 +497,22 @@ class Synthesizer:
             generation += time.perf_counter() - tick
             for row, (i, k) in enumerate(chunk):
                 target = result[row, reference_frames : totals[row]]
-                audio = self.codec.decode(target.float() * self.std + self.mean)
+                audio, finish = self._finish(target.float(), latents, **output)
                 results[i][k] = {
                     "audio": audio.numpy().astype(np.float32),
                     "audio_seconds": audio.numel() / self.codec.sample_rate,
                     "frames": int(requests[i][0]),
                     "duration": requests[i][5],
+                    **finish,
                 }
         self._sync()
+        if selector is not None:
+            output["selected"] = []
+            for text, row in zip(texts, results):
+                best, scores = selector(text, [candidate["audio"] for candidate in row], self.codec.sample_rate)
+                for candidate, score in zip(row, scores):
+                    candidate["selection"] = score
+                output["selected"].append(int(best))
         metadata = {
             "texts": len(texts),
             "candidates": candidates,
@@ -468,6 +527,7 @@ class Synthesizer:
             "duration_mode": duration_mode,
             "duration_scale": duration_scale,
             **{k: v for k, v in stats.items() if k != "time_grid"},
+            **output,
         }
         return results, metadata
 
@@ -504,5 +564,6 @@ def infer(args):
         apg_norm=getattr(args, "apg_norm", 0.0),
         apg_momentum=getattr(args, "apg_momentum", 0.0),
         speaker_guidance=getattr(args, "speaker_guidance", None),
+        **{name: getattr(args, name) for name in (*WINDOW_OPTIONS, *OUTPUT_OPTIONS) if hasattr(args, name)},
     )
     print(json.dumps(result.metadata, indent=2))

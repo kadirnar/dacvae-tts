@@ -367,6 +367,42 @@ def add_inference_args(parser, steps=True):
     parser.add_argument(
         "--speaker-guidance", type=float, help="Independent speaker guidance scale (text guidance = --guidance)"
     )
+    add_output_quality_args(parser)
+
+
+def pre_tanh_gain(value):
+    from .codec import parse_pre_tanh_gain
+
+    try:
+        return parse_pre_tanh_gain(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
+def add_output_quality_args(parser):
+    """Late guidance window, latent moment matching and the decoder's pre-tanh gain (all off by default)."""
+    parser.add_argument(
+        "--guidance-split",
+        type=float,
+        help="Split the guided interval at this t: [from, split) uses --guidance/--apg-*/--cfg-rescale, "
+        "[split, until) the *-late values (e.g. 0.5 with --apg-eta-late 0.5: CFG early, APG late)",
+    )
+    parser.add_argument("--guidance-late", type=float, help="Late-window CFG scale (default: --guidance)")
+    parser.add_argument("--apg-eta-late", type=float, help="Late-window APG eta (default: --apg-eta)")
+    parser.add_argument("--apg-norm-late", type=float, help="Late-window APG norm cap (default: --apg-norm)")
+    parser.add_argument("--apg-momentum-late", type=float, help="Late-window APG momentum (default: --apg-momentum)")
+    parser.add_argument("--cfg-rescale-late", type=float, help="Late-window CFG rescale phi (default: --cfg-rescale)")
+    parser.add_argument(
+        "--moment-match",
+        choices=["std", "meanstd"],
+        help="Rescale each generated latent channel to the voice prompt's std (meanstd: also its mean) before decoding",
+    )
+    parser.add_argument(
+        "--pre-tanh-gain",
+        type=pre_tanh_gain,
+        help="Scale the codec decoder's output-tanh input against saturation: a number, auto (99.9th percentile of "
+        "|input| to atanh 0.95) or auto:<output ceiling>",
+    )
 
 
 if __name__ == "__main__":
