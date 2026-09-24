@@ -1,3 +1,4 @@
+import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -89,6 +90,16 @@ class ModelConfig:
             raise ValueError("ffn_activation must be gelu or swiglu")
         if self.ctc_targets not in {"bytes", "chars"} or (self.ctc_targets == "chars" and not self.ctc_layer):
             raise ValueError("ctc_targets must be bytes or chars; chars needs a CTC head (ctc_layer > 0)")
+        if self.ctc_layer and self.patch_size > 1 and self.ctc_targets == "bytes":
+            # CTC needs at least one input frame per label. The head reads packed frames: DACVAE's 25 latent
+            # frames/s become 12.5/s at patch_size 2, below the 16-19 bytes/s of normal speech, so most examples
+            # are infeasible and zero_infinity silently zeroes their loss. A warning: such configs still load.
+            warnings.warn(
+                f"ctc_layer with patch_size {self.patch_size} and byte targets: the CTC head sees "
+                f"{25 / self.patch_size:g} packed frames/s against 16-19 transcript bytes/s, so zero_infinity "
+                "zeroes most examples; use ctc_targets: chars or patch_size: 1",
+                stacklevel=3,
+            )
         self.tla_layers = teacher_blocks(self.tla_layers, self.depth)
         if not 0 <= self.repa_layer <= self.depth or (self.repa_layer and self.repa_dim < 1):
             raise ValueError("repa_layer must be 0 (off) or a generator block, with a positive repa_dim")

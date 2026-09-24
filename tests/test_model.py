@@ -1,6 +1,10 @@
+import warnings
+from pathlib import Path
+
+import pytest
 import torch
 
-from dacvae_tts.config import ModelConfig
+from dacvae_tts.config import Config, ModelConfig
 from dacvae_tts.data import collate
 from dacvae_tts.model import FlowTTS, flow_loss, sample
 from dacvae_tts.training import Objective
@@ -86,3 +90,25 @@ def test_tiny_overfit_reduces_fixed_flow_loss():
         loss.backward()
         optimizer.step()
     assert loss.item() < initial * 0.3
+
+
+def test_byte_ctc_on_packed_frames_warns_but_loads():
+    # 12.5 packed frames/s against 16-19 bytes/s: zero_infinity used to zero most CTC rows without a word.
+    with pytest.warns(UserWarning, match="ctc_targets: chars or patch_size: 1"):
+        ModelConfig(ctc_layer=4, patch_size=2)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        ModelConfig(ctc_layer=4, patch_size=1)
+        ModelConfig(ctc_layer=4, patch_size=2, ctc_targets="chars")
+        ModelConfig(ctc_layer=0, patch_size=2)
+    # Every shipped model config still loads; none of them trains byte CTC on packed frames.
+    configs = Path(__file__).resolve().parents[1] / "configs"
+    paths = sorted(configs.glob("*.yaml")) + sorted((configs / "experiments").glob("*.yaml"))
+    loaded = {}
+    for path in paths:
+        if path.name != "evaluation.yaml":  # the evaluation-run settings, not a model config
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                loaded[path.name] = Config.load(path)
+    assert {name for name, cfg in loaded.items() if cfg.model.patch_size == 2} >= {"small.yaml", "tiny.yaml"}
+    assert len(loaded) == len(paths) - 1
