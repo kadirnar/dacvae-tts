@@ -407,6 +407,7 @@ def flow_loss(
     return_details=False,
     cached=None,
     time_sampling="uniform",
+    guidance_weight=0.0,
 ):
     if not 0 <= dropout <= 1:
         raise ValueError("dropout must lie in [0,1]")
@@ -447,6 +448,8 @@ def flow_loss(
     if prediction_kind(model) == "edm":
         t = time[:, None, None]
         target = ((1 - t) * x1 - t * noise) / (t.square() + (1 - t).square()).sqrt()
+    if guidance_weight:
+        target = target + guidance_weight * guidance_direction(model, pred, xt, time, batch, drop, cached)
     losses = per_example_mse(pred, target, mask)
     if return_details:
         counts = mask.sum(1)
@@ -463,6 +466,34 @@ def flow_loss(
             details["ctc"] = ctc
         return details
     return losses
+
+
+def guidance_direction(model, prediction, xt, time, batch, drop, cached=None):
+    """sg(out_cond - out_null) at the training (x_t, t), the model-guidance direction; 0 on CFG-dropped rows.
+
+    The null branch drops text, voice and prompt exactly like condition dropout (and the sampler's CFG null
+    branch). Output differences are the right quantity in either parameterization: EDM's `to_velocity` is
+    affine in the output with slope 1/sqrt(t^2 + (1-t)^2) and an offset that depends only on (x_t, t), the
+    same for both branches on target frames, so target + w (F_cond - F_null) is exactly the F-space image of
+    the velocity target v + w (v_cond - v_null). Without model dropout the conditional output is the training
+    forward itself (same inputs and weights); with dropout both branches are recomputed in eval mode so the
+    direction carries no dropout noise.
+    """
+    inputs = (xt, time, batch["prompt"], batch["prompt_mask"], batch["valid"])
+    inputs += (batch["tokens"], batch["segments"])
+    extra = {} if cached is None else {"cached": cached}
+    with torch.no_grad():
+        if model.training and getattr(model.cfg, "dropout", 0) > 0:
+            model.eval()
+            try:
+                cond = model(*inputs, drop=torch.zeros_like(drop), **extra)
+                null = model(*inputs, drop=torch.ones_like(drop), **extra)
+            finally:
+                model.train()
+        else:
+            cond = prediction.detach()
+            null = model(*inputs, drop=torch.ones_like(drop), **extra)
+    return (cond - null).masked_fill(drop[:, None, None], 0)
 
 
 def ctc_alignment_loss(logits, token_valid, tokens, drop):

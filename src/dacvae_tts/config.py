@@ -123,6 +123,11 @@ class TrainConfig:
     # with load_model(..., ema=<decay>). The best EMA length depends on the run and on CFG (EDM2,
     # arXiv:2312.02696); 0.9999 is too slow for <15k-update fine-tunes. `ema_decay` itself may be listed.
     ema_decays: list = field(default_factory=list)
+    # Model guidance (arXiv:2502.12154; on F5-TTS arXiv:2504.20334): the target becomes
+    # v + w sg(v_cond - v_null) from the model's own predictions; sample without CFG (--guidance 1). The fixed
+    # point bakes in CFG scale 1 / (1 - w) (w 0.5 ~ 2, 0.7 ~ 3.3); w >= 1 diverges. One extra no-grad forward
+    # per update (~+30%); meant for fine-tuning a trained checkpoint with --init-from.
+    model_guidance_weight: float = 0.0
 
     def __post_init__(self):
         if self.worker_threads < 1 or self.prefetch_factor < 1:
@@ -188,6 +193,11 @@ class TrainConfig:
             or not all(isinstance(d, float) and 0 <= d < 1 for d in self.ema_decays)
         ):
             raise ValueError("ema_decays must be a list of distinct decays in [0,1)")
+        if not 0 <= self.model_guidance_weight < 1:
+            raise ValueError("model_guidance_weight must lie in [0,1); w >= 1 diverges")
+        if self.model_guidance_weight and self.contrastive_weight:
+            # The hinge would compare the loss against the guided target with a plain-target negative.
+            raise ValueError("model_guidance_weight cannot be combined with contrastive_weight")
 
 
 @dataclass
@@ -202,6 +212,8 @@ class Config:
     def __post_init__(self):
         if self.train.pairing == "within" and self.model.text_layout != "joined":
             raise ValueError("Within-utterance prompts need model.text_layout: joined")
+        if self.train.model_guidance_weight and not self.model.cond_dropout:
+            raise ValueError("Model guidance needs model.cond_dropout > 0 to learn the null prediction")
 
     @classmethod
     def from_dict(cls, obj):

@@ -33,7 +33,8 @@ class Objective(nn.Module):
 
     `expansion` > 1 is context-sharing batch expansion (SupertonicTTS, arXiv:2503.23108): every
     utterance receives several independent (time, noise) draws that share one condition encoding.
-    Flow entries are then [B * expansion] while duration entries stay [B].
+    Flow entries are then [B * expansion] while duration entries stay [B]. `guidance_weight` > 0 trains
+    toward the model-guidance target (see `guidance_direction`); evaluation keeps the plain target.
     """
 
     def __init__(
@@ -45,9 +46,11 @@ class Objective(nn.Module):
         ctc_weight=0.0,
         contrastive_weight=0.0,
         contrastive_margin=0.1,
+        guidance_weight=0.0,
     ):
         super().__init__()
         self.model = model
+        self.guidance_weight = guidance_weight
         self.duration_weight, self.ctc_weight = duration_weight, ctc_weight
         self.contrastive_weight, self.contrastive_margin = contrastive_weight, contrastive_margin
         self.time_sampling, self.expansion = time_sampling, expansion
@@ -84,6 +87,7 @@ class Objective(nn.Module):
             return_details=True,
             cached=shared,
             time_sampling=self.time_sampling,
+            guidance_weight=self.guidance_weight if self.training else 0.0,
         )
         flow = details["flow"]
         if self.model.duration is None:
@@ -480,6 +484,7 @@ def train(args):
             cfg.train.ctc_weight,
             cfg.train.contrastive_weight,
             cfg.train.contrastive_margin,
+            guidance_weight=cfg.train.model_guidance_weight,
         ).train()
         raw_objective = objective  # compile/DDP wrap the module; helper methods stay reachable here
         eager_forward = model.forward
@@ -772,6 +777,8 @@ def train(args):
                         "init_from": getattr(args, "init_from", None),
                     }
                     saved.update({key: average.state_dict() for key, (_, average) in averages.items()})
+                    if cfg.train.model_guidance_weight:
+                        saved["recommended_guidance"] = 1.0  # guidance is baked in: sample without CFG
                     atomic_save(saved, out / "last.pt")
                     if keeping:
                         # Permanent, optimizer-free snapshot for later speech evaluation and selection.

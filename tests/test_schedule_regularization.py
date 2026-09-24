@@ -15,8 +15,9 @@ import yaml
 from dacvae_tts import training
 from dacvae_tts.config import Config, ModelConfig, TrainConfig
 from dacvae_tts.data import LatentDataset, collate
-from dacvae_tts.model import FlowTTS
+from dacvae_tts.model import FlowTTS, flow_loss, guidance_direction, per_example_mse, to_velocity
 from dacvae_tts.training import (
+    Objective,
     decay_phase_loader,
     decay_start,
     ema_key,
@@ -39,7 +40,7 @@ NEW_FIELDS = {
     "model": ("dropout",),
     "train": (
         "lr_schedule", "decay_fraction", "decay_shape", "min_lr_ratio", "decay_cache", "final_time_sampling",
-        "final_time_sampling_start", "ema_decays",
+        "final_time_sampling_start", "ema_decays", "model_guidance_weight",
     ),
 }
 TINY = {"latent_dim": 4, "width": 16, "depth": 1, "heads": 2, "text_depth": 1}
@@ -165,7 +166,7 @@ def test_old_configurations_compare_equal_for_resume():
 def test_old_checkpoints_load_and_resume_exactly(cache, tmp_path):
     config = config_file(tmp_path, steps=4)
     full = run(config, cache, tmp_path / "full")
-    assert not any(k.startswith("ema_") for k in full)
+    assert "recommended_guidance" not in full and not any(k.startswith("ema_") for k in full)
     run(config, cache, tmp_path / "old", stop_after=2)
     path = tmp_path / "old" / "last.pt"
     saved = torch.load(path, weights_only=True)
@@ -203,25 +204,26 @@ def test_decay_loader_checks_the_codec_and_keeps_the_main_normalization(cache, d
 
 
 def test_options_resume_exactly_across_the_decay_switch(cache, decay_cache, tmp_path, monkeypatch):
-    """WSD + decay cache + uniform-t cooldown + dropout + an EMA track, interrupted before, exactly at and
-    after the decay start (update 3 of 6), must equal the uninterrupted run."""
+    """WSD + decay cache + uniform-t cooldown + dropout + an EMA track + model guidance, interrupted before,
+    exactly at and after the decay start (update 3 of 6), must equal the uninterrupted run."""
     calls = []
     original = training.flow_loss
 
     def spy(*args, **kwargs):
-        calls.append(kwargs["time_sampling"])
+        calls.append((kwargs["time_sampling"], kwargs["guidance_weight"]))
         return original(*args, **kwargs)
 
     monkeypatch.setattr(training, "flow_loss", spy)
     config = config_file(
         tmp_path, model={**TINY, "dropout": 0.1}, lr_schedule="wsd", decay_fraction=0.5, decay_shape="1-sqrt",
         min_lr_ratio=0.0, decay_cache=str(decay_cache), time_sampling="logit_normal",
-        final_time_sampling="uniform", ema_decays=[0.2],
+        final_time_sampling="uniform", ema_decays=[0.2], model_guidance_weight=0.5,
     )
     full = run(config, cache, tmp_path / "full", no_validation=True)
-    assert calls == ["logit_normal"] * 6 + ["uniform"] * 6  # two micro-batches per update
+    assert calls == [("logit_normal", 0.5)] * 6 + [("uniform", 0.5)] * 6  # two micro-batches per update
     assert full["batch_offset"] == 3  # 6 decay-phase batches from a 3-batch subset: the switch happened
     assert "ema_0.2" in full
+    assert full["recommended_guidance"] == 1.0
     records = [json.loads(line) for line in (tmp_path / "full" / "train.jsonl").read_text().splitlines()]
     decay = [1.0, 1 - (1 / 3) ** 0.5, 1 - (2 / 3) ** 0.5]
     assert [r["lr"] for r in records] == pytest.approx([3e-4 * m for m in [1.0, 1.0, 1.0, *decay]])
@@ -356,3 +358,121 @@ def test_extra_ema_track_matches_a_run_with_that_decay(cache, tmp_path):
     exported, saved = load_model(tmp_path / "exported.pt")
     assert saved["exported_ema"] == "ema_0.3" and "optimizer" not in saved and "ema_0.3" not in saved
     assert all(torch.equal(v, tracked["ema_0.3"][k]) for k, v in exported.state_dict().items())
+
+
+# ------------------------------------------------------------------------------------------ model guidance
+
+
+def guided_setup(prediction):
+    config = dict(NANO, prediction=prediction, ctc_layer=0)
+    model = randomized(FlowTTS(ModelConfig(**config)))
+    batch = nano_batch()
+    torch.manual_seed(5)
+    time = torch.tensor([0.2, 0.55, 0.9])
+    noise = torch.randn_like(batch["latents"])
+    return model, batch, time, noise
+
+
+def branch_outputs(model, batch, time, noise):
+    """Conditional and null outputs at the training state x_t, computed independently of flow_loss."""
+    t = time[:, None, None]
+    x1 = batch["latents"] * batch["valid"][..., None]
+    xt = (1 - t) * noise * batch["valid"][..., None] + t * x1
+    xt = torch.where(batch["prompt_mask"][..., None], x1, xt) * batch["valid"][..., None]
+    kwargs = {k: batch[k] for k in ("prompt", "prompt_mask", "valid", "tokens", "segments")}
+    b = len(time)
+    with torch.no_grad():
+        cond = model(xt, time, **kwargs, drop=torch.zeros(b, dtype=torch.bool))
+        null_state = xt.masked_fill(batch["prompt_mask"][..., None], 0)  # the CFG null branch's state
+        null = model(null_state, time, **kwargs, drop=torch.ones(b, dtype=torch.bool))
+    return xt, null_state, cond, null
+
+
+@pytest.mark.parametrize("prediction", ["edm", "velocity"])
+def test_model_guidance_target_is_the_guided_velocity(prediction):
+    model, batch, time, noise = guided_setup(prediction)
+    model.eval()
+    w = 0.7
+    xt, null_state, cond, null = branch_outputs(model, batch, time, noise)
+    mask = batch["valid"] & ~batch["prompt_mask"]
+    x1 = batch["latents"]
+    # Velocity-space target v + w (v_cond - v_null), mapped back to the model's output space.
+    guided_velocity = (x1 - noise) + w * (
+        to_velocity(model, cond, xt, time) - to_velocity(model, null, null_state, time)
+    )
+    t = time[:, None, None]
+    scale = t.square() + (1 - t).square()
+    if prediction == "edm":
+        target = scale.sqrt() * (guided_velocity - (2 * t - 1) / scale * xt)
+    else:
+        target = guided_velocity
+    expected = per_example_mse(cond, target, mask)
+    loss = flow_loss(model, batch, 0, time, noise, guidance_weight=w)
+    assert torch.allclose(loss, expected, rtol=1e-5, atol=1e-6)
+    # ... which is the plain target shifted by w (out_cond - out_null) on the target frames.
+    plain = ((1 - t) * x1 - t * noise) / scale.sqrt() if prediction == "edm" else x1 - noise
+    assert torch.allclose(target[mask], (plain + w * (cond - null))[mask], atol=1e-5)
+    assert not torch.allclose(loss, flow_loss(model, batch, 0, time, noise))
+
+
+def test_model_guidance_leaves_cfg_dropped_rows_on_the_plain_target():
+    model, batch, time, noise = guided_setup("edm")
+    model.train()
+    model.grad_checkpoint = True  # the recipe's setting; the no-grad null pass runs through it
+    torch.manual_seed(11)
+    guided = flow_loss(model, batch, 0.5, time, noise, return_details=True, guidance_weight=0.7)
+    torch.manual_seed(11)
+    plain = flow_loss(model, batch, 0.5, time, noise, return_details=True)
+    drop = guided["drop"]
+    assert torch.equal(drop, plain["drop"]) and drop.any() and not drop.all()
+    assert torch.equal(guided["flow"][drop], plain["flow"][drop])
+    assert not torch.allclose(guided["flow"][~drop], plain["flow"][~drop])
+    torch.manual_seed(11)
+    everything = flow_loss(model, batch, 1.0, time, noise, guidance_weight=0.7)
+    torch.manual_seed(11)
+    assert torch.equal(everything, flow_loss(model, batch, 1.0, time, noise))
+
+
+def test_guidance_direction_is_detached_and_dropout_free():
+    model = randomized(FlowTTS(ModelConfig(**NANO, dropout=0.3))).train()
+    batch = nano_batch()
+    time = torch.tensor([0.2, 0.55, 0.9])
+    xt = batch["latents"] * 0.5
+    drop = torch.tensor([False, True, False])
+    first = guidance_direction(model, None, xt, time, batch, drop)
+    second = guidance_direction(model, None, xt, time, batch, drop)
+    assert model.training and not first.requires_grad
+    assert torch.equal(first, second)  # eval-mode branches: no dropout noise in the direction
+    assert (first[1] == 0).all() and first[0].abs().sum() > 0
+    # A gradient step through the guided loss still reaches every generator parameter.
+    loss = Objective(model, guidance_weight=0.5).train()(batch)["loss"].mean()
+    loss.backward()
+    assert all(p.grad is not None for p in model.blocks.parameters())
+
+
+def test_objective_uses_the_guided_target_only_in_training():
+    model, batch, _, _ = guided_setup("edm")
+    for mode in ("eval", "train"):
+        results = []
+        for weight in (0.0, 0.7):
+            objective = getattr(Objective(model, guidance_weight=weight), mode)()
+            torch.manual_seed(3)
+            results.append(objective(batch)["flow"])
+        assert torch.equal(*results) == (mode == "eval")
+
+
+def test_model_guidance_configuration_guards():
+    for fields in (dict(model_guidance_weight=1.0), dict(model_guidance_weight=0.5, contrastive_weight=0.2)):
+        with pytest.raises(ValueError):
+            TrainConfig(**fields)
+    with pytest.raises(ValueError):  # the null prediction must be trained
+        Config(ModelConfig(cond_dropout=0.0), TrainConfig(model_guidance_weight=0.5))
+    Config(ModelConfig(cond_dropout=0.2), TrainConfig(model_guidance_weight=0.7))
+
+
+def test_model_guidance_fine_tune_is_marked_for_sampling_without_cfg(cache, tmp_path):
+    run(config_file(tmp_path, "base.yaml", steps=3), cache, tmp_path / "base")
+    tuned = run(config_file(tmp_path, "tune.yaml", steps=2, model_guidance_weight=0.7, ema_decays=[0.9]),
+                cache, tmp_path / "tune", init_from=str(tmp_path / "base" / "last.pt"))
+    assert tuned["recommended_guidance"] == 1.0 and tuned["step"] == 2 and "ema_0.9" in tuned
+    assert all(torch.isfinite(v).all() for v in tuned["model"].values())
