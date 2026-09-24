@@ -14,7 +14,7 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, Sampler
 
 from .contracts import normalization_stats
-from .text import assemble, decode_ids, tokenize, tokenize_bytes
+from .text import assemble, char_ctc_targets, decode_ids, join_ids, tokenize, tokenize_bytes
 
 SCHEMA = """
 CREATE TABLE samples (
@@ -81,6 +81,30 @@ def load_stats(directory):
     return obj
 
 
+def load_silence(directory, meta):
+    """Raw (unnormalized) encoded-silence frame [C] written by scripts/silence_latent.py."""
+    path = Path(directory) / "silence.pt"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} is missing; tail_silence_prob and prompt_cut: quiet need the encoded-silence latent "
+            f"(python scripts/silence_latent.py --cache {directory})"
+        )
+    obj = torch.load(path, map_location="cpu", weights_only=True)
+    for key in ("checkpoint", "latent_dim", "sample_rate", "hop_length"):
+        if key in obj.get("codec", {}) and key in meta and obj["codec"][key] != meta[key]:
+            raise ValueError(f"{path} was encoded with another codec ({key}); recreate it for this cache")
+    raw = obj["raw"].float()
+    if raw.shape != (meta["latent_dim"],) or not torch.isfinite(raw).all():
+        raise ValueError(f"{path} must hold one finite [{meta['latent_dim']}] frame")
+    return raw
+
+
+# Independent random streams per (seed, epoch, index): toggling one pair option never moves the draws
+# of another, and every stream stays clear of the original seed range seed + epoch * rows + index.
+CROSS_STREAM, TAIL_STREAM, LONG_STREAM = 1 << 48, 2 << 48, 3 << 48
+QUIET_CUT_SECONDS = 0.3
+
+
 class LatentDataset(Dataset):
     """`cross` pairs a target with another utterance of the same speaker; `within` cuts the voice
     prompt from the start of the target utterance itself, so no speaker labels are needed."""
@@ -94,6 +118,7 @@ class LatentDataset(Dataset):
         layout="segments",
         prompt_fraction=(0.1, 0.5),
         prompt_dropout=0.0,
+        **pair_options,
     ):
         if pairing not in {"cross", "within"} or layout not in {"segments", "joined"}:
             raise ValueError("pairing must be cross or within; layout must be segments or joined")
@@ -145,6 +170,7 @@ class LatentDataset(Dataset):
                 end = self.group_end[start]
                 self.max_ref_lengths[start:end] = self.lengths[start:end].max()
             self.costs = self.lengths + self.max_ref_lengths
+        self.configure_pairs(**pair_options)
         self._pid, self._db, self._maps = None, None, OrderedDict()
 
     def __len__(self):
@@ -201,16 +227,20 @@ class LatentDataset(Dataset):
         epoch, index = index if isinstance(index, tuple) else (self.epoch, index)
         rng = random.Random(self.seed + epoch * len(self) + index)
         if self.pairing == "within":
+            references = self.cross_plan(epoch, index)
+            if references:
+                return self.finish_item(self.cross_prompt_item(index, references), epoch, index)
             row = self.row(index)
             frames = len(row["latents"])
             # Prompt dropout trains prompt-free synthesis of the whole utterance from its text.
             cut = (
                 0
                 if rng.random() < self.prompt_dropout
-                else round(frames * rng.uniform(*self.prompt_fraction))
+                else round(frames * rng.uniform(*self.prompt_range(epoch, index)))
             )
+            cut = self.quiet_cut(row["latents"], cut)
             cut = max(min(cut, frames - 1), 0)  # always keep at least one target frame
-            return {
+            item = {
                 "target": row["latents"][cut:],
                 "reference": row["latents"][:cut],
                 "text": row["text"],
@@ -225,11 +255,12 @@ class LatentDataset(Dataset):
                 "text_normalization": self.meta.get("text_normalization", "unicode-v1"),
                 "layout": self.layout,
             }
+            return self.finish_item(item, epoch, index)
         start, end = int(self.group_start[index]), int(self.group_end[index])
         ref_index = rng.randrange(start, end - 1)
         ref_index += ref_index >= index
         target, ref = self.row(index), self.row(ref_index)
-        return {
+        item = {
             "target": target["latents"],
             "reference": ref["latents"],
             "text": target["text"],
@@ -244,6 +275,151 @@ class LatentDataset(Dataset):
             "text_normalization": self.meta.get("text_normalization", "unicode-v1"),
             "layout": self.layout,
         }
+        return self.finish_item(item, epoch, index)
+
+    # Training-pair options (issue #11). Each one is a no-op when off: no extra random draws, no new
+    # item keys, unchanged costs, so the default data stream is bit-identical to the one before.
+
+    def configure_pairs(
+        self,
+        cross_prompt_prob=0.0,
+        cross_prompt_max_utterances=3,
+        cross_prompt_max_seconds=12.0,
+        long_prompt_prob=0.0,
+        prompt_fraction_long_max=0.85,
+        tail_silence_prob=0.0,
+        tail_silence_max_seconds=0.8,
+        prompt_cut="random",
+        ctc_targets="bytes",
+    ):
+        """Validate the options and widen `costs` to an upper bound of every prompt+target they can form.
+
+        `costs` stays the static bound the sampler checks against the frame budget. Cross prompts change a
+        row's length from epoch to epoch, so `epoch_costs` gives the exact per-epoch lengths (never above
+        `costs`); batching by the bound would reserve up to 12 s for every row that keeps a within cut.
+        """
+        if not all(0 <= p <= 1 for p in (cross_prompt_prob, long_prompt_prob, tail_silence_prob)):
+            raise ValueError("Pair option probabilities must lie in [0,1]")
+        if cross_prompt_max_utterances < 1 or cross_prompt_max_seconds <= 0 or tail_silence_max_seconds <= 0:
+            raise ValueError("Cross-prompt and tail-silence limits must be positive")
+        if long_prompt_prob and not self.prompt_fraction[1] <= prompt_fraction_long_max < 1:
+            raise ValueError("Need prompt_fraction_max <= prompt_fraction_long_max < 1")
+        if prompt_cut not in {"random", "quiet"} or ctc_targets not in {"bytes", "chars"}:
+            raise ValueError("prompt_cut must be random or quiet; ctc_targets bytes or chars")
+        if self.pairing != "within" and (cross_prompt_prob or long_prompt_prob or prompt_cut != "random"):
+            raise ValueError("Cross prompts, long prompts and quiet cuts act on within pairing")
+        frame_rate = self.meta["sample_rate"] / self.meta["hop_length"]
+        self.cross_prompt_prob, self.cross_prompt_utterances = cross_prompt_prob, cross_prompt_max_utterances
+        self.cross_prompt_frames = int(cross_prompt_max_seconds * frame_rate)  # floor: never above the limit
+        self.long_prompt_prob, self.prompt_fraction_long_max = long_prompt_prob, prompt_fraction_long_max
+        self.tail_silence_prob = tail_silence_prob
+        self.tail_silence_frames = (
+            max(round(tail_silence_max_seconds * frame_rate), 1) if tail_silence_prob else 0
+        )
+        self.prompt_cut, self.quiet_window = prompt_cut, round(QUIET_CUT_SECONDS * frame_rate)
+        self.ctc_targets = ctc_targets
+        self.silence = None
+        if tail_silence_prob or prompt_cut == "quiet":
+            self.silence = (load_silence(self.directory, self.meta) - self.mean) / self.std
+        if self.tail_silence_frames:
+            self.costs = self.costs + self.tail_silence_frames
+        if cross_prompt_prob:
+            several = self.group_end - self.group_start >= 2
+            self.costs = self.costs + np.where(several, self.cross_prompt_frames, 0).astype(self.costs.dtype)
+
+    def cross_plan(self, epoch, index):
+        """Rows forming this row's prompt in `epoch` (other utterances of its speaker), or () for a cut.
+
+        A pure function of (seed, epoch, index) and the row lengths, so `epoch_costs` in the sampler's
+        process and `__getitem__` in the loader workers agree. Prompt dropout is decided first with the
+        same draw `__getitem__` uses, which keeps its rate: cross prompts replace cuts of prompted rows only.
+        References are whole utterances (a cropped one would no longer match its transcript); those longer
+        than the remaining seconds are skipped, and a row whose draws all exceed them keeps its within cut.
+        """
+        if not self.cross_prompt_prob:
+            return ()
+        start, end = int(self.group_start[index]), int(self.group_end[index])
+        if end - start < 2:
+            return ()
+        base = self.seed + epoch * len(self) + index
+        if random.Random(base).random() < self.prompt_dropout:
+            return ()
+        rng = random.Random(base + CROSS_STREAM)
+        if rng.random() >= self.cross_prompt_prob:
+            return ()
+        count = rng.randint(1, min(self.cross_prompt_utterances, end - start - 1))
+        chosen, total = [], 0
+        for other in rng.sample(range(start, end - 1), count):
+            other += other >= index
+            if total + int(self.lengths[other]) <= self.cross_prompt_frames:
+                chosen.append(other)
+                total += int(self.lengths[other])
+        return tuple(chosen)
+
+    def epoch_costs(self, epoch):
+        """Exact prompt+target frames of every row in `epoch` (plus the tail-silence maximum)."""
+        costs = self.lengths + self.tail_silence_frames
+        if self.cross_prompt_prob:
+            for index in np.flatnonzero(self.group_end - self.group_start >= 2):
+                references = self.cross_plan(epoch, int(index))
+                if references:
+                    costs[index] += int(self.lengths[list(references)].sum())
+        return costs
+
+    def cross_prompt_item(self, index, references):
+        """Prompt = the references' latents back to back, transcript = their texts + target text, target =
+        the whole utterance; the joined layout reads it as one stream like a within item."""
+        target, refs = self.row(index), [self.row(r) for r in references]
+        ids = [r["token_ids"] for r in refs]
+        utf8 = [r["text_bytes"] for r in refs]
+        return {
+            "target": target["latents"],
+            "reference": torch.cat([r["latents"] for r in refs]),
+            "text": target["text"],
+            "reference_text": " ".join(r["text"] for r in refs),
+            "text_bytes": target["text_bytes"],
+            "reference_text_bytes": None if None in utf8 else b" ".join(utf8),
+            "token_ids": target["token_ids"],
+            "reference_token_ids": None if any(i is None for i in ids) else join_ids(ids),
+            "uid": target["uid"],
+            "reference_uid": "|".join(r["uid"] for r in refs),
+            "speaker": target["speaker"],
+            "text_normalization": self.meta.get("text_normalization", "unicode-v1"),
+            "layout": self.layout,
+        }
+
+    def prompt_range(self, epoch, index):
+        """Cut-fraction range: the long one ([max, long max], short targets) with long_prompt_prob."""
+        if self.long_prompt_prob:
+            draw = random.Random(self.seed + epoch * len(self) + index + LONG_STREAM).random()
+            if draw < self.long_prompt_prob:
+                return self.prompt_fraction[1], self.prompt_fraction_long_max
+        return self.prompt_fraction
+
+    def quiet_cut(self, latents, cut):
+        """Move a nonzero cut so the prompt ends on the frame closest (L2) to silence within the window.
+
+        Ties go to the frame nearest the sampled cut; at least one prompt and one target frame remain.
+        """
+        if self.prompt_cut != "quiet" or cut < 1:
+            return cut
+        low, high = max(cut - 1 - self.quiet_window, 0), min(cut - 1 + self.quiet_window, len(latents) - 2)
+        if low > high:
+            return cut
+        distance = (latents[low : high + 1] - self.silence).square().sum(-1).tolist()
+        last = min(range(high - low + 1), key=lambda i: (distance[i], abs(low + i - cut + 1)))
+        return low + last + 1
+
+    def finish_item(self, item, epoch, index):
+        """Tail silence and the CTC label flag; the item itself when both are off."""
+        if self.ctc_targets == "chars":
+            item = {**item, "ctc_targets": "chars"}
+        if not self.tail_silence_prob:
+            return item
+        rng = random.Random(self.seed + epoch * len(self) + index + TAIL_STREAM)
+        frames = rng.randint(1, self.tail_silence_frames) if rng.random() < self.tail_silence_prob else 0
+        pad = self.silence.expand(frames, -1)
+        return {**item, "target": torch.cat([item["target"], pad]), "tail_silence": frames}
 
 
 def collate(items):
@@ -282,7 +458,7 @@ def collate(items):
         tokens.append(tok)
         segments.append(seg)
         lengths.append(len(z))
-    return {
+    batch = {
         "latents": pad_sequence(latents, batch_first=True),
         "prompt": pad_sequence(prompts, batch_first=True),
         "prompt_mask": pad_sequence(masks, batch_first=True),
@@ -290,6 +466,13 @@ def collate(items):
         "tokens": pad_sequence(tokens, batch_first=True),
         "segments": pad_sequence(segments, batch_first=True),
     }
+    labels = {item.get("ctc_targets", "bytes") for item in items}
+    if labels != {"bytes"}:
+        # Character CTC targets are built here, in the loader workers, from the exact model tokens.
+        if labels != {"chars"}:
+            raise ValueError("A batch cannot mix byte and character CTC targets")
+        batch["ctc_targets"], batch["ctc_target_lengths"] = char_ctc_targets(tokens)
+    return batch
 
 
 class BucketBatchSampler(Sampler):
@@ -310,8 +493,10 @@ class BucketBatchSampler(Sampler):
         bucket_size=4096,
         speaker_counts=None,
         speaker_balance=0.0,
+        epoch_costs=None,
     ):
-        self.costs = costs
+        # `epoch_costs(epoch)`: exact per-epoch costs (cross prompts) bounded by the static `costs`.
+        self.costs, self.epoch_costs, self._epoch_cache = costs, epoch_costs, None
         self.batch_size, self.rank, self.world_size = batch_size, rank, world_size
         self.seed, self.frame_budget, self.bucket_size = seed, frame_budget, bucket_size
         self.epoch = 0
@@ -337,15 +522,16 @@ class BucketBatchSampler(Sampler):
             if self.weights is None
             else rng.choice(len(self.costs), len(self.costs), replace=True, p=self.weights)
         )
+        costs = self.current_costs()
         batches = []
         for offset in range(0, len(indices), self.bucket_size):
             bucket = indices[offset : offset + self.bucket_size]
-            bucket = bucket[np.argsort(self.costs[bucket], kind="stable")]
+            bucket = bucket[np.argsort(costs[bucket], kind="stable")]
             current = []
             for idx in bucket:
                 if current and (
                     len(current) >= self.batch_size
-                    or (self.frame_budget and self.costs[idx] * (len(current) + 1) > self.frame_budget)
+                    or (self.frame_budget and costs[idx] * (len(current) + 1) > self.frame_budget)
                 ):
                     batches.append(current)
                     current = []
@@ -357,6 +543,16 @@ class BucketBatchSampler(Sampler):
         if not usable:
             raise ValueError("Too few batches for this world size")
         return batches[self.rank : usable : self.world_size]
+
+    def current_costs(self):
+        if self.epoch_costs is None:
+            return self.costs
+        if self._epoch_cache is None or self._epoch_cache[0] != self.epoch:
+            costs = self.epoch_costs(self.epoch)
+            if len(costs) != len(self.costs) or np.any(costs > self.costs):
+                raise ValueError("Per-epoch costs must stay within the static bound checked against budgets")
+            self._epoch_cache = (self.epoch, costs)
+        return self._epoch_cache[1]
 
     def __iter__(self):
         for batch in self.batches()[self.start_batch :]:
