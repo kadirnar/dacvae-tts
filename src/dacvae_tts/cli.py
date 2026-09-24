@@ -210,6 +210,15 @@ def main():
         choices=["english-unicode-v2", "legacy-ascii-v1", "turkish-v1"],
         help="WER/CER text normalization (default: turkish-v1 for --language tr, else english-unicode-v2)",
     )
+    p.add_argument(
+        "--reference-kind",
+        choices=["original", "codec"],
+        help="Protocol v2: what the manifest's reference_audio is (original recording -> sim_o, codec "
+        "resynthesis -> sim_r); rows may instead carry original_prompt_audio / codec_prompt_audio",
+    )
+    from .eval_protocol import add_protocol_args
+
+    add_protocol_args(p)
 
     p = sub.add_parser(
         "compare", help="Paired before/after metrics with speaker-clustered bootstrap intervals"
