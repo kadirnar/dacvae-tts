@@ -155,9 +155,11 @@ def negative_distance(model, prediction, negative_latents, noise, time, mask, po
     farther from the negative than the true target does (cap 1: only while it is closer than that).
     """
     negative = flow_target(model, negative_latents, noise, time).detach()
-    distance = per_example_mse(prediction, negative, mask)
+    # train.strict_checks: false skips the empty-target check, which would wait for the device.
+    strict = getattr(model, "strict_checks", True)
+    distance = per_example_mse(prediction, negative, mask, strict)
     if cap > 0:
-        distance = torch.minimum(distance, cap * per_example_mse(positive.detach(), negative, mask))
+        distance = torch.minimum(distance, cap * per_example_mse(positive.detach(), negative, mask, strict))
     return distance
 
 

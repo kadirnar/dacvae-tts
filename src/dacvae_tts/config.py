@@ -102,7 +102,7 @@ class TrainConfig:
     strict_checks: bool = True  # false: skip value checks that stall the host (shapes still checked)
     pad_multiple: int = 1  # round padded batch frames up to a multiple (masked; bounds compiled shapes)
     text_pad_multiple: int = 1  # the same for transcript tokens
-    loader_negatives: bool = False  # draw the contrastive text negatives in the loader workers
+    loader_negatives: bool = False  # draw the text_hinge negatives in the loader workers (inert otherwise)
     compile_dynamic: str = "batch"  # compile: blocks -- batch (only batch dim symbolic) or auto
     # Negatives. text_hinge: the transcript hinge above (contrastive_weight/margin; one more text encoding
     # and generator pass, ~20-25% compute). latent_delta: RobustSpeechFlow/ΔFM corrupted target latents

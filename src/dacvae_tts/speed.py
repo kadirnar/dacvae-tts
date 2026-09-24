@@ -277,9 +277,12 @@ class TrainCollate:
 def training_loader(dataset, train):
     """(items, collate_fn, sampler costs) of the training loader under the options of `train`.
 
-    With the defaults this is exactly (dataset, collate, dataset.costs).
+    With the defaults this is exactly (dataset, collate, dataset.costs). Loader negatives are text
+    negatives of the transcript hinge: they are drawn only when `contrastive_mode` is text_hinge
+    (latent_delta corrupts the target latents inside the step and needs no loader-side transcripts).
     """
-    negatives = train.loader_negatives and train.contrastive_weight > 0
+    hinge = getattr(train, "contrastive_mode", "text_hinge") == "text_hinge"
+    negatives = train.loader_negatives and train.contrastive_weight > 0 and hinge
     costs = padded_costs(dataset.costs, train.pad_multiple)
     if not negatives and train.pad_multiple == 1 and train.text_pad_multiple == 1:
         return dataset, collate, costs
