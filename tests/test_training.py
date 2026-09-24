@@ -165,6 +165,77 @@ def test_compiler_failure_falls_back_to_eager(cache, tmp_path, monkeypatch, caps
     assert any("activation checkpointing" in line for line in capsys.readouterr().out.splitlines())
 
 
+# One torchrun rank of `train` in which the second compiled generator call on rank 0 raises an inductor
+# error; every rank saves its final raw weights so the test can check that DDP kept them in sync.
+FALLBACK_RANK = """
+import os
+import sys
+
+import torch
+import torch._inductor.exc as inductor
+
+from dacvae_tts import cli, training
+
+rank, models, calls = os.environ["RANK"], [], {"count": 0}
+build = training.build_optimizer
+
+
+def capture(model, *args, **kwargs):
+    models.append(model)
+    return build(model, *args, **kwargs)
+
+
+def fake_compile(function, dynamic=True):
+    def wrapped(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 2 and rank == "0":
+            raise inductor.InductorError(AssertionError("synthetic"), None)
+        return function(*args, **kwargs)
+
+    return wrapped
+
+
+training.build_optimizer, torch.compile = capture, fake_compile
+output = sys.argv[sys.argv.index("--output") + 1]
+cli.main()
+torch.save(models[0].state_dict(), os.path.join(output, f"rank{rank}.pt"))
+"""
+
+
+@pytest.mark.parametrize("accumulation", [1, 2])
+def test_ddp_compiler_fallback_keeps_gradient_sync(cache, tmp_path, accumulation):
+    """A compiler failure on one rank under compile: model must fall back to eager through the DDP wrapper:
+    the ranks keep all-reducing gradients (identical weights) and no_sync stays available for accumulation."""
+    import socket
+
+    config = config_file(tmp_path)
+    cfg = yaml.safe_load(config.read_text())
+    cfg["train"].update(compile="model", accumulation=accumulation)
+    config.write_text(yaml.safe_dump(cfg))
+    driver = tmp_path / "fallback_rank.py"
+    driver.write_text(FALLBACK_RANK)
+    output = tmp_path / "fallback"
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    env = {**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
+    if sys.platform == "darwin":
+        env["GLOO_SOCKET_IFNAME"] = "lo0"
+    command = [sys.executable, "-m", "torch.distributed.run", "--nproc_per_node=2"]
+    command += ["--master_addr=127.0.0.1", f"--master_port={port}", str(driver), "train"]
+    command += ["--config", str(config), "--cache", str(cache), "--output", str(output)]
+    command += ["--device", "cpu", "--no-validation"]
+    result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=180)
+    assert result.returncode == 0, result.stderr[-3000:]
+    warnings = [json.loads(line) for line in result.stdout.splitlines() if "compiler failed" in line]
+    assert [w["rank"] for w in warnings] == [0]  # only rank 0 fell back
+    first = torch.load(output / "rank0.pt", weights_only=True)
+    second = torch.load(output / "rank1.pt", weights_only=True)
+    for key in first:
+        assert torch.equal(first[key], second[key]), key
+    assert torch.load(output / "last.pt", weights_only=True)["step"] == 4
+
+
 def test_wandb_tracking_mirrors_logs(cache, tmp_path, monkeypatch):
     """With a project set, train/val records reach wandb.log with step numbers; nothing else changes."""
     import sys

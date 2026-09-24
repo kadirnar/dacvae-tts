@@ -662,7 +662,10 @@ def train(args):
                     raise
                 model.forward = eager_forward
                 model.block_runner = eager_runner
-                objective = raw_objective
+                if world == 1:
+                    objective = module = raw_objective
+                # else: keep the DDP wrapper (it holds only raw_objective here) and retry through it, so
+                # this rank still joins the gradient all-reduce and `no_sync` stays available.
                 compiled = False
                 # Eager activations need roughly twice the memory of the compiled graph; recompute
                 # them instead so a run sized for the compiled path survives the switch.
@@ -678,7 +681,7 @@ def train(args):
                     ),
                     flush=True,
                 )
-                return raw_objective(batch)
+                return module(batch)
 
         if world > 1:
             objective = DDP(
