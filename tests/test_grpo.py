@@ -194,6 +194,45 @@ def test_group_advantages_standardize_each_term_with_floors_and_signs():
     assert not group_advantages(flat, weights, signs, floors).any()
 
 
+DEFAULT_WEIGHTS = {"cer": 1.0, "sim": 0.5, "dnsmos": 0.4, "utmos": 0.4}  # the CLI's --reward-weights
+
+
+def judged_group(sim, mos, seed=0, size=8):
+    """Transcripts all right (CER 0); SIM and MOS judges spread by `sim` and `mos` around fixed values."""
+    rng = np.random.default_rng(seed)
+    return {
+        "cer": np.zeros(size),
+        "sim": 0.6 + sim * rng.standard_normal(size),
+        "dnsmos": 3.0 + mos * rng.standard_normal(size),
+        "utmos": 3.0 + mos * rng.standard_normal(size),
+    }
+
+
+def test_standardized_advantages_keep_judge_noise_under_the_floors_small():
+    # Jitter far below every floor (SIM 0.001 vs 0.01, MOS 0.005 vs 0.05) used to be rescaled to unit variance
+    # (advantage std 0.998, the same as a real signal); the composite floor keeps it at its z-score size.
+    raw, signs, stats = judged_group(sim=0.001, mos=0.005), {"cer": -1}, {}
+    advantages = group_advantages(raw, DEFAULT_WEIGHTS, signs, grpo.REWARD_FLOORS, stats=stats)
+    weighted = group_advantages(raw, DEFAULT_WEIGHTS, signs, grpo.REWARD_FLOORS, "weighted")
+    assert grpo.composite_floor(DEFAULT_WEIGHTS) == 0.4 and stats["composite_floor"] == 0.4
+    assert stats["under_floor"] and stats["composite_std"] < 0.1
+    assert np.allclose(advantages, weighted * 2.3 / 0.4)  # centred composite / c
+    assert 0 < advantages.std() < 0.2 and weighted.std() < 0.03
+    reward = CompositeReward(dict.fromkeys(DEFAULT_WEIGHTS, lambda group: [0.0]), DEFAULT_WEIGHTS)
+    assert np.allclose(reward.advantages(raw), advantages)
+
+
+@pytest.mark.parametrize("sim,mos", [(0.03, 0.2), (0.001, 0.2), (0.03, 0.005)])
+def test_standardized_advantages_with_real_spread_are_unchanged(sim, mos):
+    # Every term above its floor, or one weighted term alone above it: plain (R - mean) / (std + 1e-4) as before.
+    raw, signs, stats = judged_group(sim, mos, seed=1), {"cer": -1}, {}
+    advantages = group_advantages(raw, DEFAULT_WEIGHTS, signs, grpo.REWARD_FLOORS, stats=stats)
+    composite = group_advantages(raw, DEFAULT_WEIGHTS, signs, grpo.REWARD_FLOORS, "weighted") * 2.3
+    assert not stats["under_floor"] and stats["composite_std"] >= 0.4
+    assert np.allclose(advantages, (composite - composite.mean()) / (composite.std() + 1e-4), rtol=0, atol=1e-12)
+    assert abs(advantages.std() - 1) < 1e-3
+
+
 def test_composite_reward_requires_two_terms_and_handles_failed_scores():
     class Error:
         sign = -1
@@ -323,6 +362,7 @@ def test_grpo_cli_updates_raise_a_toy_reward(cache, tmp_path, monkeypatch):
     steps = [r for r in records if "reward" in r]
     assert [r["step"] for r in records if "monitor" in r] == [0, 6, 12] and len(steps) == 12
     assert all(r["optimizer_steps"] == 1 and r["logp_mismatch"] < 1e-4 and r["kl_ref"] >= 0 for r in steps)
+    assert all(r["floored_groups"] == r["degenerate_groups"] == 0 for r in steps)  # an unfloored term at z-spread 1
     trained = torch.load(output / "grpo-000012.pt", weights_only=True)
     assert trained["stage"] == "grpo" and trained["posttrain_args"]["mode"] == "grpo"
     assert (output / "grpo-000006.pt").exists()
@@ -372,6 +412,7 @@ def test_oracle_best_of_n_with_a_toy_reward(cache, tmp_path, sampler):
     reward = CompositeReward({"mean": LatentMean()}, {"mean": 1.0}, min_terms=1)
     summary = grpo.oracle_best_of_n(args, reward=reward)
     assert summary["prompts"] == 4 and summary["best"]["mean"] == summary["term_best"]["mean"]
+    assert summary["floored_groups"] == summary["degenerate_groups"] == 0
     assert summary["best"]["mean"] > summary["mean"]["mean"] and summary["group_std"]["mean"] > 0
     rows = [json.loads(line) for line in (tmp_path / sampler / "oracle.jsonl").read_text().splitlines()]
     assert len(rows) == 4 and all(len(r["raw"]["mean"]) == 6 for r in rows)

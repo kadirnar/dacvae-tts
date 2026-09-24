@@ -40,9 +40,12 @@ transcript, target text, target length from the deployed duration rule) G trajec
 reward term k is standardized inside the group, z_k = sign_k (r_k - mean) / max(std, floor_k), where the floor (about
 one unit of measurement noise: CER 0.01, WER 0.02, SIM 0.01, MOS 0.05) stops a term whose samples barely differ from
 turning noise into a full-size signal; the weighted sum R = sum_k w_k z_k is standardized again,
-A = (R - mean) / (std + 1e-4) (`--advantage standardized`), or kept as the weighted mean of the z-scores
-(`--advantage weighted`, no second division, Dr. GRPO arXiv:2503.20783's argument against std normalization). Groups
-whose advantages are all zero are skipped. The loss over window steps k and samples i is
+A = (R - mean) / max(std + 1e-4, c) (`--advantage standardized`), or kept as the weighted mean of the z-scores
+(`--advantage weighted`, no second division, Dr. GRPO arXiv:2503.20783's argument against std normalization). The
+composite floor c = min_k |w_k| is the spread R gets when a single term moves by exactly its floor: a group whose terms
+all stay under their floors keeps its small advantages instead of being rescaled back to unit variance, while a group
+with real spread (std >= c) is standardized as before. Groups whose advantages are all zero are skipped. The loss over
+window steps k and samples i is
 
     L = mean_{i,k} [ -min(rho A_i, clip(rho, 1-eps, 1+eps) A_i) + beta KL(N(mu_theta, s^2) || N(mu_ref, s^2)) ],
 
@@ -82,9 +85,9 @@ Commands (GPU machine; oracle first: best-of-N under the same reward is the ceil
       --prompts-per-step 4 --sample-steps 16 --guidance 5 --learning-rate 1e-5 --save-every 100
 
 Watch `grpo-log.jsonl`: per-term reward means rise while `monitor` (held-out, other judges) follows; `reward_std`
-(group spread) and `degenerate_groups` say whether sigma/window give a usable signal; `kl_ref` grows slowly;
-`logp_mismatch` stays near zero; listen to `monitor/step-*/` audio. Stop when held-out metrics fall while the reward
-rises (hacking).
+(group spread), `degenerate_groups` and `floored_groups` (composite spread under c, degenerate ones included) say
+whether sigma/window give a usable signal; `kl_ref` grows slowly; `logp_mismatch` stays near zero; listen to
+`monitor/step-*/` audio. Stop when held-out metrics fall while the reward rises (hacking).
 """
 
 import copy
@@ -499,19 +502,32 @@ def standardize(values, floor=0.0, eps=1e-8):
     return (values - values.mean()) / max(float(values.std()), floor, eps)
 
 
-def group_advantages(raw, weights, signs=None, floors=None, mode="standardized", eps=1e-4):
-    """Per-term z-scores inside the group (sign-aware, spread floored), weighted sum, then the advantage."""
+def composite_floor(weights):
+    """Smallest composite spread counted as signal: a term moving by exactly its floor has z-spread 1 and spreads
+    R = sum_k w_k z_k by |w_k|, so the lightest active term sets the bar (z-score units, scale-free in the weights)."""
+    return min(abs(weight) for weight in weights.values() if weight)
+
+
+def group_advantages(raw, weights, signs=None, floors=None, mode="standardized", eps=1e-4, stats=None):
+    """Per-term z-scores inside the group (sign-aware, spread floored), weighted sum, then the advantage.
+
+    `standardized` divides the centred composite by max(std + eps, composite_floor): judge jitter below every term's
+    floor stays small instead of being rescaled to unit variance, and groups with real spread are unchanged. `stats`
+    (a dict) receives the composite spread, the floor and whether the group fell under it.
+    """
     signs, floors = signs or {}, floors or {}
     active = [name for name, weight in weights.items() if weight]
     if not active:
         raise ValueError("No active reward term")
+    if mode not in ("standardized", "weighted"):
+        raise ValueError("advantage must be standardized or weighted")
     composite = sum(weights[k] * signs.get(k, 1) * standardize(raw[k], floors.get(k, 0.0)) for k in active)
+    spread, floor = float(composite.std()), composite_floor({k: weights[k] for k in active})
+    if stats is not None:
+        stats.update(composite_std=spread, composite_floor=floor, under_floor=spread + eps < floor)
     if mode == "weighted":
         return composite / sum(abs(weights[k]) for k in active)
-    if mode != "standardized":
-        raise ValueError("advantage must be standardized or weighted")
-    spread = float(composite.std())
-    return np.zeros_like(composite) if spread == 0 else (composite - composite.mean()) / (spread + eps)
+    return np.zeros_like(composite) if spread == 0 else (composite - composite.mean()) / max(spread + eps, floor)
 
 
 class CompositeReward:
@@ -547,8 +563,8 @@ class CompositeReward:
             raw[name] = values
         return raw
 
-    def advantages(self, raw):
-        return group_advantages(raw, self.weights, self.signs, self.floors, self.advantage, self.eps)
+    def advantages(self, raw, stats=None):
+        return group_advantages(raw, self.weights, self.signs, self.floors, self.advantage, self.eps, stats)
 
 
 class Judges:
@@ -915,14 +931,17 @@ def grpo_train(args, reward=None, monitor=None):
         for step in range(1, args.steps + 1):
             started = time.perf_counter()
             window = choose_window(args.sample_steps, args.sde_window, args.window_max, rng)
-            rollouts = []
+            rollouts, floored = [], 0
             policy.eval()
             for _ in range(args.prompts_per_step):
                 prompt = source.draw(rng)
                 with autocast(device, args.precision):
                     r = rollout(policy, prompt, args.group_size, window, args, generator, args.shared_noise)
                 r.raw = reward.score(Group(prompt, r.latents, decoder))
-                r.advantages = torch.as_tensor(reward.advantages(r.raw), dtype=torch.float32, device=device)
+                group_stats = {}
+                advantages = reward.advantages(r.raw, group_stats)
+                r.advantages = torch.as_tensor(advantages, dtype=torch.float32, device=device)
+                floored += group_stats["under_floor"]
                 rollouts.append(r)
             sampled = time.perf_counter()
             stats = grpo_update(policy, reference, optimizer, ema, rollouts, args, device)
@@ -934,6 +953,7 @@ def grpo_train(args, reward=None, monitor=None):
                     "reward": {k: float(np.mean([r.raw[k].mean() for r in rollouts])) for k in names},
                     "reward_std": {k: float(np.mean([r.raw[k].std() for r in rollouts])) for k in names},
                     "degenerate_groups": sum(not bool((r.advantages != 0).any()) for r in rollouts),
+                    "floored_groups": floored,
                     **stats,
                     "rollout_seconds": sampled - started,
                     "update_seconds": time.perf_counter() - sampled,
@@ -971,7 +991,7 @@ def oracle_best_of_n(args, reward=None):
     generator = torch.Generator(device=device).manual_seed(args.seed)
     names = list(reward.weights)
     picks = {key: {k: [] for k in names} for key in ("first", "mean", "best", "term_best", "group_std")}
-    degenerate = 0
+    degenerate = floored = 0
     sde = args.sampler == "sde"
     with open(output / "oracle.jsonl", "x") as stream:
         for i, prompt in enumerate(prompts):
@@ -980,8 +1000,10 @@ def oracle_best_of_n(args, reward=None):
                 r = rollout(model, prompt, args.candidates, window, args, generator, sde and args.shared_noise)
             group = Group(prompt, r.latents, decoder)
             raw = reward.score(group)
-            advantages = reward.advantages(raw)
+            group_stats = {}
+            advantages = reward.advantages(raw, group_stats)
             degenerate += not np.any(advantages)
+            floored += group_stats["under_floor"]
             best = int(np.argmax(advantages))
             for k in names:
                 values, sign = raw[k], reward.signs[k]
@@ -1006,6 +1028,7 @@ def oracle_best_of_n(args, reward=None):
         "sampler": args.sampler,
         "weights": reward.weights,
         "degenerate_groups": degenerate,
+        "floored_groups": floored,
         **{key: {k: float(np.mean(v)) for k, v in table.items()} for key, table in picks.items()},
     }
     (output / "summary.json").write_text(json.dumps(summary, indent=2))
