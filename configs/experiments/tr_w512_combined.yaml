@@ -1,5 +1,5 @@
 # Combined recipe (integration branch, tracking issue #17): configs/nano_tr_w512.yaml (run C) plus the options
-# with the strongest evidence in docs/arastirma-raporu-2026-09-24.md, each commented with its issue number.
+# with the strongest evidence in docs/research-report-2026-09-24.md, each commented with its issue number.
 # The DiT block options of #9 (long_skip, value_residual, ffn_conv_kernel, attn_gate, ffn_activation,
 # final_adaln, cond_text_pool) and #14's dropout / model guidance stay OFF: they need their individual A/Bs first.
 # Needs, next to the cache (see each issue's GPU notes):

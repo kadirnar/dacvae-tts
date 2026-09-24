@@ -88,7 +88,7 @@ Measured on a 40k-update checkpoint (901 h of podcast speech, one GPU): held-out
 (Whisper small.en), unseen-text sentences WER 11%, random word lists 6%, DNSMOS ≈ prompt level.
 The remaining errors are single-word repeats and drops; the contrastive term targets them and has
 not yet been evaluated at scale. The reasoning behind every choice, block by block:
-[docs/arastirma-raporu-2026-09-24.md](docs/arastirma-raporu-2026-09-24.md) (Turkish).
+[docs/research-report-2026-09-24.md](docs/research-report-2026-09-24.md).
 
 ## Turkish model and demo
 
@@ -107,19 +107,21 @@ Serving pieces used by the demo, all usable from Python and the CLI:
 - `Synthesizer.synthesize_many(texts, voice, candidates=N)`: sentence chunks and best-of-N candidates in padded batches.
 - `scripts/eval_sentences.py` takes the same options plus `--candidates N` (Whisper-ranked best-of-N).
 
-Results and decisions (Turkish): [docs/turkce-arastirma-2026-09-22.md](docs/turkce-arastirma-2026-09-22.md).
+Results and decisions: [docs/turkish-experiments-2026-09-22.md](docs/turkish-experiments-2026-09-22.md).
 
 ## More
 
 - [docs/reference.md](docs/reference.md): the detailed reference (all commands, flags, Tiny/Small
   baselines, DDP, post-training, evaluation protocols, limits).
-- [docs/arastirma-raporu-2026-09-24.md](docs/arastirma-raporu-2026-09-24.md): block-by-block architecture,
-  training and quality research for small Turkish models (Turkish), with the evaluation caveats (SIM metric,
+- [docs/research-report-2026-09-24.md](docs/research-report-2026-09-24.md): block-by-block architecture,
+  training and quality research for small Turkish models, with the evaluation caveats (SIM metric,
   Freya comparability, confidence intervals).
-- [docs/yol-haritasi.md](docs/yol-haritasi.md): the roadmap and its GitHub issues (tracking issue #17).
-- [docs/inceleme-ve-mimari-2026-09-24.md](docs/inceleme-ve-mimari-2026-09-24.md): code review fixes, training-free
-  evidence (interval calibration, Turkish normalization, speaker leakage) and the optional character units, prompt
-  tempo perturbation, speaker-embedding condition and multi-clip speaker context (Turkish).
+- [docs/roadmap.md](docs/roadmap.md): the roadmap and its GitHub issues (tracking issue #17).
+- [docs/review-and-architecture-2026-09-24.md](docs/review-and-architecture-2026-09-24.md): code review fixes,
+  training-free evidence (interval calibration, Turkish normalization, speaker leakage) and the optional character
+  units, prompt tempo perturbation, speaker-embedding condition and multi-clip speaker context.
+- [scripts/gpu/README.md](scripts/gpu/README.md): the GPU runbook for the experiments that remain (evaluation
+  protocol, inference options, the 20k-update training A/Bs, model-guidance fine-tune, WSD, Flow-GRPO).
 - `configs/tiny.yaml`, `configs/small.yaml`: the original baselines, untouched by the nano changes.
 
 The DACVAE codec keeps its upstream license; this repository ships no trained voice model.
