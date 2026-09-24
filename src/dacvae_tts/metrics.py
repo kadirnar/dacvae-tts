@@ -166,6 +166,79 @@ class DNSMOS:
         return dict(zip(("dnsmos_sig", "dnsmos_bak", "dnsmos_ovrl"), map(float, scores)))
 
 
+DNSMOS_CALIBRATION = (
+    (-0.08397278, 1.22083953, 0.0052439),
+    (-0.13166888, 1.60915514, -0.39604546),
+    (-0.06766283, 1.11546468, 0.04602535),
+)
+
+
+def dnsmos_windows(audio, size=144160, hop=16000):
+    """The official 9.01 s windows at 1 s hops of one 16 kHz clip (short clips tiled), as a [W, size] array."""
+    audio = np.asarray(audio, dtype=np.float32)
+    if not audio.size or not np.isfinite(audio).all():
+        raise ValueError("Cannot score empty/nonfinite audio")
+    while len(audio) < size:
+        audio = np.tile(audio, 2)
+    count = int(np.floor(len(audio) / hop) - 9.01) + 1
+    return np.stack([audio[i * hop : i * hop + size] for i in range(count)])
+
+
+class TorchDNSMOS:
+    """The same sig_bak_ovr.onnx model converted to PyTorch (onnx2torch), batched over windows on any device.
+
+    Identical windows, calibration and averaging as `DNSMOS`; the converted graph matches onnxruntime to ~1e-6 on
+    the raw outputs. ~100x faster than one-thread CPU sessions on a GPU, which matters for corpus-scale scoring.
+    """
+
+    def __init__(self, model_path, device="cuda", batch=32):  # ~69 MB of activations per window
+        import onnx
+        import torch
+        from onnx2torch import convert
+
+        self.torch, self.device, self.batch = torch, torch.device(device), batch
+        self.model = convert(onnx.load(str(model_path))).eval().to(self.device)
+
+    def score_many(self, audios):
+        torch = self.torch
+        windows, owners, results = [], [], [None] * len(audios)
+        for index, audio in enumerate(audios):
+            try:
+                clip = dnsmos_windows(audio)
+            except ValueError as error:
+                results[index] = {"dnsmos_error": str(error)}
+                continue
+            windows.append(clip)
+            owners += [index] * len(clip)
+        if not windows:
+            return results
+        stacked = np.concatenate(windows)
+        raw = []
+        # Strict FP32 (TF32 convolutions/matmuls move MOS by ~0.006), restored afterwards for the caller.
+        flags = torch.backends.cudnn.allow_tf32, torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cudnn.allow_tf32 = torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            with torch.inference_mode():
+                for start in range(0, len(stacked), self.batch):
+                    chunk = torch.from_numpy(stacked[start : start + self.batch]).to(self.device)
+                    raw.append(self.model(chunk).float().reshape(-1, 3).cpu().numpy())
+        finally:
+            torch.backends.cudnn.allow_tf32, torch.backends.cuda.matmul.allow_tf32 = flags
+        raw = np.concatenate(raw)
+        calibrated = np.stack([np.polyval(coeff, raw[:, k]) for k, coeff in enumerate(DNSMOS_CALIBRATION)], 1)
+        owners = np.asarray(owners)
+        for index in np.unique(owners):
+            scores = calibrated[owners == index].mean(0)
+            results[index] = dict(zip(("dnsmos_sig", "dnsmos_bak", "dnsmos_ovrl"), map(float, scores)))
+        return results
+
+    def __call__(self, audio):
+        result = self.score_many([audio])[0]
+        if "dnsmos_error" in result:
+            raise ValueError(result["dnsmos_error"])
+        return result
+
+
 # What changes a row's WER/CER/SIM for the same audio: kept in every result row (`row_identity`) so that
 # comparison.compare_evaluations can refuse to pair runs scored differently; the full identity (library versions,
 # model revisions, hashes) goes to the summary.

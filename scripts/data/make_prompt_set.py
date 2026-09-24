@@ -92,6 +92,7 @@ def main(argv=None):
     parser.add_argument("--speakers", type=int, default=48)
     parser.add_argument("--exclude-sentences", nargs="*", default=[], help="Evaluation sentence files (jsonl/txt)")
     parser.add_argument("--dnsmos", help="sig_bak_ovr.onnx: rank clips by DNSMOS OVRL (else by duration)")
+    parser.add_argument("--dnsmos-device", default="cpu", help="cuda: the PyTorch conversion of the same model")
     parser.add_argument("--min-seconds", type=float, default=3.5)
     parser.add_argument("--max-seconds", type=float, default=12.0)
     parser.add_argument("--min-words", type=int, default=4)
@@ -100,9 +101,9 @@ def main(argv=None):
     excluded = {match_key(text) for path in args.exclude_sentences for text in load_sentences(path)}
     scorer = None
     if args.dnsmos:
-        from dacvae_tts.metrics import DNSMOS
+        from dacvae_tts.metrics import DNSMOS, TorchDNSMOS
 
-        scorer = DNSMOS(args.dnsmos)
+        scorer = DNSMOS(args.dnsmos) if args.dnsmos_device == "cpu" else TorchDNSMOS(args.dnsmos, args.dnsmos_device)
     from scipy.signal import resample_poly
 
     rows = parquet_rows(args.parquet) if args.parquet else release_rows(args.cv_dir, args.split)

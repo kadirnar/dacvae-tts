@@ -22,7 +22,7 @@ import pyarrow.parquet as pq
 import soundfile as sf
 from scipy.signal import resample_poly
 
-from dacvae_tts.metrics import DNSMOS, error_counts
+from dacvae_tts.metrics import DNSMOS, TorchDNSMOS, error_counts
 
 
 def row_uid(name, index, row):
@@ -81,6 +81,16 @@ def main():
     parser.add_argument("--dnsmos", help="Path to sig_bak_ovr.onnx")
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--limit", type=int, default=0, help="Rows per shard (0 = all), for smoke tests")
+    parser.add_argument(
+        "--metric-normalization", choices=["turkish-v1", "turkish-v2"], default="turkish-v1",
+        help="Normalization of the WER/CER written per clip (turkish-v2 for caches prepared with turkish-v2)",
+    )
+    parser.add_argument("--chunk-rows", type=int, default=2000, help="Rows read (and held in RAM) at a time")
+    parser.add_argument(
+        "--dnsmos-device", default="cpu",
+        help="cpu: onnxruntime worker pool (the official runtime); cuda: the same model converted to PyTorch "
+             "(TorchDNSMOS, matches onnxruntime to ~1e-5 MOS) and batched on the GPU, ~100x faster",
+    )
     args = parser.parse_args()
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
@@ -97,12 +107,14 @@ def main():
     processor = WhisperProcessor.from_pretrained(hf_name)
     model = WhisperForConditionalGeneration.from_pretrained(hf_name, torch_dtype=torch.float16).to(args.device).eval()
     pool = mp.get_context("spawn").Pool(args.workers)
+    gpu_dnsmos = TorchDNSMOS(args.dnsmos, args.dnsmos_device) if args.dnsmos and args.dnsmos_device != "cpu" else None
     files = sorted(Path(args.raw).glob("*.parquet"))
     started = time.time()
     total = 0
 
     def transcribe(audios):
-        features = processor(audios, sampling_rate=16000, return_tensors="pt").input_features
+        # Log-mel on the scoring device: numpy features cost ~1 s per 48 clips on a busy CPU (more than decoding).
+        features = processor(audios, sampling_rate=16000, return_tensors="pt", device=args.device).input_features
         with torch.inference_mode():
             ids = model.generate(
                 features.to(args.device, torch.float16), language=args.language, task="transcribe",
@@ -110,54 +122,73 @@ def main():
             )
         return processor.batch_decode(ids, skip_special_tokens=True)
 
+    def row_chunks(file):
+        """(first row index, rows) over groups of row groups: a 4.7 GB shard read whole took ~25 GB of RAM."""
+        source = pq.ParquetFile(file)
+        offset, groups = 0, max(1, args.chunk_rows // max(1, source.metadata.row_group(0).num_rows))
+        for first in range(0, source.num_row_groups, groups):
+            rows = source.read_row_groups(list(range(first, min(first + groups, source.num_row_groups)))).to_pylist()
+            yield offset, rows
+            offset += len(rows)
+
     with open(log, "a") as stream:
         for file in files:
             name = f"data/{file.name}"
-            table = pq.read_table(file)
-            rows = table.to_pylist()
-            if args.limit:
-                rows = rows[: args.limit]
-            meta = {row_uid(name, i, r): r for i, r in enumerate(rows)}
-            items = [(uid, row_audio(r, file.parent)) for uid, r in meta.items() if uid not in done]
-            decoded = pool.map(decode, items, chunksize=8)
-            dnsmos_jobs = [(args.dnsmos, uid, audio) for uid, audio, err in decoded if err is None and audio is not None]
-            dnsmos_results = pool.map_async(dnsmos_worker, dnsmos_jobs, chunksize=4) if args.dnsmos else None
-            results = {}
-            usable = [(uid, audio) for uid, audio, err in decoded if err is None and audio is not None and len(audio) >= 1600]
-            for uid, audio, err in decoded:
-                if err is not None or audio is None or len(audio) < 1600:
-                    results[uid] = {"error": err or "too short"}
-            for start in range(0, len(usable), args.batch_size):
-                chunk = usable[start : start + args.batch_size]
-                hypotheses = transcribe([a for _, a in chunk])
-                for (uid, _), hypothesis in zip(chunk, hypotheses):
-                    hypothesis = hypothesis.strip()
-                    try:
-                        counts = error_counts(meta[uid]["text"], hypothesis, "turkish-v1")
-                    except ValueError as error:
-                        counts = {"error": str(error)}
-                    results[uid] = {"hypothesis": hypothesis, **counts}
-                if (start // args.batch_size) % 20 == 0:
-                    print(f"  {file.name}: {start + len(chunk)}/{len(usable)} transcribed, {(time.time() - started) / 60:.1f} min", flush=True)
-            if dnsmos_results is not None:
-                for uid, score in dnsmos_results.get():
-                    results.setdefault(uid, {}).update(score)
-            for uid, _ in items:
-                r = meta[uid]
-                record = {
-                    "uid": uid,
-                    "text": r["text"],
-                    "duration_seconds": r.get("duration_seconds"),
-                    "quality_score": r.get("quality_score"),
-                    "speaker": r.get("speaker"),
-                    **results.get(uid, {}),
-                }
-                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-            stream.flush()
-            total += len(items)
-            elapsed = time.time() - started
-            print(f"{file.name}: {len(items)} rows, total {total}, {elapsed/60:.1f} min", flush=True)
-            del table, rows, decoded
+            for base, rows in row_chunks(file):
+                if args.limit:
+                    if base >= args.limit:
+                        break
+                    rows = rows[: args.limit - base]
+                meta = {row_uid(name, base + i, r): r for i, r in enumerate(rows)}
+                items = [(uid, row_audio(r, file.parent)) for uid, r in meta.items() if uid not in done]
+                decoded = pool.map(decode, items, chunksize=8)
+                dnsmos_jobs = [(args.dnsmos, uid, audio) for uid, audio, err in decoded if err is None and audio is not None]
+                dnsmos_results = None
+                if args.dnsmos and args.dnsmos_device == "cpu":
+                    dnsmos_results = pool.map_async(dnsmos_worker, dnsmos_jobs, chunksize=4)
+                results = {}
+                usable = [(uid, audio) for uid, audio, err in decoded if err is None and audio is not None and len(audio) >= 1600]
+                # Similar lengths per batch: generation runs until the longest transcript of the batch ends.
+                usable.sort(key=lambda item: len(item[1]))
+                for uid, audio, err in decoded:
+                    if err is not None or audio is None or len(audio) < 1600:
+                        results[uid] = {"error": err or "too short"}
+                for start in range(0, len(usable), args.batch_size):
+                    chunk = usable[start : start + args.batch_size]
+                    hypotheses = transcribe([a for _, a in chunk])
+                    for (uid, _), hypothesis in zip(chunk, hypotheses):
+                        hypothesis = hypothesis.strip()
+                        try:
+                            counts = error_counts(meta[uid]["text"], hypothesis, args.metric_normalization)
+                        except ValueError as error:
+                            counts = {"error": str(error)}
+                        results[uid] = {"hypothesis": hypothesis, **counts}
+                    if (start // args.batch_size) % 20 == 0:
+                        print(f"  {file.name}: {start + len(chunk)}/{len(usable)} transcribed, {(time.time() - started) / 60:.1f} min", flush=True)
+                if dnsmos_results is not None:
+                    for uid, score in dnsmos_results.get():
+                        results.setdefault(uid, {}).update(score)
+                elif args.dnsmos:
+                    for start in range(0, len(dnsmos_jobs), 512):
+                        chunk = dnsmos_jobs[start : start + 512]
+                        for (_, uid, _), score in zip(chunk, gpu_dnsmos.score_many([audio for _, _, audio in chunk])):
+                            results.setdefault(uid, {}).update(score)
+                for uid, _ in items:
+                    r = meta[uid]
+                    record = {
+                        "uid": uid,
+                        "text": r["text"],
+                        "duration_seconds": r.get("duration_seconds"),
+                        "quality_score": r.get("quality_score"),
+                        "speaker": r.get("speaker") if r.get("speaker") is not None else r.get("speaker_id"),
+                        **results.get(uid, {}),
+                    }
+                    stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+                stream.flush()
+                total += len(items)
+                elapsed = time.time() - started
+                print(f"{file.name}: {len(items)} rows, total {total}, {elapsed/60:.1f} min", flush=True)
+                del rows, decoded
     pool.close()
     pool.join()
 
