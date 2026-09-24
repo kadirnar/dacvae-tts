@@ -1,10 +1,10 @@
 """Turkish text frontend for synthesis: free user text -> text the Turkish normalizations accept, and sentence chunks.
 
 `turkish.normalize_turkish` (versions `turkish-v1`, `turkish-v2`) is the training normalization: it spells out numbers
-and rejects every character the byte model never saw. Text typed into a demo is messier: currency and unit symbols, dates and
-clock times written with dots, abbreviations, acronyms, e-mail addresses, emoji and foreign letters. `prepare_text`
-rewrites these into spoken Turkish words first and drops what cannot be spoken, reporting every change, so that
-synthesis never fails on a stray symbol. Plain Turkish sentences pass through unchanged.
+and rejects every character the byte model never saw. Text typed into a demo is messier: currency and unit symbols,
+dates and clock times written with dots, abbreviations, acronyms, e-mail addresses, emoji and foreign letters.
+`prepare_text` rewrites these into spoken Turkish words first and drops what cannot be spoken, reporting every change,
+so that synthesis never fails on a stray symbol. Plain Turkish sentences pass through unchanged.
 
 `split_sentences` cuts long text into sentence-based chunks short enough for the model (training utterances were at
 most ~20 s including the voice prompt).
@@ -305,7 +305,7 @@ def prepare_text(text):
         if unicodedata.category(c) == "Mn":  # a mark NFKC could not attach: "i̇stanbul" from a non-Turkish lower()
             r.changes.append(f"birleşik işaret çıkarıldı: U+{ord(c):04X}")
             continue
-        base ="".join(b for b in unicodedata.normalize("NFKD", c) if unicodedata.category(b) != "Mn")
+        base = "".join(b for b in unicodedata.normalize("NFKD", c) if unicodedata.category(b) != "Mn")
         if base and all(b in ALLOWED for b in base):
             out.append(base)
             r.changes.append(f"yabancı harf: {c!r} → {base!r}")
