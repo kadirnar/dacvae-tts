@@ -1,0 +1,56 @@
+# Issue #14 (c): model-guidance fine-tune of run C (--init-from runs/tr-w512-clean/step-0060000.pt). The target
+# becomes v + w sg(v_cond - v_null) from the model's own conditional and null predictions (arXiv:2502.12154; on
+# F5-TTS, arXiv:2504.20334: MOS 4.026 -> 4.159, WER 2.28 -> 1.96 without CFG, and CFG on top lowers MOS). The
+# fixed point bakes in CFG scale 1 / (1 - w): w 0.7 ~ 3.3, w 0.5 ~ 2 (the second variant); w >= 1 diverges.
+# Sample with --guidance 1 (checkpoints carry recommended_guidance: 1.0): one forward per step instead of two.
+# Short schedule at the stage-2 LR; the contrastive hinge is off (it would compare a guided positive with a
+# plain negative). The primary EMA is 0.9995 because 0.9999 is too slow for an 8k-update fine-tune; 0.999 is
+# kept as a second track (ema_0.999). One extra no-grad forward per update: ~+30% time.
+model:
+  width: 512
+  depth: 12
+  heads: 8
+  text_depth: 4
+  text_attention: 4
+  patch_size: 1
+  latent_dim: 128
+  positions: rope
+  qk_norm: true
+  prediction: edm
+  text_layout: joined
+  duration: rule
+  cond_dropout: 0.2
+  ctc_layer: 8
+  adaln_rank: 64
+train:
+  steps: 8000
+  batch_size: 96
+  accumulation: 1
+  learning_rate: 0.0002
+  warmup: 300
+  weight_decay: 0.01
+  optimizer: muon
+  muon_momentum: 0.95
+  ema_decay: 0.9995
+  precision: bf16
+  workers: 4
+  prefetch_factor: 4
+  checkpoint_every: 1000
+  keep_every: 2000
+  validate_every: 1000
+  log_every: 100
+  grad_checkpoint: true
+  compile: false
+  seed: 42
+  flow_reduction: frame
+  pairing: within
+  prompt_fraction_min: 0.1
+  prompt_fraction_max: 0.6
+  prompt_dropout: 0.3
+  time_sampling: logit_normal
+  batch_expansion: 4
+  ctc_weight: 0.1
+  contrastive_weight: 0.0
+  wandb_project: dacvae-tts-tr
+  ema_decays: [0.9995, 0.999]
+  model_guidance_weight: 0.7

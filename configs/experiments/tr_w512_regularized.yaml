@@ -1,0 +1,53 @@
+# Issue #14 (b): run C (configs/nano_tr_w512.yaml) with dropout 0.1 and weight decay 0.05. The 51M model's
+# validation flow plateaus after ~30k updates while the training flow keeps falling (~93 h of data): mild
+# overfitting. F5-TTS's DiT trains with dropout 0.1 (attention outputs and FFN hidden). Only these two values
+# differ from run C; weight_decay 0.1 is the second variant of the sweep. Dropout has no parameters, so these
+# checkpoints warm-start fine-tunes with or without dropout.
+model:
+  width: 512
+  depth: 12
+  heads: 8
+  text_depth: 4
+  text_attention: 4
+  patch_size: 1
+  latent_dim: 128
+  positions: rope
+  qk_norm: true
+  prediction: edm
+  text_layout: joined
+  duration: rule
+  cond_dropout: 0.2
+  ctc_layer: 8
+  adaln_rank: 64
+  dropout: 0.1
+train:
+  steps: 60000
+  batch_size: 96
+  accumulation: 1
+  learning_rate: 0.0008
+  warmup: 2000
+  weight_decay: 0.05
+  optimizer: muon
+  muon_momentum: 0.95
+  ema_decay: 0.9999
+  precision: bf16
+  workers: 4
+  prefetch_factor: 4
+  checkpoint_every: 1000
+  keep_every: 5000
+  validate_every: 1000
+  log_every: 100
+  grad_checkpoint: true
+  compile: false
+  seed: 42
+  flow_reduction: frame
+  pairing: within
+  prompt_fraction_min: 0.1
+  prompt_fraction_max: 0.6
+  prompt_dropout: 0.3
+  time_sampling: logit_normal
+  batch_expansion: 4
+  ctc_weight: 0.1
+  contrastive_weight: 0.2
+  contrastive_margin: 0.1
+  wandb_project: dacvae-tts-tr

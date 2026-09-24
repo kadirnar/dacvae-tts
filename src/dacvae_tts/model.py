@@ -245,6 +245,22 @@ class Block(nn.Module):
         return x if self.value_mix is None else (x, first_value)
 
 
+def _output_dropout(module, args, output):
+    return F.dropout(output, module.output_dropout, module.training)
+
+
+def add_dropout(block, p):
+    """Residual-branch dropout where F5-TTS's DiT has it (0.1): after both attention output projections and on
+    the FFN hidden activation. Only parameter-free pieces are added (an output hook, a Dropout next to the
+    activation), so state-dict keys, initialization and checkpoints are the same with and without it."""
+    if not isinstance(block.ff[1], nn.GELU):
+        raise TypeError("Dropout expects the block feed-forward as Linear, GELU, Linear")
+    block.ff[1] = nn.Sequential(block.ff[1], nn.Dropout(p))
+    for attention in (block.self_attn, block.cross_attn):
+        attention.output_dropout = p
+        attention.register_forward_hook(_output_dropout)
+
+
 class FlowTTS(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -258,6 +274,9 @@ class FlowTTS(nn.Module):
         self.time = nn.Sequential(nn.Linear(d, d), nn.SiLU(), nn.Linear(d, d))
         self.input = nn.Linear((2 * c + 1) * p, d)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.depth)])
+        if cfg.dropout:  # at 0 nothing is installed, so default runs draw exactly the same random numbers
+            for block in self.blocks:
+                add_dropout(block, cfg.dropout)
         self.ada_shared = None
         if cfg.adaln_rank:
             self.ada_shared = nn.Sequential(nn.SiLU(), nn.Linear(d, d * 9))
@@ -547,6 +566,7 @@ def flow_loss(
     cached=None,
     time_sampling="uniform",
     hidden_layers=(),
+    guidance_weight=0.0,
 ):
     """Per-example flow losses; `return_details` adds diagnostics, the CTC term and, for nonempty
     `hidden_layers`, the requested block outputs under "hidden" (training-only teacher terms)."""
@@ -592,6 +612,8 @@ def flow_loss(
         pred, logits, token_valid = pred
         ctc = ctc_alignment_loss(logits, token_valid, batch["tokens"], drop, *ctc_labels(model, batch))
     target = flow_target(model, x1, noise, time)
+    if guidance_weight:
+        target = target + guidance_weight * guidance_direction(model, pred, xt, time, batch, drop, cached)
     losses = per_example_mse(pred, target, mask, strict)
     if return_details:
         counts = mask.sum(1)
@@ -624,6 +646,34 @@ def ctc_labels(model, batch):
         return batch["ctc_targets"], batch["ctc_target_lengths"]
     device = batch["tokens"].device
     return tuple(value.to(device) for value in char_ctc_targets(batch["tokens"].cpu()))
+
+
+def guidance_direction(model, prediction, xt, time, batch, drop, cached=None):
+    """sg(out_cond - out_null) at the training (x_t, t), the model-guidance direction; 0 on CFG-dropped rows.
+
+    The null branch drops text, voice and prompt exactly like condition dropout (and the sampler's CFG null
+    branch). Output differences are the right quantity in either parameterization: EDM's `to_velocity` is
+    affine in the output with slope 1/sqrt(t^2 + (1-t)^2) and an offset that depends only on (x_t, t), the
+    same for both branches on target frames, so target + w (F_cond - F_null) is exactly the F-space image of
+    the velocity target v + w (v_cond - v_null). Without model dropout the conditional output is the training
+    forward itself (same inputs and weights); with dropout both branches are recomputed in eval mode so the
+    direction carries no dropout noise.
+    """
+    inputs = (xt, time, batch["prompt"], batch["prompt_mask"], batch["valid"])
+    inputs += (batch["tokens"], batch["segments"])
+    extra = {} if cached is None else {"cached": cached}
+    with torch.no_grad():
+        if model.training and getattr(model.cfg, "dropout", 0) > 0:
+            model.eval()
+            try:
+                cond = model(*inputs, drop=torch.zeros_like(drop), **extra)
+                null = model(*inputs, drop=torch.ones_like(drop), **extra)
+            finally:
+                model.train()
+        else:
+            cond = prediction.detach()
+            null = model(*inputs, drop=torch.ones_like(drop), **extra)
+    return (cond - null).masked_fill(drop[:, None, None], 0)
 
 
 def ctc_alignment_loss(logits, token_valid, tokens, drop, targets=None, target_lengths=None):

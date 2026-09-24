@@ -44,6 +44,9 @@ class ModelConfig:
     tla_layers: object = ()  # TLA-SA: blocks aligned to the utterance speaker embedding; (), "all" or a list
     tla_dim: int = 0  # width of the stored speaker embeddings (192 for SpeechBrain ECAPA)
     tla_hidden: int = 256  # width of the per-block heads and of the time -> block-weight network
+    # Residual-branch dropout in the generator blocks (attention outputs, FFN hidden activation); F5-TTS's
+    # DiT uses 0.1. Parameter-free, so checkpoints load with any value; 0 draws no random numbers at all.
+    dropout: float = 0.0
 
     def __post_init__(self):
         if min(self.latent_dim, self.width, self.depth, self.heads, self.patch_size) < 1:
@@ -93,6 +96,8 @@ class ModelConfig:
             raise ValueError("repa_layer must differ from ctc_layer; align speech after the CTC block")
         if self.tla_layers and (self.tla_dim < 1 or self.tla_hidden < 1):
             raise ValueError("tla_layers need positive tla_dim and tla_hidden")
+        if not 0 <= self.dropout < 1:
+            raise ValueError("dropout must lie in [0,1)")
 
 
 def teacher_blocks(value, depth):
@@ -194,6 +199,31 @@ class TrainConfig:
     speaker_embeddings: str = ""  # TLA-SA utterance speaker-embedding store (e.g. teacher/ecapa-speechbrain)
     tla_weight: float = 0.0  # TLA-SA used 0.5
     tla_entropy: float = 0.01  # weight of the negative entropy of the time-dependent block weights
+    # Schedule and regularization options (issue #14); every default reproduces the original recipe exactly.
+    # wsd: warmup, constant LR, then a decay over the last `decay_fraction` of the updates. A 20% 1-sqrt
+    # cooldown matches cosine and any stable-phase checkpoint can branch into a cooldown (Hägele et al.,
+    # arXiv:2405.18392); Echo-TTS and Irodori train with Muon + WSD.
+    lr_schedule: str = "cosine"  # cosine (warmup + cosine to min_lr_ratio) or wsd
+    decay_fraction: float = 0.2  # wsd: share of all updates in the final decay
+    decay_shape: str = "1-sqrt"  # wsd: 1-sqrt or linear decay
+    min_lr_ratio: float = 0.1  # final LR / peak LR of either schedule (0.1: the original cosine floor)
+    # wsd: from the decay start on, train on this second merged cache (e.g. the hq subset), MiniCPM's
+    # (arXiv:2404.06395) switch to high-quality data in the decay: the warm-started stages in one run.
+    decay_cache: object = None
+    # Time sampling from `final_time_sampling_start` on (a fraction of `steps`, or "decay": the wsd decay
+    # start). BareWave (arXiv:2606.09048), logit-normal -> uniform late: SIM 0.522 -> 0.543,
+    # UTMOS 3.70 -> 3.82, WER flat (2.86 -> 2.93).
+    final_time_sampling: object = None  # null, uniform or logit_normal
+    final_time_sampling_start: object = "decay"
+    # More EMA tracks, saved next to `ema` (which keeps `ema_decay`) as `ema_<decay>`, validated and loadable
+    # with load_model(..., ema=<decay>). The best EMA length depends on the run and on CFG (EDM2,
+    # arXiv:2312.02696); 0.9999 is too slow for <15k-update fine-tunes. `ema_decay` itself may be listed.
+    ema_decays: list = field(default_factory=list)
+    # Model guidance (arXiv:2502.12154; on F5-TTS arXiv:2504.20334): the target becomes
+    # v + w sg(v_cond - v_null) from the model's own predictions; sample without CFG (--guidance 1). The fixed
+    # point bakes in CFG scale 1 / (1 - w) (w 0.5 ~ 2, 0.7 ~ 3.3); w >= 1 diverges. One extra no-grad forward
+    # per update (~+30%); meant for fine-tuning a trained checkpoint with --init-from.
+    model_guidance_weight: float = 0.0
 
     def __post_init__(self):
         if self.worker_threads < 1 or self.prefetch_factor < 1:
@@ -285,6 +315,35 @@ class TrainConfig:
             self.tla_weight and not self.speaker_embeddings
         ):
             raise ValueError("repa_weight needs teacher_features and tla_weight needs speaker_embeddings")
+        if self.lr_schedule not in {"cosine", "wsd"} or self.decay_shape not in {"linear", "1-sqrt"}:
+            raise ValueError("lr_schedule must be cosine or wsd; decay_shape linear or 1-sqrt")
+        if not 0 < self.decay_fraction <= 1 or not 0 <= self.min_lr_ratio <= 1:
+            raise ValueError("decay_fraction must lie in (0,1] and min_lr_ratio in [0,1]")
+        if self.lr_schedule == "wsd" and self.steps - round(self.steps * self.decay_fraction) < self.warmup:
+            raise ValueError("The wsd decay would start inside the warmup; lower decay_fraction or warmup")
+        if self.decay_cache is not None and (
+            not isinstance(self.decay_cache, str) or self.lr_schedule != "wsd"
+        ):
+            raise ValueError("decay_cache is a cache path and needs lr_schedule: wsd")
+        start = self.final_time_sampling_start
+        if self.final_time_sampling not in {None, "uniform", "logit_normal"} or not (
+            start == "decay"
+            or (isinstance(start, (int, float)) and not isinstance(start, bool) and 0 < start < 1)
+        ):
+            raise ValueError("final_time_sampling: null, uniform or logit_normal; start: decay or in (0,1)")
+        if self.final_time_sampling is not None and start == "decay" and self.lr_schedule != "wsd":
+            raise ValueError("final_time_sampling_start: decay needs lr_schedule: wsd; give a fraction")
+        if (
+            not isinstance(self.ema_decays, list)
+            or len(set(self.ema_decays)) != len(self.ema_decays)
+            or not all(isinstance(d, float) and 0 <= d < 1 for d in self.ema_decays)
+        ):
+            raise ValueError("ema_decays must be a list of distinct decays in [0,1)")
+        if not 0 <= self.model_guidance_weight < 1:
+            raise ValueError("model_guidance_weight must lie in [0,1); w >= 1 diverges")
+        if self.model_guidance_weight and self.contrastive_weight:
+            # The hinge would compare the loss against the guided target with a plain-target negative.
+            raise ValueError("model_guidance_weight cannot be combined with contrastive_weight")
 
 
 @dataclass
@@ -303,6 +362,8 @@ class Config:
             self.train.tla_weight and not self.model.tla_layers
         ):
             raise ValueError("repa_weight needs model.repa_layer and tla_weight needs model.tla_layers")
+        if self.train.model_guidance_weight and not self.model.cond_dropout:
+            raise ValueError("Model guidance needs model.cond_dropout > 0 to learn the null prediction")
 
     @classmethod
     def from_dict(cls, obj):

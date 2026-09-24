@@ -1,6 +1,7 @@
 """DDP training with sample-weighted accumulation and per-rank resumable RNG state."""
 
 import copy
+import dataclasses
 import json
 import math
 import os
@@ -17,6 +18,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from .alignment import teacher_layers, teacher_terms
+from .codec import check_compatibility
 from .config import Config
 from .contracts import sanitize, target_mask
 from .data import BucketBatchSampler, LatentDataset, collate, move_batch
@@ -45,7 +47,8 @@ class Objective(nn.Module):
 
     `expansion` > 1 is context-sharing batch expansion (SupertonicTTS, arXiv:2503.23108): every
     utterance receives several independent (time, noise) draws that share one condition encoding.
-    Flow entries are then [B * expansion] while duration entries stay [B].
+    Flow entries are then [B * expansion] while duration entries stay [B]. `guidance_weight` > 0 trains
+    toward the model-guidance target (see `guidance_direction`); evaluation keeps the plain target.
 
     `contrastive_mode` picks the negatives: `text_hinge` (a one-word skip/repeat transcript, one more
     text encoding and generator pass), `latent_delta` (corrupted target latents with the correct text,
@@ -73,9 +76,11 @@ class Objective(nn.Module):
         repa_frames="all",
         tla_weight=0.0,
         tla_entropy=0.01,
+        guidance_weight=0.0,
     ):
         super().__init__()
         self.model = model
+        self.guidance_weight = guidance_weight
         self.duration_weight, self.ctc_weight = duration_weight, ctc_weight
         self.contrastive_weight, self.contrastive_margin = contrastive_weight, contrastive_margin
         self.time_sampling, self.expansion = time_sampling, expansion
@@ -158,6 +163,7 @@ class Objective(nn.Module):
             cached=shared,
             time_sampling=self.time_sampling,
             **({"hidden_layers": layers} if layers else {}),
+            guidance_weight=self.guidance_weight if self.training else 0.0,
         )
         prediction = details.pop("prediction")
         if self.training:
@@ -251,19 +257,137 @@ def atomic_save(obj, path):
     os.replace(temporary, path)
 
 
+def ema_key(decay):
+    """Checkpoint key of an extra EMA track, e.g. ema_0.999 (shortest round-trip float spelling)."""
+    return f"ema_{float(decay)!r}"
+
+
+def ema_tracks(train):
+    """Extra EMA tracks {checkpoint key: decay}; `ema_decay` itself always stays under `ema`."""
+    return {ema_key(decay): decay for decay in train.ema_decays if decay != train.ema_decay}
+
+
+def weights_key(checkpoint, ema=True):
+    """Checkpoint entry for `ema`: True -> "ema", False -> "model", a decay (0.999 or "0.999") or a key
+    ("ema_0.999") -> that EMA track; the primary decay maps to "ema"."""
+    if ema is True or ema is False:
+        return "ema" if ema else "model"
+    key = ema if str(ema).startswith("ema") else ema_key(float(ema))
+    if key == ema_key(Config.from_dict(checkpoint["config"]).train.ema_decay):
+        key = "ema"
+    if key not in checkpoint:
+        tracks = sorted(k for k in checkpoint if k == "ema" or k.startswith("ema_"))
+        raise KeyError(f"Checkpoint has no {key}; available weights: model, {', '.join(tracks)}")
+    return key
+
+
 def load_model(path, device="cpu", ema=True):
+    """`ema`: True loads the primary EMA, False the raw weights, a decay or key one of `train.ema_decays`."""
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     cfg = Config.from_dict(checkpoint["config"])
     model = FlowTTS(cfg.model)
-    model.load_state_dict(checkpoint["ema"] if ema else checkpoint["model"])
+    model.load_state_dict(checkpoint[weights_key(checkpoint, ema)])
     return model.to(device).eval(), checkpoint
 
 
-def lr_multiplier(step, warmup, steps):
+def export_ema(path, ema, output):
+    """Optimizer-free copy of a checkpoint whose `ema` holds another EMA track, for the evaluation tools
+    that load the default EMA (monitor, eval scripts, demo)."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    key = weights_key(checkpoint, ema)
+    dropped = {"optimizer", "rng"}
+    result = {k: v for k, v in checkpoint.items() if k not in dropped and not k.startswith("ema_")}
+    result.update(ema=checkpoint[key], exported_ema=key)
+    atomic_save(result, output)
+
+
+def decay_start(steps, decay_fraction):
+    """First update of the WSD decay phase."""
+    return steps - round(steps * decay_fraction)
+
+
+def lr_multiplier(
+    step, warmup, steps, schedule="cosine", decay_fraction=0.2, decay_shape="1-sqrt", floor=0.1
+):
+    """Linear warmup, then cosine to `floor`, or WSD: constant until `decay_start`, then a linear or 1-sqrt
+    decay to `floor` (Hägele et al., arXiv:2405.18392). The defaults are the original cosine schedule."""
     if step < warmup:
         return (step + 1) / max(warmup, 1)
+    if schedule == "wsd":
+        start = decay_start(steps, decay_fraction)
+        progress = min(max(step - start, 0) / max(steps - start, 1), 1)
+        return floor + (1 - floor) * (1 - (math.sqrt(progress) if decay_shape == "1-sqrt" else progress))
     progress = (step - warmup) / max(steps - warmup, 1)
-    return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(progress, 1)))
+    return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * min(progress, 1)))
+
+
+def schedule_multiplier(step, train):
+    return lr_multiplier(
+        step,
+        train.warmup,
+        train.steps,
+        train.lr_schedule,
+        train.decay_fraction,
+        train.decay_shape,
+        train.min_lr_ratio,
+    )
+
+
+def time_sampling_at(step, train):
+    """Flow-time distribution of an update: `final_time_sampling` from its start on (a function of the step
+    only, so exact resume is unaffected)."""
+    if train.final_time_sampling is None:
+        return train.time_sampling
+    start = train.final_time_sampling_start
+    first = decay_start(train.steps, train.decay_fraction) if start == "decay" else round(start * train.steps)
+    return train.final_time_sampling if step >= first else train.time_sampling
+
+
+def decay_phase_loader(cache, reference, cfg, rank, world, frame_budget, device):
+    """Sampler and loader over the WSD decay cache, built like the main training loader.
+
+    Latents are normalized with the main cache's statistics, so the latent space does not shift at the
+    switch and the checkpoint's mean/std stay valid for inference; the codec metadata must match.
+    """
+    data = LatentDataset(
+        cache,
+        "train",
+        cfg.train.seed,
+        prompt_dropout=cfg.train.prompt_dropout,
+        pairing=cfg.train.pairing,
+        layout=cfg.model.text_layout,
+        prompt_fraction=(cfg.train.prompt_fraction_min, cfg.train.prompt_fraction_max),
+    )
+    if not data.meta.get("merged"):
+        raise ValueError("Run merge on the decay cache before training")
+    check_compatibility(data.meta, reference.meta)
+    if data.channels != reference.channels:
+        raise ValueError("The decay cache has a different latent width")
+    data.mean, data.std = reference.mean, reference.std
+    sampler = BucketBatchSampler(
+        data.costs,
+        cfg.train.batch_size,
+        rank,
+        world,
+        cfg.train.seed,
+        frame_budget,
+        speaker_counts=data.group_end - data.group_start,
+        speaker_balance=cfg.train.speaker_balance,
+    )
+    loader = DataLoader(
+        data,
+        batch_sampler=sampler,
+        collate_fn=collate,
+        **loader_options(
+            cfg.train.workers,
+            device,
+            cfg.train.prefetch_factor,
+            cfg.train.worker_threads,
+            cfg.train.loader_start_method,
+        ),
+        generator=torch.Generator().manual_seed(cfg.train.seed + rank),
+    )
+    return sampler, loader
 
 
 def rng_state(device):
@@ -413,6 +537,11 @@ def train(args):
             ),
             generator=loader_rng,
         )
+        decay_loader = None
+        if cfg.train.decay_cache:
+            decay_loader = decay_phase_loader(
+                cfg.train.decay_cache, data, cfg, rank, world, args.frame_budget, device
+            )
         validation = None
         if not args.no_validation:
             val_data = LatentDataset(args.cache, "val", cfg.train.seed, **pairing)
@@ -428,6 +557,7 @@ def train(args):
         model.grad_checkpoint = cfg.train.grad_checkpoint
         model.strict_checks = cfg.train.strict_checks
         ema = copy.deepcopy(model).eval().requires_grad_(False)
+        averages = {key: (decay, copy.deepcopy(ema)) for key, decay in ema_tracks(cfg.train).items()}
         optimizer = build_optimizer(
             model,
             cfg.train.optimizer,
@@ -454,6 +584,8 @@ def train(args):
                 raise ValueError("Resume requires the same cache path and frame budget")
             model.load_state_dict(saved["model"])
             ema.load_state_dict(saved["ema"])
+            for key, (_, average) in averages.items():
+                average.load_state_dict(saved[key])
             optimizer.load_state_dict(saved["optimizer"])
             start_step, epoch, batch_offset = saved["step"], saved["epoch"], saved["batch_offset"]
             restore_rng(saved["rng"][rank], device)
@@ -462,10 +594,14 @@ def train(args):
                 # Warm start: weights only. Schedule, optimizer state and data order start fresh, so
                 # a run can continue on a larger cache than the one that produced the checkpoint.
                 warm = torch.load(args.init_from, map_location="cpu", weights_only=True)
-                if Config.from_dict(warm["config"]).model != cfg.model:
-                    raise ValueError("--init-from requires an identical model configuration")
+                warm_model = Config.from_dict(warm["config"]).model
+                # Dropout has no parameters, so a run may switch it on or off when warm starting.
+                if dataclasses.replace(warm_model, dropout=cfg.model.dropout) != cfg.model:
+                    raise ValueError("--init-from requires an identical model configuration (except dropout)")
                 model.load_state_dict(warm["model"])
                 ema.load_state_dict(warm["ema"])
+                for key, (_, average) in averages.items():
+                    average.load_state_dict(warm.get(key, warm["ema"]))
             torch.manual_seed(cfg.train.seed + rank)
             random.seed(cfg.train.seed + rank)
         silence = None
@@ -496,6 +632,7 @@ def train(args):
             repa_frames=cfg.train.repa_frames,
             tla_weight=cfg.train.tla_weight,
             tla_entropy=cfg.train.tla_entropy,
+            guidance_weight=cfg.train.model_guidance_weight,
         ).train()
         raw_objective = objective  # compile/DDP wrap the module; helper methods stay reachable here
         eager_forward = model.forward
@@ -584,6 +721,10 @@ def train(args):
                 ),
                 flush=True,
             )
+        switch = decay_start(cfg.train.steps, cfg.train.decay_fraction) if decay_loader else None
+        if decay_loader is not None and start_step > switch:
+            # Resumed inside the decay phase: the saved epoch and offset count decay-cache batches.
+            sampler, loader = decay_loader
         sampler.epoch, sampler.start_batch = epoch, batch_offset
         # strict_checks: false defers the loss/gradient finiteness checks to the next host sync.
         watch = None if cfg.train.strict_checks else NonfiniteWatch(device)
@@ -591,6 +732,12 @@ def train(args):
         last_time = time.monotonic()
         inactive = {}
         for step in range(start_step, cfg.train.steps):
+            if decay_loader is not None and step == switch:
+                sampler, loader = decay_loader
+                epoch, batch_offset = 0, 0
+                sampler.epoch, sampler.start_batch = 0, 0
+                iterator = iter(loader)
+            raw_objective.time_sampling = time_sampling_at(step, cfg.train)
             # Collect a window before backward so variable batches receive exact example weighting.
             batches = []
             for _ in range(cfg.train.accumulation):
@@ -617,7 +764,7 @@ def train(args):
             # Batch expansion multiplies the flow terms only; duration terms stay per utterance.
             flow_examples = denominator * cfg.train.batch_expansion
             frame_denominator = frame_denominator * cfg.train.batch_expansion
-            learning_rate = cfg.train.learning_rate * lr_multiplier(step, cfg.train.warmup, cfg.train.steps)
+            learning_rate = cfg.train.learning_rate * schedule_multiplier(step, cfg.train)
             for group in optimizer.param_groups:
                 group["lr"] = learning_rate
             optimizer.zero_grad(set_to_none=True)
@@ -708,6 +855,9 @@ def train(args):
                 # Warm-up keeps the average from being dominated by the random initialization.
                 decay = min(cfg.train.ema_decay, (1 + step) / (10 + step))
                 torch._foreach_lerp_(list(ema.parameters()), list(model.parameters()), 1 - decay)
+                for track_decay, average in averages.values():
+                    decay = min(track_decay, (1 + step) / (10 + step))
+                    torch._foreach_lerp_(list(average.parameters()), list(model.parameters()), 1 - decay)
             if (step + 1) % cfg.train.log_every == 0 or step == start_step or diagnose:
                 if watch is not None:
                     watch.check()
@@ -759,6 +909,17 @@ def train(args):
                     reduction=cfg.train.flow_reduction,
                     duration_weight=cfg.train.duration_weight,
                 )
+                for key, (_, average) in averages.items():
+                    extra = validate(
+                        average,
+                        validation,
+                        device,
+                        cfg.train.precision,
+                        reduction=cfg.train.flow_reduction,
+                        duration_weight=cfg.train.duration_weight,
+                    )
+                    label = key.replace(".", "_")  # dots are W&B's nested-key separator
+                    val.update({f"{label}/{name}": value for name, value in extra.items()})
                 if rank == 0:
                     record = {"step": step + 1, **val}
                     print(json.dumps(record), flush=True)
@@ -800,6 +961,9 @@ def train(args):
                         "stage": "pretrain",
                         "init_from": getattr(args, "init_from", None),
                     }
+                    saved.update({key: average.state_dict() for key, (_, average) in averages.items()})
+                    if cfg.train.model_guidance_weight:
+                        saved["recommended_guidance"] = 1.0  # guidance is baked in: sample without CFG
                     atomic_save(saved, out / "last.pt")
                     if keeping:
                         # Permanent, optimizer-free snapshot for later speech evaluation and selection.
