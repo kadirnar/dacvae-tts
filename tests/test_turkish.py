@@ -356,3 +356,13 @@ def test_v2_reads_ordinal_ranges_and_keeps_minus_for_signs_only():
     assert normalize("Sıcaklık -5 derece", "turkish-v2") == "Sıcaklık eksi beş derece"
     assert normalize("Hava (-3) derece", "turkish-v2") == "Hava (eksi üç) derece"
     assert normalize("3-4 kişi", "turkish-v2") == "üç dört kişi"
+
+
+def test_v2_metric_splits_hyphenated_reduplications_and_joins_short_prefixes():
+    # Whisper writes "yazlık-kışlık" for the reference "yazlık kışlık": 16 correct transcripts of the published
+    # Freya-TR-Eval runs, which the joining rule turned into 2 word errors each.
+    assert metric_text("Yazlık-kışlık ayrımı", "turkish-v2") == "yazlık kışlık ayrımı"
+    assert error_counts("yazlık kışlık ayrımı", "yazlık-kışlık ayrımı", "turkish-v2")["word_edits"] == 0
+    assert metric_text("yavaş-yavaş, sağlı-sollu", "turkish-v2") == "yavaş yavaş sağlı sollu"
+    assert metric_text("e-posta ve Wi-Fi", "turkish-v2") == "eposta ve wifi"
+    assert metric_text("a-b-c", "turkish-v2") == "abc"

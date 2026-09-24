@@ -310,7 +310,7 @@ LATIN_I_ACRONYMS = {
 # Roman numerals written with I, V and X only (1-39): C, L, D and M also spell acronyms and initials (CD, MI, DC).
 ROMAN = r"(?=[IVX])X{0,3}(?:IX|IV|V?I{0,3})"
 _METRIC_RULES = {
-    "hyphen": re.compile(rf"(?<=[{LETTER}])-(?=[{LETTER}])"),
+    "hyphen_pair": re.compile(rf"(?<![{LETTER}])([{LETTER}]+)-([{LETTER}]+)(?![{LETTER}])"),
     # XIX. yüzyıl, XIX yüzyıl, V. yüzyıl; "II. Dünya", "XVI.yüzyıl"; a single letter only before a capitalized word
     # ("I. Dünya", "V. Murat", but "Bay X. geldi" stays); standalone numerals of two or more letters become digits
     # that the number rules read with their suffix (Faz II -> faz iki, II'de -> ikide, IV'üncü -> dördüncü).
@@ -371,12 +371,29 @@ def _fold_marks(text):
     )
 
 
+def _join_or_split_hyphens(text):
+    """Metric hyphens: join short-part compounds (e-posta, Wi-Fi), split longer pairs (yazlık-kışlık, yavaş-yavaş)."""
+    def repl(match):
+        left, right = match.group(1), match.group(2)
+        return f"{left}{right}" if min(len(left), len(right)) <= 2 else f"{left} {right}"
+
+    pattern = _METRIC_RULES["hyphen_pair"]
+    while True:  # chains (a-b-c) need one pass per hyphen
+        joined = pattern.sub(repl, text)
+        if joined == text:
+            return text
+        text = joined
+
+
 def metric_text_turkish_v2(text, apostrophe=""):
     """WER/CER normalization `turkish-v2`: the `turkish-v1` metric text without its known mistakes (issue #5).
 
     Order: apostrophe/hyphen variants, NFKC, then rewrites that need the original case and punctuation, Turkish
     lower-casing, combining-mark removal and the character filter:
-    - intra-word hyphens join (e-posta -> eposta, Wi-Fi -> wifi) instead of splitting a word in two;
+    - intra-word hyphens after or before a part of one or two letters join (e-posta -> eposta, Wi-Fi -> wifi)
+      instead of splitting a word in two; between longer parts they separate words like a space, as in turkish-v1,
+      because those are reduplications and pairs that Turkish writes apart and Whisper often hyphenates
+      (yazlık-kışlık = yazlık kışlık; joining them cost 2 word errors on 16 correct Freya-TR-Eval transcripts);
     - SAFE_ABBREVIATIONS expand (T.C. -> te ce, A.Ş. -> anonim şirketi, Dr. -> doktor, vb. -> ve benzeri);
     - Roman numerals (I-XXXIX): "II. Dünya", "XVI.yüzyıl", "XIX yüzyıl", "I. Dünya" -> ordinals; other standalone
       numerals of two or more letters -> cardinals (Faz II -> faz iki); v1 produced "ıı";
@@ -398,7 +415,7 @@ def metric_text_turkish_v2(text, apostrophe=""):
     """
     rules = _METRIC_RULES
     text = unicodedata.normalize("NFKC", text.translate(METRIC_MARKS))
-    text = rules["hyphen"].sub("", text)
+    text = _join_or_split_hyphens(text)
     text = expand_safe_abbreviations(text)
     text = rules["roman_century"].sub(lambda m: ordinal_words(roman_value(m.group(1))) + " ", text)
     text = rules["roman_ordinal"].sub(lambda m: ordinal_words(roman_value(m.group(1)[:-1])) + " ", text)
