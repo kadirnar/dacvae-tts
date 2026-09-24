@@ -12,6 +12,7 @@ from torch.nn import functional as F
 
 from .codec import file_digest, read_audio
 from .data import jsonl
+from .eval_protocol import WHISPER_V1
 
 
 def metric_text(text, version="english-unicode-v2"):
@@ -128,6 +129,28 @@ class DNSMOS:
         return dict(zip(("dnsmos_sig", "dnsmos_bak", "dnsmos_ovrl"), map(float, scores)))
 
 
+# What changes a row's WER/CER/SIM for the same audio: kept in every result row (`row_identity`) so that
+# comparison.compare_evaluations can refuse to pair runs scored differently; the full identity (library versions,
+# model revisions, hashes) goes to the summary.
+ROW_IDENTITY_KEYS = (
+    "asr_backend", "asr_model", "language", "metric_normalization", "decoding", "compute_type", "device",
+    "speaker_model",
+)
+
+
+def row_identity(identity):
+    """Compact scorer identity of an Evaluator identity (or of a compact one: the projection is idempotent).
+
+    Protocol v2 contributes its options (`protocol_options`, e.g. band_limit_8k, sim_o); None/missing values stay
+    None, so rows written before these fields existed compare as "unknown", not as equal.
+    """
+    if not isinstance(identity, dict):
+        return None
+    protocol = identity.get("protocol")
+    options = protocol.get("options") if isinstance(protocol, dict) else identity.get("protocol_options")
+    return {**{key: identity.get(key) for key in ROW_IDENTITY_KEYS}, "protocol_options": options}
+
+
 class Evaluator:
     def __init__(
         self,
@@ -147,9 +170,8 @@ class Evaluator:
             metric_normalization = "turkish-v1" if language == "tr" else "english-unicode-v2"
         from faster_whisper import WhisperModel
 
-        self.asr = WhisperModel(
-            asr_model, device=device, compute_type="float16" if device == "cuda" else "int8"
-        )
+        compute_type = "float16" if device == "cuda" else "int8"
+        self.asr = WhisperModel(asr_model, device=device, compute_type=compute_type)
         self.dnsmos = DNSMOS(dnsmos_model) if dnsmos_model else None
         self.device = torch.device(device)
         self.speaker_name = speaker_model
@@ -170,6 +192,10 @@ class Evaluator:
             "dnsmos_sha256": file_digest(dnsmos_model) if dnsmos_model else None,
             "metric_normalization": metric_normalization,
             "language": language,
+            # int8 on the CPU and float16 on CUDA transcribe (slightly) differently.
+            "asr_backend": "faster-whisper",
+            "device": str(device),
+            "compute_type": compute_type,
         }
         self.protocol = None
         if protocol is not None and protocol.enabled:
@@ -177,6 +203,8 @@ class Evaluator:
 
             self.protocol = ProtocolScorer(protocol, device, self.dnsmos)
             self.identity["protocol"] = {**self.protocol.identity, "asr_snapshot": whisper_snapshot(asr_model)}
+        self.identity["decoding"] = self.protocol.whisper_kwargs() if self.protocol else dict(WHISPER_V1)
+        self.row_identity = row_identity(self.identity)
 
     @torch.inference_mode()
     def embedding(self, audio):
@@ -191,7 +219,7 @@ class Evaluator:
         protocol = getattr(self, "protocol", None)  # instances built with Evaluator.__new__ have none
         if protocol is None:
             asr_audio, asr_info = audio, {}
-            decoding = dict(beam_size=5, vad_filter=False, condition_on_previous_text=False)
+            decoding = dict(WHISPER_V1)
         else:
             asr_audio, asr_info = protocol.asr_audio(audio)
             decoding = protocol.whisper_kwargs()

@@ -266,6 +266,42 @@ def test_mismatched_pairs_are_rejected():
         compare_evaluations({"a": rows, "b": [{"id": "0", "error": "x"}]}, samples=10)
 
 
+def test_systems_scored_differently_are_refused():
+    rows = freya_rows()
+    identity = {"asr_backend": "faster-whisper", "asr_model": "large-v3", "language": "tr",
+                "metric_normalization": "turkish-v1", "decoding": {"beam_size": 5}, "compute_type": "float16",
+                "device": "cuda", "speaker_model": "microsoft/wavlm-base-plus-sv", "protocol_options": None}
+
+    def scored(rows, **changes):
+        out = copy.deepcopy(rows)
+        for row in out:
+            row["evaluator"] = {**identity, **changes}
+        return out
+
+    same = compare_evaluations({"a": scored(rows), "b": scored(shifted(rows, edits=1))}, samples=10)
+    assert not any("scor" in note for note in same["notes"])
+    # A full Evaluator identity (versions, hashes, the protocol's details) compares by its compact fields.
+    full = scored(rows)
+    for row in full:
+        row["evaluator"].update(faster_whisper_version="1.1.0", dnsmos_sha256="abc")
+    compare_evaluations({"a": scored(rows), "b": full}, samples=10)
+    band_limited = scored(rows, protocol_options={"band_limit_8k": True})
+    with pytest.raises(ValueError, match="scored differently.*protocol_options"):
+        compare_evaluations({"a": scored(rows), "b": band_limited}, samples=10)
+    with pytest.raises(ValueError, match='metric_normalization: a="turkish-v1", b="turkish-v2"'):
+        compare_evaluations({"a": scored(rows), "b": scored(rows, metric_normalization="turkish-v2")}, samples=10)
+    with pytest.raises(ValueError, match="compute_type"):  # CPU int8 vs CUDA float16 Whisper
+        compare_evaluations({"a": scored(rows), "b": scored(rows, compute_type="int8", device="cpu")}, samples=10)
+    mixed = scored(rows)
+    mixed[0]["evaluator"]["device"] = "cpu"  # replicates or rescored rows within one system disagree
+    with pytest.raises(ValueError, match="device"):
+        compare_evaluations({"a": scored(rows), "b": mixed}, samples=10)
+    allowed = compare_evaluations({"a": scored(rows), "b": band_limited}, samples=10, allow_scorer_mismatch=True)
+    assert any("Scorer mismatch allowed" in note for note in allowed["notes"])
+    unknown = compare_evaluations({"a": scored(rows), "b": rows}, samples=10)  # results written before identities
+    assert any("`b` carry no scorer identity" in note for note in unknown["notes"])
+
+
 def test_stratified_reports():
     assert [length_bucket({"words": n}) for n in (1, 5, 6, 9, 10, 30)] == [
         "1-5 words", "1-5 words", "6-9 words", "6-9 words", "10+ words", "10+ words"
@@ -341,6 +377,14 @@ def test_compare_evals_script(tmp_path, capsys):
     report = json.loads((tmp_path / "out" / "report.json").read_text())
     assert report["config"]["baseline"] == "base" and len(report["config"]["sources"]["new"]) == 2
     assert report["systems"]["new"]["replicates"] == 2
+    for name, normalization in (("v1", "turkish-v1"), ("v2", "turkish-v2")):
+        (tmp_path / name).mkdir()
+        lines = [json.dumps({**r, "evaluator": {"metric_normalization": normalization}}) for r in rows]
+        (tmp_path / name / "results.jsonl").write_text("\n".join(lines) + "\n")
+    with pytest.raises(SystemExit, match="scored differently"):
+        script.main([str(tmp_path / "v1"), str(tmp_path / "v2"), "--bootstrap", "10"])
+    script.main([str(tmp_path / "v1"), str(tmp_path / "v2"), "--bootstrap", "10", "--allow-scorer-mismatch"])
+    assert "Scorer mismatch allowed" in capsys.readouterr().out
     with pytest.raises(SystemExit):
         script.main([str(tmp_path / "missing")])
     with pytest.raises(SystemExit):

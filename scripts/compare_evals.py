@@ -87,6 +87,11 @@ def main(argv=None):
         "--utterance-ci", action="store_true",
         help="Also show the utterance-level (unclustered) interval for reference",
     )
+    parser.add_argument(
+        "--allow-scorer-mismatch", action="store_true",
+        help="Compare runs whose rows record different scorers (metric normalization, ASR model/decoding/device, "
+             "protocol options such as --band-limit-8k); refused by default, noted when allowed",
+    )
     parser.add_argument("--markdown", help="Write the markdown report here (it is always printed)")
     parser.add_argument("--output", help="Write the full JSON report here")
     args = parser.parse_args(argv)
@@ -113,6 +118,7 @@ def main(argv=None):
             seed=args.seed,
             level=args.level,
             utterance_ci=args.utterance_ci,
+            allow_scorer_mismatch=args.allow_scorer_mismatch,
         )
     except ValueError as error:
         raise SystemExit(f"compare_evals: {error}") from error

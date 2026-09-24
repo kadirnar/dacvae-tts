@@ -290,7 +290,7 @@ def fake_whisper(monkeypatch):
 
 
 V1_IDENTITY = {"asr_model", "faster_whisper_version", "speaker_model", "speaker_revision", "dnsmos_sha256",
-               "metric_normalization", "language"}
+               "metric_normalization", "language", "asr_backend", "device", "compute_type", "decoding"}
 V1_ROW = {"word_edits", "words", "char_edits", "chars", "wer", "cer", "word_substitutions", "word_deletions",
           "word_insertions", "hypothesis", "audio_seconds", "clipped_fraction", "evaluator"}
 
@@ -306,6 +306,16 @@ def test_evaluator_without_protocol_is_unchanged(fake_whisper, tmp_path):
     assert kwargs == dict(language="tr", beam_size=5, vad_filter=False, condition_on_previous_text=False)
     disabled = metrics.Evaluator("large-v3", None, None, "cpu", language="tr", protocol=ProtocolOptions())
     assert set(disabled.identity) == V1_IDENTITY  # an all-off protocol is v1
+    # The compact identity kept in every script row: what changes WER/CER/SIM for the same audio.
+    assert evaluator.row_identity == {
+        "asr_backend": "faster-whisper", "asr_model": "large-v3", "language": "tr", "metric_normalization": "turkish-v1",
+        "decoding": eval_protocol.WHISPER_V1, "compute_type": "int8", "device": "cpu", "speaker_model": None,
+        "protocol_options": None,
+    }
+    assert metrics.row_identity(evaluator.row_identity) == evaluator.row_identity == metrics.row_identity(
+        evaluator.identity
+    )
+    assert metrics.row_identity(None) is None
 
 
 def test_evaluator_with_protocol(fake_whisper, tmp_path, monkeypatch):
@@ -320,6 +330,8 @@ def test_evaluator_with_protocol(fake_whisper, tmp_path, monkeypatch):
     protocol = evaluator.identity["protocol"]
     assert protocol["whisper_decoding"]["temperature"] == 0.0 and protocol["asr_snapshot"] is None
     assert protocol["ctranslate2_version"] == "0.0-test" and protocol["options"]["band_limit_8k"]
+    assert evaluator.row_identity["protocol_options"]["band_limit_8k"]
+    assert evaluator.row_identity["decoding"] == evaluator.identity["decoding"] == protocol["whisper_decoding"]
     result = evaluator.score(path, "Bir iki üç.", original_prompt=original)
     length, kwargs = fake_whisper.calls[-1]
     assert length < 32000 and kwargs["temperature"] == 0.0 and kwargs["without_timestamps"]
@@ -393,6 +405,12 @@ def test_eval_sentences_rescore_with_protocol(fake_whisper, tmp_path, monkeypatc
     assert rows[0]["sim_o"] == pytest.approx(1.0) and rows[0]["sim_r"] < 1.0
     assert rows[0]["wer"] == 0 and rows[1]["wer"] > 0 and "wer_filtered" in rows[1]
     assert fake_whisper.calls[-1][1]["temperature"] == 0.0
+    # Every row keeps the compact scorer identity, so compare_evals can refuse mismatched scorers.
+    identity = rows[0]["evaluator"]
+    assert identity == rows[1]["evaluator"] and identity["protocol_options"]["band_limit_8k"]
+    assert (identity["metric_normalization"], identity["device"], identity["compute_type"]) == (
+        "turkish-v1", "cpu", "int8"
+    )
     summary = json.loads((out / "summary.json").read_text())
     assert summary["protocol"]["band_limit_rate"] == 8000 and summary["prompt_audio"] == str(originals)
     assert {"sim_o", "sim_r", "wer_mean", "cer_mean", "bandwidth_hz", "per_sentence_wer_mean"} <= summary.keys()

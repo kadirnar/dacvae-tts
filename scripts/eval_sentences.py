@@ -45,7 +45,7 @@ from dacvae_tts.eval_protocol import (  # noqa: E402
     utmos_models,
 )
 from dacvae_tts.inference import OUTPUT_OPTIONS, WINDOW_OPTIONS, Synthesizer, VoiceReference  # noqa: E402
-from dacvae_tts.metrics import Evaluator, summarize  # noqa: E402
+from dacvae_tts.metrics import Evaluator, row_identity, summarize  # noqa: E402
 from dacvae_tts.quality import (  # noqa: E402
     METRIC_FAMILY,
     CandidateScorer,
@@ -183,6 +183,11 @@ def score_hf(rows, out, args, protocol=None, originals=None):
     evaluator.speaker = AutoModelForAudioXVector.from_pretrained(args.speaker_model).to(device).eval()
     dnsmos = DNSMOS(args.dnsmos) if args.dnsmos else None
     scorer = ProtocolScorer(protocol, device, dnsmos) if protocol is not None else None
+    identity = row_identity({  # the same compact identity the faster-whisper rows carry
+        "asr_backend": "hf-greedy", "asr_model": name, "language": args.language, "metric_normalization": "turkish-v1",
+        "decoding": {"num_beams": 1, "max_new_tokens": 220}, "compute_type": "float16", "device": str(device),
+        "speaker_model": args.speaker_model, "protocol_options": scorer.identity["options"] if scorer else None,
+    })
     good = [r for r in rows if "error" not in r]
     audios = {r["audio"]: read_audio(r["audio"], 16000) for r in good}
     asr_inputs = {k: scorer.asr_audio(a) if scorer else (a, {}) for k, a in audios.items()}
@@ -209,7 +214,8 @@ def score_hf(rows, out, args, protocol=None, originals=None):
         if r["prompt"] not in prompt_embeddings:
             prompt_embeddings[r["prompt"]] = evaluator.embedding(read_audio(out / r["prompt"], 16000))
         similarity = float((evaluator.embedding(audio) * prompt_embeddings[r["prompt"]]).sum())
-        record = {**r, **counts, "hypothesis": hypotheses[r["audio"]], "speaker_similarity": similarity, "asr_backend": "hf-greedy"}
+        record = {**r, **counts, "hypothesis": hypotheses[r["audio"]], "speaker_similarity": similarity, "asr_backend": "hf-greedy",
+                  "evaluator": identity}
         if dnsmos is not None:
             record.update(dnsmos(audio.numpy()))
         if scorer is not None:
@@ -398,7 +404,7 @@ def main():
             score = evaluator.score(row["audio"], row["text"], out / row["prompt"], original_prompt=original,
                                     codec_prompt=out / row["prompt"])
             extra = {"prompt_original": str(original)} if protocol is not None and original else {}
-            scored.append({**row, **{k: v for k, v in score.items() if k != "evaluator"}, **extra})
+            scored.append({**row, **score, "evaluator": evaluator.row_identity, **extra})
     for row in scored:
         if "error" not in row:
             row.update(audio_stats(row["audio"]))

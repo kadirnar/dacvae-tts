@@ -78,7 +78,7 @@ def main():
         sf.write(prompt_path, codec.decode(prompt * std + mean).numpy(), codec.sample_rate)
         score = evaluator.score(path, case["text"], prompt_path, original_prompt=original(case["prompt_uid"]),
                                 codec_prompt=prompt_path)
-        rows.append({**case, **{k: v for k, v in score.items() if k != "evaluator"}})
+        rows.append({**case, **score, "evaluator": evaluator.row_identity})  # compact scorer identity
         print(number, f"wer={score['wer']:.2f}", case["text"][:60], "|", score["hypothesis"][:60], flush=True)
     (out / "results.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
     summary = summarize(rows)

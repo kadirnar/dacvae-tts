@@ -31,7 +31,7 @@ from typing import NamedTuple
 import numpy as np
 
 from .data import jsonl
-from .metrics import summarize
+from .metrics import row_identity, summarize
 
 METRICS = ("wer", "cer", "dnsmos_ovrl", "speaker_similarity")  # checkpoint-promotion gate of `compare`
 DEFAULT_SAMPLES = 5000
@@ -365,6 +365,47 @@ def _identity(run, field):
     return values.pop() if len(values) == 1 else f"mixed:{sorted(values)}"
 
 
+def check_scorers(runs, allow_mismatch=False):
+    """Refuse to compare systems scored differently; returns notes.
+
+    Every scored row carries its scorer identity (`evaluator`, compacted with metrics.row_identity: metric
+    normalization, ASR model/backend/decoding, compute type and device, speaker model, protocol options such as
+    band_limit_8k). WER under turkish-v1 vs turkish-v2 text, an 8 kHz band-limited vs a full-band ASR input, or
+    int8 CPU vs float16 CUDA Whisper are different measurements, so a difference between or within systems is an
+    error unless `allow_mismatch` turns it into a note. Rows without an identity (older results) cannot be
+    checked and are only noted.
+    """
+    seen = {}
+    for label, run in runs.items():
+        for rows in run["items"].values():
+            for row in rows:
+                identity = row_identity(row.get("evaluator"))
+                seen.setdefault(label, set()).add(None if identity is None else json.dumps(identity, sort_keys=True))
+    known = sorted({i for ids in seen.values() for i in ids} - {None})
+    notes = []
+    if len(known) > 1:
+        decoded = [json.loads(i) for i in known]
+        keys = [k for k in decoded[0] if len({json.dumps(d.get(k), sort_keys=True) for d in decoded}) > 1]
+        values = {
+            label: {k: sorted({json.dumps(json.loads(i).get(k), sort_keys=True) for i in ids - {None}}) for k in keys}
+            for label, ids in seen.items()
+        }
+        detail = "; ".join(
+            f"{k}: " + ", ".join(f"{label}={'|'.join(v[k])}" for label, v in values.items() if v[k]) for k in keys
+        )
+        message = f"the systems were scored differently ({detail})"
+        if not allow_mismatch:
+            raise ValueError(f"{message}; rescore them with one scorer or allow the scorer mismatch explicitly")
+        notes.append(f"Scorer mismatch allowed: {message}. Differences may reflect the scorer, not the systems.")
+    unknown = [label for label, ids in seen.items() if None in ids]
+    if known and unknown:
+        notes.append(
+            f"Rows of {', '.join(f'`{label}`' for label in unknown)} carry no scorer identity (`evaluator`); "
+            "they cannot be checked against the other systems' scorer."
+        )
+    return notes
+
+
 def compare_evaluations(
     systems,
     baseline=None,
@@ -377,6 +418,7 @@ def compare_evaluations(
     seed=0,
     level=0.95,
     utterance_ci=False,
+    allow_scorer_mismatch=False,
 ):
     """Per-system summaries with cluster-bootstrap intervals plus paired differences against a baseline.
 
@@ -387,6 +429,7 @@ def compare_evaluations(
     cluster: "auto" (speaker, then prompt IDs), a field name, or None/"none" for an utterance-level bootstrap.
     metrics: restricts the paired and stratum tables (default: headline metrics / CER+WER).
     stratify: fields for per-stratum reports; "length" buckets reference word counts into 1-5, 6-9 and 10+.
+    Systems whose rows record different scorers are refused (`check_scorers`) unless `allow_scorer_mismatch`.
     Returns a JSON-serializable report; `markdown_report` renders it.
     """
     if not systems:
@@ -444,7 +487,8 @@ def compare_evaluations(
             f"Only {few} `{cluster}` clusters: percentile intervals from few clusters are approximate (they "
             "tend to be too narrow); read differences near an interval edge as ties."
         )
-    for field in ("evaluator", "asr_backend", "cases_sha256"):
+    notes.extend(check_scorers(runs, allow_scorer_mismatch))
+    for field in ("asr_backend", "cases_sha256"):
         if len({_identity(run, field) for run in runs.values()}) > 1:
             notes.append(f"`{field}` differs between systems: a difference may reflect the scorer.")
     base = runs[baseline]["items"]
