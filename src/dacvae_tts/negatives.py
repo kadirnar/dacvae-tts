@@ -145,7 +145,9 @@ def random_negatives(latents, valid, prompt_mask, copies=1, fill=None):
     return torch.where((target & usable[:, None])[..., None], negative, latents), usable
 
 
-def negative_distance(model, prediction, negative_latents, noise, time, mask, positive=None, cap=0.0):
+def negative_distance(
+    model, prediction, negative_latents, noise, time, mask, positive=None, cap=0.0, offset=None
+):
     """Per-example MSE [B] between the prediction and the flow target of `negative_latents` under the
     positive pass's noise and time, in the model's own parameterization (the ΔFM negative term).
 
@@ -153,8 +155,11 @@ def negative_distance(model, prediction, negative_latents, noise, time, mask, po
     cap > 0 clamps the distance at cap times the (detached) distance between the positive target
     `positive` and the negative one: an example stops being pushed once its prediction sits cap times
     farther from the negative than the true target does (cap 1: only while it is closer than that).
+    `offset` (model guidance, w sg(out_cond - out_null)) shifts the negative target like the positive one.
     """
     negative = flow_target(model, negative_latents, noise, time).detach()
+    if offset is not None:
+        negative = negative + offset.detach()
     # train.strict_checks: false skips the empty-target check, which would wait for the device.
     strict = getattr(model, "strict_checks", True)
     distance = per_example_mse(prediction, negative, mask, strict)

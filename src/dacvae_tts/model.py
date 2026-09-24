@@ -625,8 +625,10 @@ def flow_loss(
         pred, logits, token_valid = pred
         ctc = ctc_alignment_loss(logits, token_valid, batch["tokens"], drop, *ctc_labels(model, batch))
     target = flow_target(model, x1, noise, time)
+    offset = None
     if guidance_weight:
-        target = target + guidance_weight * guidance_direction(model, pred, xt, time, batch, drop, cached)
+        offset = guidance_weight * guidance_direction(model, pred, xt, time, batch, drop, cached)
+        target = target + offset
     losses = per_example_mse(pred, target, mask, strict)
     if return_details:
         counts = mask.sum(1)
@@ -644,6 +646,8 @@ def flow_loss(
             details["ctc"] = ctc
         if hidden is not None:
             details["hidden"] = hidden
+        if offset is not None:  # model guidance: target-only terms (latent negatives) shift their targets too
+            details["guidance_offset"] = offset
         return details
     return losses
 

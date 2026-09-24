@@ -341,9 +341,11 @@ class TrainConfig:
             raise ValueError("ema_decays must be a list of distinct decays in [0,1)")
         if not 0 <= self.model_guidance_weight < 1:
             raise ValueError("model_guidance_weight must lie in [0,1); w >= 1 diverges")
-        if self.model_guidance_weight and self.contrastive_weight:
-            # The hinge would compare the loss against the guided target with a plain-target negative.
-            raise ValueError("model_guidance_weight cannot be combined with contrastive_weight")
+        if self.model_guidance_weight and self.contrastive_mode == "text_hinge" and self.contrastive_weight:
+            # The hinge would compare the loss against the guided target with a plain-target negative (whose
+            # guided target would need one more null pass under the wrong text). latent_delta composes with
+            # model guidance instead: its negative targets get the same guidance offset (training.Objective).
+            raise ValueError("model_guidance_weight cannot be combined with the text_hinge contrastive_weight")
 
 
 @dataclass

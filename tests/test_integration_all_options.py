@@ -322,3 +322,36 @@ def test_teacher_frames_follow_cross_prompts_tail_silence_and_padding(cache):
     objective = Objective(FlowTTS(cfg), repa_weight=1.0, tla_weight=0.5).train()
     losses = objective(padded)
     assert torch.isfinite(losses["repa"]).all() and torch.isfinite(losses["tla"]).all()
+
+
+def test_model_guidance_composes_with_latent_negatives_not_the_text_hinge():
+    """#14 x #8: the text hinge stays rejected with model guidance; latent_delta (and none) are allowed,
+    and latent negatives shift their targets by the same guidance offset as the positive target."""
+    import pytest
+
+    from dacvae_tts.contracts import target_mask
+    from dacvae_tts.model import flow_loss, flow_target, per_example_mse
+    from dacvae_tts.negatives import random_negatives
+
+    with pytest.raises(ValueError, match="text_hinge"):
+        TrainConfig(model_guidance_weight=0.5, contrastive_weight=0.2)
+    TrainConfig(model_guidance_weight=0.5, contrastive_weight=0.2, contrastive_mode="latent_delta")
+    TrainConfig(model_guidance_weight=0.5, contrastive_weight=0.2, contrastive_mode="none")
+
+    batch = tiny_batch()
+    model = block_model(ffn_activation="gelu", value_residual=False, long_skip=False)
+    objective = Objective(model, contrastive_mode="latent_delta", aug_weight=0.0, guidance_weight=0.5).train()
+    torch.manual_seed(5)
+    losses = objective(batch)
+    torch.manual_seed(5)
+    cached = model.conditions(batch["prompt"], batch["prompt_mask"], batch["tokens"], batch["segments"])
+    details = flow_loss(model, batch, model.cfg.cond_dropout, return_details=True, cached=cached,
+                        guidance_weight=0.5)
+    offset, prediction = details["guidance_offset"], details["prediction"]
+    assert offset.abs().sum() > 0 and torch.equal(losses["flow"], details["flow"])
+    negative, usable = random_negatives(batch["latents"], batch["valid"], batch["prompt_mask"])
+    mask = target_mask(batch["valid"], batch["prompt_mask"])
+    target = flow_target(model, negative, details["noise"], details["times"]) + offset
+    expected = per_example_mse(prediction, target, mask).masked_fill(details["drop"] | ~usable, 0)
+    assert torch.allclose(losses["negative_random"], expected, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(losses["latent_delta"], -0.2 * expected, rtol=1e-5, atol=1e-6)

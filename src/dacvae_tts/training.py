@@ -115,18 +115,23 @@ class Objective(nn.Module):
         device = batch["tokens"].device
         return padded_tokens.to(device), padded_segments.to(device), torch.tensor(usable, device=device)
 
-    def latent_delta(self, batch, prediction, details, copies):
+    def latent_delta(self, batch, prediction, details, copies, offset=None):
         """RobustSpeechFlow/ΔFM latent negatives on the (expanded) batch, from this pass's prediction.
 
         Returns per-row [B * expansion] tensors: the raw distances `negative_random` and `negative_aug`
         (zero where not applied) and `latent_delta` = -λ_rand d_rand - λ_aug d_aug, which the training
         loop adds with the flow term's own weights. Rows dropped for classifier-free guidance learn the
         unconditional field and get no negatives; prompt and padding frames never enter a distance.
+        With model guidance (`offset` = w sg(out_cond - out_null), #14) every negative target is shifted by
+        the same offset as the positive one, so F+ - F- and the push away from the negatives are exactly
+        those without guidance and the optimum is the guided target plus the usual ΔFM step.
         """
         valid, prompt_mask = batch["valid"], batch["prompt_mask"]
         x1, mask = sanitize(batch["latents"], valid), target_mask(valid, prompt_mask)
         noise, time = details["noise"], details["times"]
         positive = flow_target(self.model, x1, noise, time) if self.negative_cap > 0 else None
+        if positive is not None and offset is not None:
+            positive = positive + offset
         terms = {"latent_delta": torch.zeros(x1.size(0), device=x1.device)}
         for name, weight in (("negative_random", self.random_weight), ("negative_aug", self.aug_weight)):
             terms[name] = torch.zeros_like(terms["latent_delta"])
@@ -138,7 +143,7 @@ class Objective(nn.Module):
                 else augmented_negatives(x1, valid, prompt_mask, **self.augment, fill=self.silence)
             )
             distance = negative_distance(
-                self.model, prediction, negative, noise, time, mask, positive, self.negative_cap
+                self.model, prediction, negative, noise, time, mask, positive, self.negative_cap, offset
             )
             terms[name] = distance.masked_fill(details["drop"] | ~usable, 0)
             terms["latent_delta"] = terms["latent_delta"] - weight * terms[name]
@@ -166,6 +171,7 @@ class Objective(nn.Module):
             guidance_weight=self.guidance_weight if self.training else 0.0,
         )
         prediction = details.pop("prediction")
+        offset = details.pop("guidance_offset", None)
         if self.training:
             hidden = details.pop("hidden", {})
             times, drop = details["times"], details["drop"]
@@ -202,7 +208,7 @@ class Objective(nn.Module):
             details["contrastive"] = hinge.repeat_interleave(copies) / copies
         elif self.contrastive_mode == "latent_delta" and self.training:
             # Correct text, corrupted target latents: only the regression target changes (no forward).
-            details.update(self.latent_delta(expanded, prediction, details, copies))
+            details.update(self.latent_delta(expanded, prediction, details, copies, offset))
         total = flow + self.duration_weight * duration_loss.repeat_interleave(copies)
         return {"loss": total, "duration": duration_loss, **details}
 
