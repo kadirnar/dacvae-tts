@@ -8,6 +8,11 @@ is the regression target of the negative sample under the positive's noise and t
 changes, so the positive pass's prediction is reused: no second text encoding and no second generator
 forward/backward, unlike the transcript hinge (`corrupt_transcript`), which costs ~20-25% per step.
 
+Parameterization: F- is `flow_target` of the negative latents, the positive's formula. With velocity
+(the paper's setting) F+ - F- = x1 - x1- at every t. With EDM it is (1-t)(x1 - x1-)/s(t), which fades
+toward t=1 exactly like the positive target's own dependence on x1, so relative to what the positive
+term asks of the content the push is the same at every t; in velocity units it is weaker at late t.
+
 Boundedness: every distance is a per-example mean over the same target frames and is reduced exactly
 like the positive flow term, so per frame the objective is (1 - Σλ)|F|² + linear terms, a convex
 quadratic in the prediction whenever Σλ < 1. Its minimum, F+ + Σλ(F+ - F-)/(1 - Σλ), lies a finite
