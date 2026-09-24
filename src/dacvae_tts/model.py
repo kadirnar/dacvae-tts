@@ -379,6 +379,19 @@ def sample_time(count, device, mode="uniform"):
     return torch.sigmoid(torch.special.ndtri(uniform.clamp(1e-4, 1 - 1e-4))).clamp(1e-3, 1 - 1e-3)
 
 
+def flow_target(model, x1, noise, time):
+    """Regression target of the linear path x_t=(1-t)noise+t x1 in the model's parameterization.
+
+    Velocity: x1 - noise. EDM: the unit-variance F that `to_velocity` inverts. Latent negatives
+    (ΔFM) evaluate it on corrupted x1 with the positive's noise and time, so both must agree.
+    """
+    target = x1 - noise
+    if prediction_kind(model) == "edm":
+        t = time[:, None, None]
+        target = ((1 - t) * x1 - t * noise) / (t.square() + (1 - t).square()).sqrt()
+    return target
+
+
 def flow_loss(
     model,
     batch,
@@ -424,10 +437,7 @@ def flow_loss(
     if with_ctc:
         pred, logits, token_valid = pred
         ctc = ctc_alignment_loss(logits, token_valid, batch["tokens"], drop)
-    target = x1 - noise
-    if prediction_kind(model) == "edm":
-        t = time[:, None, None]
-        target = ((1 - t) * x1 - t * noise) / (t.square() + (1 - t).square()).sqrt()
+    target = flow_target(model, x1, noise, time)
     losses = per_example_mse(pred, target, mask)
     if return_details:
         counts = mask.sum(1)
@@ -439,6 +449,7 @@ def flow_loss(
             "prediction_rms": rms,
             "noise": noise,
             "drop": drop,
+            "prediction": pred,  # lets target-only terms (latent negatives) reuse this generator pass
         }
         if ctc is not None:
             details["ctc"] = ctc
