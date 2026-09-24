@@ -365,7 +365,7 @@ def test_eval_sentences_rescore_with_protocol(fake_whisper, tmp_path, monkeypatc
     cases = [{"speaker": "spk", "prompt_uid": "shard/a.parquet:7", "prompt_text": "Önceki cümle.", "prompt_index": 0,
               "uid": "shard/a.parquet:8", "text": "Hedef.", "target_index": 1, "ground_truth_seconds": 1.0}]
     data = SimpleNamespace(row=lambda index: {"latents": torch.zeros(5, 4)})
-    monkeypatch.setattr(module, "select_cases", lambda cache, count, seed: (data, cases))
+    monkeypatch.setattr(module, "select_cases", lambda cache, count, seed, exclude=(): (data, cases))
     monkeypatch.setattr(sim_o, "SimO", lambda checkpoint, backend, device: StubSpeaker())
     out, originals = tmp_path / "out", tmp_path / "originals"
     out.mkdir()

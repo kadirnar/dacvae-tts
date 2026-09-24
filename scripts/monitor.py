@@ -28,10 +28,12 @@ from dacvae_tts.data import LatentDataset
 from dacvae_tts.eval_protocol import add_protocol_args, protocol_from_args
 from dacvae_tts.inference import Synthesizer, VoiceReference
 from dacvae_tts.metrics import Evaluator, summarize
+from dacvae_tts.speakers import read_speaker_list
 
 
-def select_cases(cache, count, seed, min_frames=75, max_frames=375):
-    """Deterministic (prompt, target) pairs of distinct validation recordings per speaker."""
+def select_cases(cache, count, seed, min_frames=75, max_frames=375, exclude=()):
+    """Deterministic (prompt, target) pairs of distinct validation recordings per speaker; `exclude`
+    drops labels whose voice also occurs in train (leakage.json of scripts/speaker_clusters.py)."""
     data = LatentDataset(cache, "val", pairing="within", layout="joined")
     db = sqlite3.connect(f"file:{Path(cache) / 'index.sqlite'}?mode=ro", uri=True)
     rows = db.execute(
@@ -42,7 +44,7 @@ def select_cases(cache, count, seed, min_frames=75, max_frames=375):
     by_speaker = {}
     for row in rows:
         by_speaker.setdefault(row[2], []).append(row)
-    speakers = sorted(s for s, items in by_speaker.items() if len(items) >= 2)
+    speakers = sorted(s for s, items in by_speaker.items() if len(items) >= 2 and s not in exclude)
     rng = random.Random(seed)
     rng.shuffle(speakers)
     index = {int(v): i for i, v in enumerate(data.ids)}
@@ -102,6 +104,9 @@ def main():
         help="WER/CER normalization (default follows --language: turkish-v1 for tr)",
     )
     parser.add_argument("--speaker-model", default="microsoft/wavlm-base-plus-sv")
+    parser.add_argument(
+        "--exclude-speakers", help="Labels never used as cases, e.g. leakage.json of speaker_clusters.py"
+    )
     parser.add_argument("--dnsmos", help="Path to sig_bak_ovr.onnx; adds DNSMOS SIG/BAK/OVRL per case and to the summary")
     parser.add_argument("--once", action="store_true", help="Score the checkpoints present now, then exit")
     parser.add_argument("--checkpoint", help="Score one checkpoint file instead of watching the run")
@@ -121,7 +126,8 @@ def main():
     run = Path(args.run)
     monitor = run / "monitor"
     monitor.mkdir(parents=True, exist_ok=True)
-    data, cases = select_cases(args.cache, args.cases, args.seed)
+    exclude = read_speaker_list(args.exclude_speakers) if args.exclude_speakers else ()
+    data, cases = select_cases(args.cache, args.cases, args.seed, exclude=exclude)
     (monitor / "cases.json").write_text(json.dumps(cases, indent=1))
     print(f"{len(cases)} cases from {len({c['speaker'] for c in cases})} held-out speakers", flush=True)
     evaluator = Evaluator(
