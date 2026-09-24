@@ -350,3 +350,50 @@ def test_cli_evaluate_with_protocol(fake_whisper, tmp_path, monkeypatch):
     assert summary["wer"] == 0 and summary["wer_mean"] == 0 and "sim_o" in summary and "bandwidth_hz" in summary
     assert summary["evaluator"]["protocol"]["options"] == {"sim_o": True, "sim_o_backend": "transformers",
                                                            "signal_stats": True}
+
+
+def test_eval_sentences_rescore_with_protocol(fake_whisper, tmp_path, monkeypatch):
+    """scripts/eval_sentences.py --rescore: sim_r vs the codec prompt WAV, sim_o only vs the exported original."""
+    import importlib.util
+    from pathlib import Path
+
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location("eval_sentences_under_test", scripts / "eval_sentences.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    cases = [{"speaker": "spk", "prompt_uid": "shard/a.parquet:7", "prompt_text": "Önceki cümle.", "prompt_index": 0,
+              "uid": "shard/a.parquet:8", "text": "Hedef.", "target_index": 1, "ground_truth_seconds": 1.0}]
+    data = SimpleNamespace(row=lambda index: {"latents": torch.zeros(5, 4)})
+    monkeypatch.setattr(module, "select_cases", lambda cache, count, seed: (data, cases))
+    monkeypatch.setattr(sim_o, "SimO", lambda checkpoint, backend, device: StubSpeaker())
+    out, originals = tmp_path / "out", tmp_path / "originals"
+    out.mkdir()
+    originals.mkdir()
+    sentences = tmp_path / "sentences.jsonl"
+    rows = ({"id": "s0", "text": "Bir iki üç."}, {"id": "s1", "text": "Dört beş."})
+    sentences.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+    write(out / "s0.wav", speech_like(48000), 48000)
+    write(out / "s1.wav", speech_like(48000, seed=3), 48000)
+    for name in ("s0", "s1"):  # synthesis sidecars of the first pass
+        (out / f"{name}.json").write_text(json.dumps({"audio_seconds": 2.0, "rtf": 0.1}))
+    write(out / "prompt-00.wav", speech_like(48000, seed=5), 48000)  # codec-decoded prompt of the first pass
+    write(originals / "shard_a.parquet_7.wav", speech_like(48000), 48000)
+    fake_whisper.text = "Bir iki üç."
+    monkeypatch.setattr(sys, "argv", [
+        "eval_sentences.py", "--checkpoint", "unused.pt", "--cache", "unused", "--sentences", str(sentences),
+        "--output", str(out), "--prompts", "1", "--rescore", "--asr-device", "cpu", "--speaker-model", "",
+        "--prompt-audio", str(originals), "--sim-o", "--signal-stats", "--flag-hallucinations",
+        "--asr-deterministic", "--band-limit-8k",
+    ])
+    module.main()
+    rows = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()]
+    assert [r["id"] for r in rows] == ["s0", "s1"]
+    assert all(r["prompt_original"].endswith("shard_a.parquet_7.wav") for r in rows)
+    assert rows[0]["sim_o"] == pytest.approx(1.0) and rows[0]["sim_r"] < 1.0
+    assert rows[0]["wer"] == 0 and rows[1]["wer"] > 0 and "wer_filtered" in rows[1]
+    assert fake_whisper.calls[-1][1]["temperature"] == 0.0
+    summary = json.loads((out / "summary.json").read_text())
+    assert summary["protocol"]["band_limit_rate"] == 8000 and summary["prompt_audio"] == str(originals)
+    assert {"sim_o", "sim_r", "wer_mean", "cer_mean", "bandwidth_hz", "per_sentence_wer_mean"} <= summary.keys()
+    assert json.loads((out / "cases.json").read_text()) == cases
