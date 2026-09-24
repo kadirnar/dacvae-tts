@@ -31,7 +31,7 @@ from .negatives import (
 )
 from .optim import build_optimizer
 from .parallel import device_batches, loader_options
-from .speed import NonfiniteWatch, compile_blocks, training_loader
+from .speed import NonfiniteWatch, compile_blocks, training_epoch_costs, training_loader
 from .text import BYTE_OFFSET, corrupt_transcript
 from .tracking import Tracker
 
@@ -358,7 +358,8 @@ def train(args):
             args.frame_budget,
             speaker_counts=data.group_end - data.group_start,
             speaker_balance=cfg.train.speaker_balance,
-            epoch_costs=data.epoch_costs if cfg.train.cross_prompt_prob else None,
+            # Exact per-epoch lengths of cross prompts, rounded up like `costs` when pad_multiple > 1.
+            epoch_costs=training_epoch_costs(data, cfg.train),
         )
         loader_rng = torch.Generator().manual_seed(cfg.train.seed + rank)
         loader = DataLoader(
@@ -432,7 +433,7 @@ def train(args):
         silence = None
         if cfg.train.contrastive_mode == "latent_delta":
             # Tail padding of skip and short random negatives: the cache's silence latent if it has one.
-            silence = load_silence(args.cache, data.channels)
+            silence = load_silence(args.cache, data.channels, data.mean, data.std, data.meta)
             silence = None if silence is None else silence.to(device)
             if rank == 0:
                 fill = "last target frame (no silence.pt)" if silence is None else "silence.pt"

@@ -187,20 +187,28 @@ def delta_record(sums, denominator):
     }
 
 
-def load_silence(directory, channels):
-    """The cache's silence latent [C] from `silence.pt`, or None when the cache has none.
+def load_silence(directory, channels, mean=None, std=None, meta=None):
+    """The cache's silence latent [C] from `silence.pt`, standardized with the cache statistics, or None
+    when the cache has none.
 
-    Expected already standardized with the cache statistics (the format the silence-latent issue #11
-    specifies): a tensor [C], a tensor [T,C] (averaged over frames) or a dict holding one of them
-    under `latent`.
+    Accepted: a standardized tensor [C] or [T,C] (averaged over frames), a dict holding one under
+    `latent`, or the dict scripts/silence_latent.py writes (#11: `raw` [C], `frame` [C], `codec`). For that
+    one the `raw` frame is standardized with this cache's `mean`/`std` and its codec checked against
+    `meta`, exactly as LatentDataset does for tail silence and quiet cuts, so the latent negatives pad with
+    the same frame the data pipeline appends; without statistics its stored `frame` is used.
     """
     path = Path(directory) / "silence.pt"
     if not path.exists():
         return None
     value = torch.load(path, map_location="cpu", weights_only=True)
-    value = value.get("latent") if isinstance(value, dict) else value
+    if isinstance(value, dict) and "raw" in value and mean is not None and std is not None:
+        from .data import load_silence as raw_silence  # validates the codec and the frame shape
+
+        value = (raw_silence(directory, meta or {"latent_dim": channels}) - mean.float()) / std.float()
+    elif isinstance(value, dict):
+        value = value.get("latent", value.get("frame"))
     if not isinstance(value, torch.Tensor):
-        raise ValueError(f"{path}: expected a tensor or a dict with a `latent` tensor")
+        raise ValueError(f"{path}: expected a tensor or a dict with a `latent` (or silence_latent.py) frame")
     value = value.float().mean(0) if value.ndim == 2 else value.float()
     if value.shape != (channels,) or not torch.isfinite(value).all():
         raise ValueError(f"{path}: silence latent must be finite [{channels}] or [T,{channels}]")

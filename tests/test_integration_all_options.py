@@ -211,3 +211,48 @@ def test_compiled_blocks_with_value_residual_match_eager():
             assert torch.allclose(grad, results[1][1][name], rtol=1e-4, atol=1e-5), name
     finally:
         torch._dynamo.reset()
+
+
+def write_silence(cache, raw=(0.125, -0.375, 0.625, -0.875)):
+    """<cache>/silence.pt in the format of scripts/silence_latent.py (#11)."""
+    raw = torch.tensor(raw)
+    torch.save({"raw": raw, "frame": torch.full((4,), 9.0), "codec": {"checkpoint": "test-codec"}},
+               cache / "silence.pt")
+    return raw
+
+
+def test_latent_negatives_pad_with_the_pipeline_silence(cache):
+    """#8 x #11: latent negatives read the silence.pt of scripts/silence_latent.py and pad with the
+    same standardized frame the data pipeline appends as tail silence."""
+    from dacvae_tts.data import LatentDataset
+    from dacvae_tts.negatives import load_silence
+
+    raw = write_silence(cache)
+    data = LatentDataset(cache, "train", pairing="within", layout="joined", tail_silence_prob=0.5)
+    fill = load_silence(cache, data.channels, data.mean, data.std, data.meta)
+    assert torch.equal(fill, data.silence) and torch.allclose(fill, (raw - data.mean) / data.std)
+    assert torch.equal(load_silence(cache, 4), torch.full((4,), 9.0))  # no statistics: the stored frame
+
+
+def test_padded_epoch_costs_keep_the_frame_budget(cache):
+    """#7 x #11: cross-prompt epoch costs are rounded up to pad_multiple like the static costs, so the
+    padded batches of every epoch stay within the frame budget."""
+    import numpy as np
+
+    from dacvae_tts.data import BucketBatchSampler, LatentDataset
+    from dacvae_tts.speed import padded_costs, training_epoch_costs
+
+    pairs = dict(cross_prompt_prob=1.0, cross_prompt_max_seconds=0.5)  # up to 23 frames of other utterances
+    train = TrainConfig(pairing="within", pad_multiple=8, **pairs)
+    data = LatentDataset(cache, "train", pairing="within", layout="joined", **pairs)
+    epoch_costs = training_epoch_costs(data, train)
+    assert training_epoch_costs(data, TrainConfig()) is None
+    static = padded_costs(data.costs, 8)
+    for epoch in (0, 1):
+        exact, padded = data.epoch_costs(epoch), epoch_costs(epoch)
+        assert np.all(padded % 8 == 0) and np.all(padded >= exact) and np.all(padded <= static)
+        assert np.any(exact > data.lengths)  # cross prompts are in use
+        sampler = BucketBatchSampler(static, 4, frame_budget=80, epoch_costs=epoch_costs)
+        sampler.epoch = epoch
+        for batch in sampler.batches():
+            assert max(padded[i] for i in batch) * len(batch) <= 80

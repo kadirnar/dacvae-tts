@@ -190,6 +190,26 @@ def padded_costs(costs, multiple=1):
     return (costs + multiple - 1) // multiple * multiple
 
 
+class PaddedEpochCosts:
+    """`LatentDataset.epoch_costs` (#11, exact per-epoch lengths of cross prompts) rounded up to the
+    padding multiple, so the frame budget counts padded frames in every epoch, like the static costs."""
+
+    def __init__(self, epoch_costs, multiple):
+        self.epoch_costs, self.multiple = epoch_costs, multiple
+
+    def __call__(self, epoch):
+        return padded_costs(self.epoch_costs(epoch), self.multiple)
+
+
+def training_epoch_costs(dataset, train):
+    """The sampler's per-epoch cost function: None unless cross prompts vary the lengths per epoch."""
+    if not getattr(train, "cross_prompt_prob", 0):
+        return None
+    if train.pad_multiple <= 1:
+        return dataset.epoch_costs
+    return PaddedEpochCosts(dataset.epoch_costs, train.pad_multiple)
+
+
 FRAME_KEYS = ("latents", "prompt", "prompt_mask", "valid")
 TEXT_KEYS = ("tokens", "segments", "negative_tokens", "negative_segments")
 
