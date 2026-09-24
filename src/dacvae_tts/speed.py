@@ -202,8 +202,9 @@ class PaddedEpochCosts:
 
 
 def training_epoch_costs(dataset, train):
-    """The sampler's per-epoch cost function: None unless cross prompts vary the lengths per epoch."""
-    if not getattr(train, "cross_prompt_prob", 0):
+    """The sampler's per-epoch cost function: None unless cross prompts or stretched prompts vary the lengths per
+    epoch."""
+    if not getattr(train, "cross_prompt_prob", 0) and not getattr(train, "tempo_prompt_prob", 0):
         return None
     if train.pad_multiple <= 1:
         return dataset.epoch_costs

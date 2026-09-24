@@ -210,6 +210,17 @@ class TrainConfig:
     # `quiet` moves each within cut to the silence-closest frame within +-0.3 s (needs silence.pt), so
     # prompts end in a pause like inference prompts do instead of mid-word.
     prompt_cut: str = "random"
+    # Prompt tempo perturbation (VoiceStar, arXiv:2505.19462: +cross prompts 6.42 -> 5.66 WER, SIM -0.004): with
+    # this probability the prompt is the same speech at another tempo, from a tempo-variant store (WSOLA-stretched
+    # audio re-encoded by scripts/build_tempo_variants.py; relative paths resolve against the cache). Training then
+    # shows prompt/target rate mismatches, the break the length-aware RoPE prior meets whenever the duration rule
+    # does not reproduce the prompt's rate. `tempo_prompt_factors` picks stored tempos (e.g. [0.8, 0.9, 1.0, 1.111,
+    # 1.25]; [] = all; 1.0 is the re-encoded round trip); `tempo_prompt_pairs`: all (within cuts and cross prompts)
+    # or cross (cross prompts only, as VoiceStar). Stretched prompts carry no REPA teacher frames.
+    tempo_prompt_prob: float = 0.0
+    tempo_variants: str = ""
+    tempo_prompt_factors: tuple = ()
+    tempo_prompt_pairs: str = "all"
     # Teacher-feature auxiliary losses (alignment.py, scripts/extract_teacher_features.py); stores are
     # sidecar directories, relative paths resolve against the cache directory.
     teacher_features: str = ""  # speech-REPA frame store (e.g. teacher/mhubert147-l12-pca256)
@@ -333,6 +344,17 @@ class TrainConfig:
             self.cross_prompt_prob or self.long_prompt_prob or self.prompt_cut != "random"
         ):
             raise ValueError("cross_prompt_prob, long_prompt_prob and prompt_cut: quiet need within pairing")
+        self.tempo_prompt_factors = tuple(self.tempo_prompt_factors)
+        if not 0 <= self.tempo_prompt_prob <= 1 or self.tempo_prompt_pairs not in {"all", "cross"}:
+            raise ValueError("tempo_prompt_prob must lie in [0,1]; tempo_prompt_pairs all or cross")
+        if not all(isinstance(f, (int, float)) and not isinstance(f, bool) and 0.5 <= f <= 2.0
+                   for f in self.tempo_prompt_factors) or len(set(self.tempo_prompt_factors)) != len(
+                self.tempo_prompt_factors):
+            raise ValueError("tempo_prompt_factors must be distinct tempo factors in [0.5, 2.0]")
+        if self.tempo_prompt_prob and (not self.tempo_variants or self.pairing != "within"):
+            raise ValueError("tempo_prompt_prob needs a tempo_variants store and within pairing")
+        if self.tempo_prompt_prob and self.tempo_prompt_pairs == "cross" and not self.cross_prompt_prob:
+            raise ValueError("tempo_prompt_pairs: cross stretches cross prompts only; set cross_prompt_prob > 0")
         if min(self.repa_weight, self.repa_stop_step, self.tla_weight, self.tla_entropy) < 0:
             raise ValueError("Teacher loss weights and repa_stop_step must be nonnegative")
         if self.repa_frames not in {"all", "target"}:

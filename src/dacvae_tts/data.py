@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import os
 import random
 import sqlite3
@@ -15,6 +16,7 @@ from torch.utils.data import Dataset, Sampler
 
 from .contracts import normalization_stats
 from .teacher import TeacherInputs, collate_teacher, pair_teacher
+from .tempo import TempoStore, tempo_key
 from .text import (
     TEXT_UNITS,
     assemble,
@@ -111,7 +113,7 @@ def load_silence(directory, meta):
 
 # Independent random streams per (seed, epoch, index): toggling one pair option never moves the draws
 # of another, and every stream stays clear of the original seed range seed + epoch * rows + index.
-CROSS_STREAM, TAIL_STREAM, LONG_STREAM = 1 << 48, 2 << 48, 3 << 48
+CROSS_STREAM, TAIL_STREAM, LONG_STREAM, TEMPO_STREAM = 1 << 48, 2 << 48, 3 << 48, 4 << 48
 QUIET_CUT_SECONDS = 0.3
 
 
@@ -131,6 +133,7 @@ class LatentDataset(Dataset):
         teacher_features=None,
         speaker_embeddings=None,
         text_units="bytes",
+        tempo_variants=None,
         **pair_options,
     ):
         if pairing not in {"cross", "within"} or layout not in {"segments", "joined"}:
@@ -186,6 +189,9 @@ class LatentDataset(Dataset):
                 end = self.group_end[start]
                 self.max_ref_lengths[start:end] = self.lengths[start:end].max()
             self.costs = self.lengths + self.max_ref_lengths
+        # Tempo-variant latents of the rows (tempo.py, scripts/build_tempo_variants.py) for prompt tempo perturbation.
+        self.tempo_store = TempoStore(tempo_variants) if tempo_variants else None
+        self.split = split
         self.configure_pairs(**pair_options)
         self._pid, self._db, self._maps = None, None, OrderedDict()
         # Precomputed teacher targets (teacher.py) for the alignment losses; None leaves items unchanged.
@@ -250,8 +256,10 @@ class LatentDataset(Dataset):
         rng = random.Random(self.seed + epoch * len(self) + index)
         if self.pairing == "within":
             references = self.cross_plan(epoch, index)
+            tempo = self.tempo_plan(epoch, index)
             if references:
-                return self.finish_item(self.cross_prompt_item(index, references), epoch, index)
+                item = self.cross_prompt_item(index, references, tempo)
+                return self.finish_item(stretch_teacher(item) if tempo is not None else item, epoch, index)
             row = self.row(index)
             frames = len(row["latents"])
             # Prompt dropout trains prompt-free synthesis of the whole utterance from its text.
@@ -278,6 +286,11 @@ class LatentDataset(Dataset):
                 "layout": self.layout,
                 **pair_teacher(row, row, cut),
             }
+            if tempo is not None and self.tempo_pairs == "all" and cut > 0:
+                # The same speech at another tempo: the prompt covers the cut's content, the target is unchanged.
+                variant = self.tempo_latents(row["uid"], tempo)
+                reference = variant[: min(max(round(cut * 1000 / tempo), 1), len(variant))]
+                item = stretch_teacher({**item, "reference": reference, "prompt_tempo": tempo / 1000})
             return self.finish_item(item, epoch, index)
         start, end = int(self.group_start[index]), int(self.group_end[index])
         ref_index = rng.randrange(start, end - 1)
@@ -315,6 +328,9 @@ class LatentDataset(Dataset):
         tail_silence_max_seconds=0.8,
         prompt_cut="random",
         ctc_targets="bytes",
+        tempo_prompt_prob=0.0,
+        tempo_prompt_factors=(),
+        tempo_prompt_pairs="all",
     ):
         """Validate the options and widen `costs` to an upper bound of every prompt+target they can form.
 
@@ -350,6 +366,57 @@ class LatentDataset(Dataset):
         if cross_prompt_prob:
             several = self.group_end - self.group_start >= 2
             self.costs = self.costs + np.where(several, self.cross_prompt_frames, 0).astype(self.costs.dtype)
+        self.configure_tempo(tempo_prompt_prob, tempo_prompt_factors, tempo_prompt_pairs)
+
+    def configure_tempo(self, probability, factors, pairs):
+        """Prompt tempo perturbation: with `probability`, an item's prompt is the same speech at one of `factors`
+        (tempo x0.8 = slower, from the tempo-variant store; () = every stored tempo). `pairs`: `all` stretches
+        within-utterance cuts and cross prompts, `cross` only cross prompts (VoiceStar's setting). Off: no draws,
+        no new item keys, unchanged costs. The static `costs` bound grows by the longest stretched within prompt.
+        """
+        if not 0 <= probability <= 1 or pairs not in {"all", "cross"}:
+            raise ValueError("tempo_prompt_prob must lie in [0,1]; tempo_prompt_pairs all or cross")
+        self.tempo_prompt_prob, self.tempo_pairs, self.tempo_factors = probability, pairs, ()
+        if not probability:
+            return
+        if self.tempo_store is None or self.pairing != "within":
+            raise ValueError("Prompt tempo perturbation needs within pairing and a tempo-variant store")
+        if pairs == "cross" and not self.cross_prompt_prob:
+            raise ValueError("tempo_prompt_pairs: cross stretches cross prompts only; set cross_prompt_prob > 0")
+        self.tempo_factors = tuple(sorted({tempo_key(f) for f in factors})) if factors else self.tempo_store.tempos
+        self.tempo_store.check(self.db_path, self.split, self.tempo_factors, self.meta)
+        with sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True) as db:
+            uid = dict(db.execute("SELECT id, uid FROM samples WHERE split=?", (self.split,)))
+        uids = [uid[int(i)] for i in self.ids]
+        self.tempo_lengths = {t: self.tempo_store.lengths(uids, t) for t in self.tempo_factors}
+        slowest = min(self.tempo_factors)
+        if pairs == "all" and slowest < 1000:
+            # Longest within prompt: the cut fraction's upper end (plus the quiet-cut window), stretched.
+            top = self.prompt_fraction_long_max if self.long_prompt_prob else self.prompt_fraction[1]
+            window = self.quiet_window if self.prompt_cut == "quiet" else 0
+            cut = np.minimum(self.lengths - 1, np.ceil(self.lengths * top).astype(np.int64) + window)
+            self.costs = self.costs + np.maximum(np.ceil(cut * 1000 / slowest).astype(np.int64) - cut, 0).astype(
+                self.costs.dtype)
+
+    def tempo_plan(self, epoch, index):
+        """Tempo (per mille) of this row's prompt in `epoch`, or None: a pure function of (seed, epoch, index)."""
+        if not self.tempo_prompt_prob:
+            return None
+        rng = random.Random(self.seed + epoch * len(self) + index + TEMPO_STREAM)
+        if rng.random() >= self.tempo_prompt_prob:
+            return None
+        return rng.choice(self.tempo_factors)
+
+    def tempo_latents(self, uid, tempo):
+        """Normalized latents of a row at `tempo`, like `row` normalizes the cache latents."""
+        return (self.tempo_store.latents(uid, tempo) - self.mean) / self.std
+
+    def planned_cut(self, epoch, index):
+        """The within cut `__getitem__` draws before the quiet-cut move (0 with prompt dropout)."""
+        rng = random.Random(self.seed + epoch * len(self) + index)
+        if rng.random() < self.prompt_dropout:
+            return 0
+        return round(int(self.lengths[index]) * rng.uniform(*self.prompt_range(epoch, index)))
 
     def cross_plan(self, epoch, index):
         """Rows forming this row's prompt in `epoch` (other utterances of its speaker), or () for a cut.
@@ -372,28 +439,47 @@ class LatentDataset(Dataset):
         if rng.random() >= self.cross_prompt_prob:
             return ()
         count = rng.randint(1, min(self.cross_prompt_utterances, end - start - 1))
+        tempo = self.tempo_plan(epoch, index)  # stretched references are measured at their stretched length
+        lengths = self.lengths if tempo is None else self.tempo_lengths[tempo]
         chosen, total = [], 0
         for other in rng.sample(range(start, end - 1), count):
             other += other >= index
-            if total + int(self.lengths[other]) <= self.cross_prompt_frames:
+            if total + int(lengths[other]) <= self.cross_prompt_frames:
                 chosen.append(other)
-                total += int(self.lengths[other])
+                total += int(lengths[other])
         return tuple(chosen)
 
     def epoch_costs(self, epoch):
-        """Exact prompt+target frames of every row in `epoch` (plus the tail-silence maximum)."""
+        """Prompt+target frames of every row in `epoch` (plus the tail-silence maximum): exact for cross prompts, and
+        for stretched within prompts bounded by the planned cut plus the quiet-cut window."""
         costs = self.lengths + self.tail_silence_frames
+        crossed = set()
         if self.cross_prompt_prob:
             for index in np.flatnonzero(self.group_end - self.group_start >= 2):
                 references = self.cross_plan(epoch, int(index))
                 if references:
-                    costs[index] += int(self.lengths[list(references)].sum())
+                    crossed.add(int(index))
+                    tempo = self.tempo_plan(epoch, int(index))
+                    lengths = self.lengths if tempo is None else self.tempo_lengths[tempo]
+                    costs[index] += int(lengths[list(references)].sum())
+        if self.tempo_prompt_prob and self.tempo_pairs == "all":
+            window = self.quiet_window if self.prompt_cut == "quiet" else 0
+            for index in range(len(self)):
+                tempo = self.tempo_plan(epoch, index)
+                if tempo is None or tempo >= 1000 or index in crossed:
+                    continue
+                cut = min(int(self.lengths[index]) - 1, self.planned_cut(epoch, index) + window)
+                if cut > 0:
+                    costs[index] += max(math.ceil(cut * 1000 / tempo) - cut, 0)
         return costs
 
-    def cross_prompt_item(self, index, references):
+    def cross_prompt_item(self, index, references, tempo=None):
         """Prompt = the references' latents back to back, transcript = their texts + target text, target =
-        the whole utterance; the joined layout reads it as one stream like a within item."""
+        the whole utterance; the joined layout reads it as one stream like a within item. `tempo`: the references'
+        stretched latents (their teacher frames cannot be aligned and are marked invalid)."""
         target, refs = self.row(index), [self.row(r) for r in references]
+        if tempo is not None:
+            refs = [{**r, "latents": self.tempo_latents(r["uid"], tempo)} for r in refs]
         ids = [r["token_ids"] for r in refs]
         utf8 = [r["text_bytes"] for r in refs]
         return {
@@ -411,6 +497,7 @@ class LatentDataset(Dataset):
             "text_normalization": self.meta.get("text_normalization", "unicode-v1"),
             "layout": self.layout,
             **pair_teacher(refs, target),  # teacher frames of the references back to back, like the latents
+            **({"prompt_tempo": tempo / 1000} if tempo is not None else {}),
         }
 
     def prompt_range(self, epoch, index):
@@ -453,6 +540,16 @@ class LatentDataset(Dataset):
             teacher = item["teacher_target"]
             item["teacher_target"] = torch.cat([teacher, teacher.new_zeros(frames, teacher.size(-1))])
         return item
+
+
+def stretch_teacher(item):
+    """A stretched prompt has no frame-aligned teacher features: zero rows of its length, flagged so that
+    collate_teacher leaves them out of speech-REPA (`teacher_valid`)."""
+    if "teacher_reference" not in item:
+        return item
+    width = item["teacher_reference"].size(-1)
+    zeros = item["teacher_reference"].new_zeros(len(item["reference"]), width)
+    return {**item, "teacher_reference": zeros, "teacher_prompt_invalid": True}
 
 
 def collate(items):

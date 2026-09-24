@@ -371,6 +371,7 @@ def training_dataset(cache, cfg):
         prompt_fraction=(cfg.train.prompt_fraction_min, cfg.train.prompt_fraction_max),
         **pair_options(cfg),
         **teacher_sources(cfg.train, cache),
+        **tempo_sources(cfg.train, cache),
     )
 
 
@@ -529,7 +530,21 @@ def pair_options(cfg):
         "tail_silence_max_seconds",
         "prompt_cut",
     )
-    return {**{name: getattr(cfg.train, name) for name in names}, "ctc_targets": cfg.model.ctc_targets}
+    options = {**{name: getattr(cfg.train, name) for name in names}, "ctc_targets": cfg.model.ctc_targets}
+    if cfg.train.tempo_prompt_prob:  # off: no tempo keywords at all, the dataset is built exactly as before
+        options.update(tempo_prompt_prob=cfg.train.tempo_prompt_prob,
+                       tempo_prompt_factors=cfg.train.tempo_prompt_factors,
+                       tempo_prompt_pairs=cfg.train.tempo_prompt_pairs)
+    return options
+
+
+def tempo_sources(train, cache):
+    """LatentDataset keyword for the tempo-variant store (relative paths resolve against `cache`); empty if off."""
+    if not train.tempo_prompt_prob:
+        return {}
+    from .teacher import resolve_store
+
+    return {"tempo_variants": resolve_store(train.tempo_variants, cache)}
 
 
 def train(args):
