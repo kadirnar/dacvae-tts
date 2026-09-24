@@ -1,6 +1,7 @@
 """DDP training with sample-weighted accumulation and per-rank resumable RNG state."""
 
 import copy
+import dataclasses
 import json
 import math
 import os
@@ -422,8 +423,10 @@ def train(args):
                 # Warm start: weights only. Schedule, optimizer state and data order start fresh, so
                 # a run can continue on a larger cache than the one that produced the checkpoint.
                 warm = torch.load(args.init_from, map_location="cpu", weights_only=True)
-                if Config.from_dict(warm["config"]).model != cfg.model:
-                    raise ValueError("--init-from requires an identical model configuration")
+                warm_model = Config.from_dict(warm["config"]).model
+                # Dropout has no parameters, so a run may switch it on or off when warm starting.
+                if dataclasses.replace(warm_model, dropout=cfg.model.dropout) != cfg.model:
+                    raise ValueError("--init-from requires an identical model configuration (except dropout)")
                 model.load_state_dict(warm["model"])
                 ema.load_state_dict(warm["ema"])
             torch.manual_seed(cfg.train.seed + rank)

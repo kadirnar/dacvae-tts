@@ -26,6 +26,9 @@ class ModelConfig:
     duration: str = "head"
     ctc_layer: int = 0
     adaln_rank: int = 0  # 0: one D->9D modulation per block; r>0: shared modulation + rank-r per block
+    # Residual-branch dropout in the generator blocks (attention outputs, FFN hidden activation); F5-TTS's
+    # DiT uses 0.1. Parameter-free, so checkpoints load with any value; 0 draws no random numbers at all.
+    dropout: float = 0.0
 
     def __post_init__(self):
         if min(self.latent_dim, self.width, self.depth, self.heads, self.patch_size) < 1:
@@ -58,6 +61,8 @@ class ModelConfig:
             raise ValueError("ctc_layer must be 0 (off) or the index of a generator block")
         if self.text_layout == "joined" and self.duration == "head":
             raise ValueError("The duration head needs separate transcripts; use duration: rule when joined")
+        if not 0 <= self.dropout < 1:
+            raise ValueError("dropout must lie in [0,1)")
 
 
 @dataclass

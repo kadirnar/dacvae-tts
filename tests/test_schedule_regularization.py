@@ -1,5 +1,6 @@
 """Training schedule and regularization options of issue #14; every default keeps the original recipe."""
 
+import copy
 import json
 import math
 import shutil
@@ -12,8 +13,9 @@ import torch
 import yaml
 
 from dacvae_tts import training
-from dacvae_tts.config import Config, TrainConfig
-from dacvae_tts.data import LatentDataset
+from dacvae_tts.config import Config, ModelConfig, TrainConfig
+from dacvae_tts.data import LatentDataset, collate
+from dacvae_tts.model import FlowTTS
 from dacvae_tts.training import (
     decay_phase_loader,
     decay_start,
@@ -24,9 +26,13 @@ from dacvae_tts.training import (
 )
 
 CONFIGS = Path(__file__).resolve().parents[1] / "configs"
+NANO = dict(
+    latent_dim=4, width=32, heads=2, depth=2, text_depth=1, text_attention=1, patch_size=1, positions="rope",
+    qk_norm=True, prediction="edm", text_layout="joined", duration="rule", ctc_layer=1,
+)
 # Configuration keys added for issue #14; configurations saved before it lack them.
 NEW_FIELDS = {
-    "model": (),
+    "model": ("dropout",),
     "train": (
         "lr_schedule", "decay_fraction", "decay_shape", "min_lr_ratio", "decay_cache", "final_time_sampling",
         "final_time_sampling_start",
@@ -192,8 +198,8 @@ def test_decay_loader_checks_the_codec_and_keeps_the_main_normalization(cache, d
 
 
 def test_options_resume_exactly_across_the_decay_switch(cache, decay_cache, tmp_path, monkeypatch):
-    """WSD + decay cache + uniform-t cooldown, interrupted before, exactly at and after the decay start
-    (update 3 of 6), must equal the uninterrupted run."""
+    """WSD + decay cache + uniform-t cooldown + dropout, interrupted before, exactly at and after the decay
+    start (update 3 of 6), must equal the uninterrupted run."""
     calls = []
     original = training.flow_loss
 
@@ -203,7 +209,7 @@ def test_options_resume_exactly_across_the_decay_switch(cache, decay_cache, tmp_
 
     monkeypatch.setattr(training, "flow_loss", spy)
     config = config_file(
-        tmp_path, lr_schedule="wsd", decay_fraction=0.5, decay_shape="1-sqrt",
+        tmp_path, model={**TINY, "dropout": 0.1}, lr_schedule="wsd", decay_fraction=0.5, decay_shape="1-sqrt",
         min_lr_ratio=0.0, decay_cache=str(decay_cache), time_sampling="logit_normal",
         final_time_sampling="uniform",
     )
@@ -221,3 +227,80 @@ def test_options_resume_exactly_across_the_decay_switch(cache, decay_cache, tmp_
     for key in full["model"]:
         for weights in ("model", "ema"):
             assert torch.equal(full[weights][key], resumed[weights][key]), (weights, key)
+
+
+# ------------------------------------------------------------------------------------------------- dropout
+
+
+def randomized(model, seed=0):
+    """Zero-initialized AdaLN/output would make every branch identical; perturb them so conditions matter."""
+    torch.manual_seed(seed)
+    for block in model.blocks:
+        last = block.ada_up if hasattr(block, "ada_up") else block.ada[-1]
+        torch.nn.init.normal_(last.weight, std=0.05)
+    torch.nn.init.normal_(model.output[-1].weight, std=0.05)
+    return model
+
+
+def nano_batch(prompts=(3, 4, 0), frames=9):
+    torch.manual_seed(1)
+    items = []
+    for index, prompt in enumerate(prompts):
+        latents = torch.randn(frames + 2 * index, 4)
+        items.append(
+            dict(reference=latents[:prompt], target=latents[prompt:], reference_text="",
+                 text=f"Spoken words number {index}.", layout="joined")
+        )
+    return collate(items)
+
+
+def test_zero_dropout_installs_nothing_and_draws_no_random_numbers():
+    torch.manual_seed(0)
+    plain = FlowTTS(ModelConfig(**NANO))
+    torch.manual_seed(0)
+    dropped = FlowTTS(ModelConfig(**NANO, dropout=0.1))
+    # Same parameter names and values: checkpoints move freely between the two.
+    assert plain.state_dict().keys() == dropped.state_dict().keys()
+    assert all(torch.equal(v, dropped.state_dict()[k]) for k, v in plain.state_dict().items())
+    for block in plain.blocks:
+        assert not block.self_attn._forward_hooks and isinstance(block.ff[1], torch.nn.GELU)
+    model = randomized(plain).train()
+    batch = nano_batch()
+    kwargs = {k: v for k, v in batch.items() if k != "latents"}
+    time = torch.full((3,), 0.4)
+    state = torch.get_rng_state()
+    training_output = model(batch["latents"], time, **kwargs)
+    assert torch.equal(torch.get_rng_state(), state)
+    assert torch.equal(training_output, model.eval()(batch["latents"], time, **kwargs))
+
+
+def test_dropout_is_active_only_in_training():
+    model = randomized(FlowTTS(ModelConfig(**NANO, dropout=0.3)))
+    reference = FlowTTS(ModelConfig(**NANO))
+    reference.load_state_dict(model.state_dict())
+    batch = nano_batch()
+    kwargs = {k: v for k, v in batch.items() if k != "latents"}
+    time = torch.full((3,), 0.4)
+    model.train()
+    first, second = model(batch["latents"], time, **kwargs), model(batch["latents"], time, **kwargs)
+    assert not torch.allclose(first, second)
+    expected = reference.eval()(batch["latents"], time, **kwargs)
+    assert torch.equal(model.eval()(batch["latents"], time, **kwargs), expected)
+    # The EMA is a deep copy: it keeps the hooks and is evaluated without dropout.
+    assert torch.equal(copy.deepcopy(model).eval()(batch["latents"], time, **kwargs), expected)
+
+
+def test_warm_start_may_switch_dropout_but_nothing_else(cache, tmp_path):
+    run(config_file(tmp_path, "base.yaml", steps=3), cache, tmp_path / "base")
+    warm = str(tmp_path / "base" / "last.pt")
+    tuned = run(config_file(tmp_path, "tune.yaml", model={**TINY, "dropout": 0.1}, steps=2), cache,
+                tmp_path / "tune", init_from=warm)
+    assert tuned["step"] == 2 and all(torch.isfinite(v).all() for v in tuned["model"].values())
+    other = config_file(tmp_path, "other.yaml", model={**TINY, "dropout": 0.1, "width": 32})
+    with pytest.raises(ValueError, match="identical model configuration"):
+        run(other, cache, tmp_path / "other", init_from=warm)
+
+
+def test_regularization_configuration_guards():
+    with pytest.raises(ValueError):
+        ModelConfig(dropout=1.0)

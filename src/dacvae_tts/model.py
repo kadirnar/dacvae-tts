@@ -170,6 +170,22 @@ class Block(nn.Module):
         return x * valid[..., None]
 
 
+def _output_dropout(module, args, output):
+    return F.dropout(output, module.output_dropout, module.training)
+
+
+def add_dropout(block, p):
+    """Residual-branch dropout where F5-TTS's DiT has it (0.1): after both attention output projections and on
+    the FFN hidden activation. Only parameter-free pieces are added (an output hook, a Dropout next to the
+    activation), so state-dict keys, initialization and checkpoints are the same with and without it."""
+    if not isinstance(block.ff[1], nn.GELU):
+        raise TypeError("Dropout expects the block feed-forward as Linear, GELU, Linear")
+    block.ff[1] = nn.Sequential(block.ff[1], nn.Dropout(p))
+    for attention in (block.self_attn, block.cross_attn):
+        attention.output_dropout = p
+        attention.register_forward_hook(_output_dropout)
+
+
 class FlowTTS(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -183,6 +199,9 @@ class FlowTTS(nn.Module):
         self.time = nn.Sequential(nn.Linear(d, d), nn.SiLU(), nn.Linear(d, d))
         self.input = nn.Linear((2 * c + 1) * p, d)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.depth)])
+        if cfg.dropout:  # at 0 nothing is installed, so default runs draw exactly the same random numbers
+            for block in self.blocks:
+                add_dropout(block, cfg.dropout)
         self.ada_shared = None
         if cfg.adaln_rank:
             self.ada_shared = nn.Sequential(nn.SiLU(), nn.Linear(d, d * 9))
