@@ -155,10 +155,12 @@ def main():
     p.add_argument("--duration-scale", type=float, default=1.0)
     p.add_argument(
         "--duration-mode",
-        choices=["rule", "clamp", "syllable", "predictor", "auto"],
+        choices=["rule", "clamp", "syllable", "predictor", "auto", "articulation"],
         default="rule",
         help="Target length for rule-duration models: prompt rate per byte, the same with fast prompts slowed, "
-        "per syllable, or the fitted duration predictor",
+        "per syllable, the fitted duration predictor, auto (rule/clamp/predictor by prompt rate), or articulation "
+        "(syllables per second of the prompt's speaking time without edge silence and pauses >= 200 ms, plus "
+        "0.15 s per internal comma and 0.3 s per internal sentence end; see dacvae_tts/duration.py)",
     )
     p.add_argument("--compile", action="store_true")
     p.add_argument("--seed", type=int, default=42)

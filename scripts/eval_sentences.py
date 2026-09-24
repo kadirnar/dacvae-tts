@@ -110,7 +110,8 @@ def best_of_n(tts, scorer, text, voice, path, seconds, index, args, sampler, pro
     results, metadata = tts.synthesize_many(
         [text], voice, candidates=args.candidates, seconds=seconds, duration_scale=args.duration_scale,
         duration_mode=args.duration_mode, steps=args.steps, guidance=args.guidance, seed=args.seed + index,
-        sway=args.sway, guidance_until=args.guidance_until, noise_scale=args.noise_scale, selector=select, **sampler,
+        sway=args.sway, guidance_until=args.guidance_until, noise_scale=args.noise_scale, selector=select,
+        duration_factors=args.duration_factors, **sampler,
     )
     candidates = results[0]
     best = metadata["selected"][0]
@@ -121,9 +122,11 @@ def best_of_n(tts, scorer, text, voice, path, seconds, index, args, sampler, pro
     meta = {**metadata, **chosen, "selected": best, "candidate_scores": scores,
             "candidate_cer": [s.get("cer") for s in scores], "candidate_hypotheses": [s.get("hypothesis") for s in scores],
             "audio_seconds": len(audio) / tts.codec.sample_rate}
+    factor = {"selected_factor": candidates[best]["duration_factor"]} if args.duration_factors else {}
+    meta.update(factor)
     path.with_suffix(".json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
     return {"audio_seconds": meta["audio_seconds"], "rtf": metadata["request_seconds"] / max(meta["audio_seconds"], 1e-6),
-            "selected": best, "candidate_cer": meta["candidate_cer"]}
+            "selected": best, "candidate_cer": meta["candidate_cer"], **factor}
 
 
 def audio_stats(path):
@@ -237,7 +240,15 @@ def main():
     parser.add_argument("--duration-scale", type=float, default=1.0)
     parser.add_argument("--chars-per-second", type=float, default=0.0,
                         help="If > 0: fixed speaking rate; output seconds = normalized characters / rate instead of the prompt-rate rule")
-    parser.add_argument("--duration-mode", choices=["rule", "clamp", "syllable", "predictor", "auto"], default="rule")
+    parser.add_argument("--duration-mode", choices=["rule", "clamp", "syllable", "predictor", "auto", "articulation"],
+                        default="rule")
+    parser.add_argument("--articulation-options", type=json.loads,
+                        help='JSON overrides of the articulation rule, e.g. \'{"comma_pause": 0.2, "stop_pause": 0.4}\'')
+    parser.add_argument("--duration-factors", type=lambda v: [float(f) for f in v.split(",")],
+                        help="Duration-diverse best-of-N, e.g. 1.0,0.9,1.1: candidate k gets factor k mod n (needs "
+                        "--candidates >= n; list 1.0 first, selector ties keep the first candidate)")
+    parser.add_argument("--duration-model", help="Predictor JSON of the predictor/auto modes (default: the packaged "
+                        "duration_tr.json), e.g. the output of scripts/fit_duration_best_factor.py")
     parser.add_argument("--guidance-from", type=float, default=0.0)
     parser.add_argument("--cfg-rescale", type=float, default=0.0)
     parser.add_argument("--apg-eta", type=float, default=1.0)
@@ -280,6 +291,8 @@ def main():
     add_protocol_args(parser)
     args = parser.parse_args()
     protocol = protocol_from_args(args)
+    if args.duration_factors and (args.candidates < 2 or len(args.duration_factors) > args.candidates):
+        parser.error("--duration-factors is a best-of-N option: needs --candidates >= max(2, number of factors)")
 
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
@@ -290,6 +303,10 @@ def main():
     wavs_exist = all((out / f"{s['id']}.wav").exists() for s in sentences)
     reuse = args.rescore and ((out / "results.jsonl").exists() or wavs_exist)
     tts = None if reuse else Synthesizer(args.checkpoint, device=args.device)
+    if tts is not None:
+        tts.articulation_options = args.articulation_options  # None: the defaults of duration.articulation_seconds
+        if args.duration_model:
+            tts.duration_model = args.duration_model  # loaded by the predictor/auto modes
     prompts = []
     for number, case in enumerate(cases):
         latents = data.row(case["prompt_index"])["latents"]
@@ -304,7 +321,7 @@ def main():
                    **{name: getattr(args, name) for name in (*WINDOW_OPTIONS, *OUTPUT_OPTIONS)})
     if tts is None and (out / "results.jsonl").exists():  # rescore: reuse the synthesis rows of the previous pass
         previous = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines() if line.strip()]
-        rows = [{k: v for k, v in r.items() if k in {"id", "text", "speaker", "prompt", "audio", "audio_seconds", "rtf", "error"}} for r in previous]
+        rows = [{k: v for k, v in r.items() if k in {"id", "text", "speaker", "prompt", "audio", "audio_seconds", "rtf", "error", "selected_factor"}} for r in previous]
         sentences = []
     elif tts is None:  # rescore an interrupted pass: rebuild the rows from the WAVs and their JSON sidecars
         for index, sentence in enumerate(sentences):
@@ -406,6 +423,11 @@ def main():
     )
     if protocol is not None:
         summary.update(protocol=protocol_identity, prompt_audio=args.prompt_audio)
+    if args.duration_factors or args.articulation_options or args.duration_model:
+        summary.update(duration_factors=args.duration_factors, articulation_options=args.articulation_options,
+                       duration_model=args.duration_model,
+                       selected_factors={str(f): sum(r.get("selected_factor") == f for r in good)
+                                         for f in args.duration_factors or []})
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))
 

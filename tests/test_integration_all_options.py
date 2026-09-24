@@ -82,3 +82,54 @@ def test_utmos_flag_serves_protocol_and_eval_sentences():
     assert options.utmosv2 and not options.utmos and utmos_models(options) == ["utmosv2"]
     options = protocol_from_args(parser.parse_args(["--protocol-v2", "--utmos", "utmosv2"]))
     assert utmos_models(options) == ["utmos22", "utmosv2"]
+
+
+class _Codec:
+    """Codec stand-in: 4 latent channels, 512 samples per frame; accepts #13's decode keywords."""
+
+    def __init__(self, checkpoint, device):
+        self.latent_dim, self.sample_rate, self.hop_length = 4, 24000, 512
+        self.metadata = dict(checkpoint="test-codec", sample_rate=24000, hop_length=512, latent_dim=4,
+                             posterior="mean", weights_sha256="fixture", preprocessing="fixture")
+
+    def decode(self, z, pre_tanh_gain=None, stats=None):
+        if stats is not None:
+            stats.update(pre_tanh_gain=1.0, pre_tanh_mode=str(pre_tanh_gain), pre_tanh_level=0.5)
+        return torch.sin(z.sum(-1).cumsum(0)).repeat_interleave(512) * 0.3
+
+
+def test_inference_options_combine(monkeypatch, cache, tmp_path):
+    """#12 x #13: duration-diverse candidates, the articulation rule, a composite selector, two guidance
+    windows and output shaping in one synthesize_many call."""
+    import dacvae_tts.inference as module
+    from dacvae_tts.config import Config
+    from dacvae_tts.data import LatentDataset
+    from dacvae_tts.inference import Synthesizer, VoiceReference
+
+    data = LatentDataset(cache)
+    config = Config(ModelConfig(latent_dim=4, width=16, depth=1, heads=2, text_depth=1, text_layout="joined",
+                                duration="rule", positions="rope", prediction="edm"))
+    path = tmp_path / "model.pt"
+    model = FlowTTS(config.model)
+    torch.save({"model": model.state_dict(), "ema": model.state_dict(), "config": config.to_dict(),
+                "codec": {**data.meta, "text_normalization": "turkish-v1"}, "mean": data.mean, "std": data.std}, path)
+    monkeypatch.setattr(module, "Codec", _Codec)
+    tts = Synthesizer(path, device="cpu", precision="fp32")
+    voice = VoiceReference(torch.randn(60, 4), "Referans cümlesi burada, biraz uzun.", "test", {})
+    texts = ["Merhaba dünya.", "İkinci cümle biraz daha uzun."]
+
+    def selector(text, audios, sample_rate):
+        scores = [dict(dnsmos=float(len(audio))) for audio in audios]  # prefer the longest candidate
+        return max(range(len(audios)), key=lambda k: scores[k]["dnsmos"]), scores
+
+    results, metadata = tts.synthesize_many(
+        texts, voice, candidates=3, steps=4, guidance=2.0, duration_mode="articulation",
+        duration_factors=[1.0, 0.8, 1.25], selector=selector, guidance_split=0.5, apg_eta_late=0.5,
+        moment_match="std", pre_tanh_gain="auto",
+    )
+    assert metadata["candidate_factors"] == [1.0, 0.8, 1.25] and metadata["moment_match"] == "std"
+    assert metadata["late_window"]["eta"] == 0.5
+    for row, best in zip(results, metadata["selected"]):
+        assert [c["duration_factor"] for c in row] == [1.0, 0.8, 1.25]
+        assert row[best]["duration_factor"] == 1.25 and "selection" in row[best] and "latent_moments" in row[best]
+        assert all(torch.isfinite(torch.as_tensor(c["audio"])).all() for c in row)
