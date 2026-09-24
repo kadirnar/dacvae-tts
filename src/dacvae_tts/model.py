@@ -154,11 +154,32 @@ class Block(nn.Module):
         # v_l <- l1 v_l + l2 v_1 keep the first block's token features reachable in deep blocks. Two scalars
         # per block, identity at init (l1 = 1, l2 = 0). Block 1 mixes its own values: all are used (DDP).
         self.value_mix = nn.Parameter(torch.tensor([1.0, 0.0])) if cfg.value_residual else None
+        # Depthwise time convolution on the FFN hidden units, after the activation and residual (Mix-FFN
+        # style): the only local mixing along frames in the generator. ZipVoice WER 1.69 -> 9.79 without
+        # its conv modules, FastSpeech CMOS -0.11 without conv in the FFN, U-DiT/SANA gains; F5's
+        # Conv2Audio is the counter-example (4.17 -> 5.78). Zero-init, so the model starts as the baseline;
+        # skip_init draws no random numbers, so the other weights stay the baseline's for the same seed.
+        self.ff_conv = None
+        if cfg.ffn_conv_kernel:
+            hidden, kernel = self.ff[-1].in_features, cfg.ffn_conv_kernel
+            self.ff_conv = nn.utils.skip_init(
+                nn.Conv1d, hidden, hidden, kernel, padding=kernel // 2, groups=hidden
+            )
+            nn.init.zeros_(self.ff_conv.weight)
+            nn.init.zeros_(self.ff_conv.bias)
 
     def modulation(self, cond, shared):
         if shared is None:
             return self.ada(cond)
         return shared + self.ada_up(F.silu(self.ada_down(cond)))
+
+    def conv_feed_forward(self, h, valid):
+        """The FFN with its depthwise time convolution between the activation and the output projection."""
+        *project, down = self.ff
+        for layer in project:
+            h = layer(h)
+        h = h * valid[..., None]  # padded frames hold bias-driven activations: keep them from neighbours
+        return down(h + self.ff_conv(h.transpose(1, 2)).transpose(1, 2))
 
     def forward(
         self,
@@ -186,7 +207,10 @@ class Block(nn.Module):
             x = x + g1 * y
         h = self.norm2(x) * (1 + s2) + b2
         x = x + g2 * self.cross_attn(h, text, text_valid, query_angles, key_angles)
-        x = x + g3 * self.ff(self.norm3(x) * (1 + s3) + b3)
+        if self.ff_conv is None:
+            x = x + g3 * self.ff(self.norm3(x) * (1 + s3) + b3)
+        else:
+            x = x + g3 * self.conv_feed_forward(self.norm3(x) * (1 + s3) + b3, valid)
         x = x * valid[..., None]
         return x if self.value_mix is None else (x, first_value)
 

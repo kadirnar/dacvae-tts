@@ -15,10 +15,12 @@ BASE = dict(NANO, adaln_rank=8)
 OPTIONS = {
     "long_skip": dict(long_skip=True),
     "value_residual": dict(value_residual=True),
+    "ffn_conv": dict(ffn_conv_kernel=5),
 }
 # Options whose new parameters start at zero (or identity): the model starts as the baseline function.
-ZERO_INIT = ["long_skip", "value_residual"]
+ZERO_INIT = ["long_skip", "value_residual", "ffn_conv"]
 ALL = {key: value for option in OPTIONS.values() for key, value in option.items()}
+CASES = {**OPTIONS, "all": ALL, "ffn_conv_patch2": dict(ffn_conv_kernel=3, patch_size=2)}
 
 # Captured from the architecture before these options existed (8f01f08): state_dict length and layout hash,
 # and an RNG-free forward fingerprint, so a default model keeps its keys, shapes and computation.
@@ -80,7 +82,7 @@ def test_options_off_keep_the_previous_model(overrides, keys, layout, expected):
     assert len(model.state_dict()) == keys and layout_hash(model) == layout
     assert fingerprint(model) == pytest.approx(expected, rel=1e-5, abs=1e-5)
     # Explicitly disabled options are the default: an old checkpoint loads strictly.
-    off = {"long_skip": False, "value_residual": False}
+    off = {"long_skip": False, "value_residual": False, "ffn_conv_kernel": 0}
     FlowTTS(ModelConfig(**overrides, **off)).load_state_dict(model.state_dict(), strict=True)
 
 
@@ -98,10 +100,20 @@ def test_zero_initialized_option_starts_as_the_baseline(name):
     assert torch.equal(model(batch["latents"], time, **inputs(batch), drop=drop), expected)
 
 
-@pytest.mark.parametrize("name", [*OPTIONS, "all"])
+@pytest.mark.parametrize("name", ZERO_INIT)
+def test_option_keeps_the_baseline_initialization_for_the_same_seed(name):
+    """New modules draw no random numbers before baseline ones: A/B arms with one seed start from the same
+    weights (and, reseeded after construction, see the same noise), so they differ by the option alone."""
+    torch.manual_seed(0)
+    base = FlowTTS(ModelConfig(**BASE)).state_dict()
+    torch.manual_seed(0)
+    model = FlowTTS(ModelConfig(**BASE, **OPTIONS[name])).state_dict()
+    assert all(torch.equal(value, model[key]) for key, value in base.items())
+
+
+@pytest.mark.parametrize("name", list(CASES))
 def test_option_trains_with_checkpointing_and_ignores_padding(name):
-    overrides = ALL if name == "all" else OPTIONS[name]
-    model = perturbed(FlowTTS(ModelConfig(**BASE, **overrides))).train()
+    model = perturbed(FlowTTS(ModelConfig(**{**BASE, **CASES[name]}))).train()
     batch = nano_batch(frames=64)  # CTC needs at least as many frames as transcript bytes
     gradients = []
     for checkpointing in (False, True):
@@ -136,6 +148,7 @@ def test_muon_partition_covers_the_new_parameters():
     adamw = {names[id(p)] for p in others}
     assert muon["skip.1.weight"] == 1 and {"skip.0.weight", "skip.1.bias"} <= adamw  # hidden [D,2D] map
     assert "blocks.0.value_mix" in adamw  # two scalars
+    assert {"blocks.0.ff_conv.weight", "blocks.1.ff_conv.bias"} <= adamw  # [H,1,k] filters
     assert muon["blocks.0.ff.0.weight"] == 1 and muon["blocks.1.self_attn.kv.weight"] == 2
 
 
@@ -161,6 +174,27 @@ def test_value_residual_feeds_the_first_block_values_to_later_blocks():
         assert torch.allclose(model(batch["latents"], time, **inputs(batch)), before, atol=1e-6)
         model.blocks[1].value_mix.copy_(torch.tensor([1.0, 0.0]))
         assert not torch.allclose(model(batch["latents"], time, **inputs(batch)), before, atol=1e-3)
+
+
+def test_ffn_conv_is_depthwise_and_never_mixes_in_padded_frames():
+    model = FlowTTS(ModelConfig(**BASE, ffn_conv_kernel=5))
+    hidden = model.blocks[0].ff[-1].in_features
+    assert model.blocks[0].ff_conv.weight.shape == (hidden, 1, 5)
+    assert sum(p.numel() for p in new_parameters(model).values()) == len(model.blocks) * hidden * (5 + 1)
+    block = perturbed(model).blocks[0]
+    torch.manual_seed(0)
+    h = torch.randn(2, 9, 32)
+    valid = torch.ones(2, 9, dtype=torch.bool)
+    valid[0, 6:] = False
+    garbage = h.masked_fill(~valid[..., None], 1e3)
+    out = block.conv_feed_forward(h, valid)
+    assert torch.allclose(block.conv_feed_forward(garbage, valid)[valid], out[valid])
+    # Sanity: the convolution does reach neighbouring frames, so the mask above is what protects them.
+    unmasked = block.conv_feed_forward(garbage, torch.ones_like(valid))
+    assert not torch.allclose(unmasked[0, 4:6], out[0, 4:6]) and torch.allclose(unmasked[0, :3], out[0, :3])
+    for kernel in (-1, 4):
+        with pytest.raises(ValueError):
+            ModelConfig(**BASE, ffn_conv_kernel=kernel)
 
 
 def test_example_configs_change_one_model_option_of_the_w512_recipe():
