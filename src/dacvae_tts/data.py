@@ -15,7 +15,16 @@ from torch.utils.data import Dataset, Sampler
 
 from .contracts import normalization_stats
 from .teacher import TeacherInputs, collate_teacher, pair_teacher
-from .text import assemble, char_ctc_targets, decode_ids, join_ids, tokenize, tokenize_bytes
+from .text import (
+    TEXT_UNITS,
+    assemble,
+    char_ctc_targets,
+    decode_ids,
+    join_ids,
+    to_units,
+    tokenize,
+    tokenize_bytes,
+)
 
 SCHEMA = """
 CREATE TABLE samples (
@@ -121,10 +130,14 @@ class LatentDataset(Dataset):
         prompt_dropout=0.0,
         teacher_features=None,
         speaker_embeddings=None,
+        text_units="bytes",
         **pair_options,
     ):
         if pairing not in {"cross", "within"} or layout not in {"segments", "joined"}:
             raise ValueError("pairing must be cross or within; layout must be segments or joined")
+        if text_units not in TEXT_UNITS:
+            raise ValueError(f"text_units must be one of {TEXT_UNITS}")
+        self.text_units = text_units  # model.text_units: collate converts the cached byte ids (chars)
         if pairing == "within" and layout != "joined":
             raise ValueError("Within-utterance prompts have no transcript boundary; use the joined layout")
         if not 0 <= prompt_fraction[0] <= prompt_fraction[1] < 1 or not 0 <= prompt_dropout <= 1:
@@ -423,9 +436,11 @@ class LatentDataset(Dataset):
         return low + last + 1
 
     def finish_item(self, item, epoch, index):
-        """Tail silence and the CTC label flag; the item itself when both are off."""
+        """Tail silence, the CTC label and text unit flags; the item itself when all are off."""
         if self.ctc_targets == "chars":
             item = {**item, "ctc_targets": "chars"}
+        if self.text_units != "bytes":
+            item = {**item, "text_units": self.text_units}
         if not self.tail_silence_prob:
             return item
         rng = random.Random(self.seed + epoch * len(self) + index + TAIL_STREAM)
@@ -470,6 +485,7 @@ def collate(items):
             tok, seg = tokenize(
                 item["reference_text"], item["text"], item.get("text_normalization", "unicode-v1"), layout
             )
+        tok, seg = to_units(tok, seg, item.get("text_units", "bytes"))
         latents.append(z)
         prompts.append(z * mask[:, None])
         masks.append(mask)
@@ -485,12 +501,15 @@ def collate(items):
         "segments": pad_sequence(segments, batch_first=True),
         **collate_teacher(items),
     }
+    units = {item.get("text_units", "bytes") for item in items}
+    if len(units) > 1:
+        raise ValueError("A batch cannot mix text units")
     labels = {item.get("ctc_targets", "bytes") for item in items}
     if labels != {"bytes"}:
         # Character CTC targets are built here, in the loader workers, from the exact model tokens.
         if labels != {"chars"}:
             raise ValueError("A batch cannot mix byte and character CTC targets")
-        batch["ctc_targets"], batch["ctc_target_lengths"] = char_ctc_targets(tokens)
+        batch["ctc_targets"], batch["ctc_target_lengths"] = char_ctc_targets(tokens, units.pop())
     return batch
 
 

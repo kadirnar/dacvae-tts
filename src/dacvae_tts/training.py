@@ -367,6 +367,7 @@ def training_dataset(cache, cfg):
         prompt_dropout=cfg.train.prompt_dropout,
         pairing=cfg.train.pairing,
         layout=cfg.model.text_layout,
+        text_units=cfg.model.text_units,
         prompt_fraction=(cfg.train.prompt_fraction_min, cfg.train.prompt_fraction_max),
         **pair_options(cfg),
         **teacher_sources(cfg.train, cache),
@@ -567,6 +568,7 @@ def train(args):
         pairing = dict(
             pairing=cfg.train.pairing,
             layout=cfg.model.text_layout,
+            text_units=cfg.model.text_units,
             prompt_fraction=(cfg.train.prompt_fraction_min, cfg.train.prompt_fraction_max),
         )
         data = training_dataset(args.cache, cfg)

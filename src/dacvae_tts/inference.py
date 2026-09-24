@@ -63,6 +63,7 @@ class SynthesisResult:
 
 class Synthesizer:
     articulation_options = None  # keyword overrides of duration.articulation_seconds, e.g. {"comma_pause": 0.2}
+    text_units, rule_unit = "bytes", "bytes"  # a char-unit model sets both to its units in __init__
 
     def __init__(
         self,
@@ -103,6 +104,9 @@ class Synthesizer:
         normalization_stats(self.mean, self.std, self.codec.latent_dim)
         self.profile = profile
         self.text_version = self.checkpoint["codec"].get("text_normalization", "unicode-v1")
+        # Text units of the model; the prompt-rate rule keeps its frames per *unit* (characters for char models).
+        self.text_units = self.model.cfg.text_units
+        self.rule_unit = "chars" if self.text_units == "chars" else "bytes"
         self.asr_model, self.asr_language = asr_defaults(self.text_version, asr_model, asr_language)
         self.asr_device, self._asr = asr_device, None
         # Guidance the checkpoint was prepared for (model guidance and distillation: 1, GRPO: its policy's); None if
@@ -349,7 +353,8 @@ class Synthesizer:
             raise ValueError(f"duration_mode must be one of {DURATION_MODES}")
         version = self.text_version
         reference_text, text = normalize(reference_text, version), normalize(text, version)
-        profile = {"duration_rule": "reference_frames_per_byte", "duration_mode": duration_mode}
+        rule = "reference_frames_per_byte" if self.rule_unit == "bytes" else "reference_frames_per_char"
+        profile = {"duration_rule": rule, "duration_mode": duration_mode}
         if duration_mode == "auto":
             duration_mode = auto_mode(reference_frames, reference_text)
             profile["duration_auto"] = duration_mode
@@ -363,12 +368,12 @@ class Synthesizer:
             needed, extra = articulation_seconds(timing, reference_text, text, **(self.articulation_options or {}))
             profile.update(extra)
             if needed is None:  # no usable prompt timing: the byte rule, flagged in the profile
-                frames = rule_frames(reference_frames, reference_text, text, "bytes")
+                frames = rule_frames(reference_frames, reference_text, text, self.rule_unit)
             else:
                 frames = needed * self.codec.sample_rate / self.codec.hop_length
                 profile["duration_rule"] = "prompt_syllables_per_speaking_second"
         else:
-            frames = rule_frames(reference_frames, reference_text, text, "bytes")
+            frames = rule_frames(reference_frames, reference_text, text, self.rule_unit)
             if duration_mode == "clamp":
                 factor = clamp_scale(reference_frames, reference_text)
                 frames *= factor
@@ -399,7 +404,8 @@ class Synthesizer:
             raise ValueError("duration_scale must be finite and positive")
         reference = reference.to(self.device)
         layout = self.model.cfg.text_layout
-        tokens, segments = tokenize(reference_text, text, version=self.text_version, layout=layout)
+        tokens, segments = tokenize(reference_text, text, version=self.text_version, layout=layout,
+                                    units=self.text_units)
         tokens, segments = tokens[None].to(self.device), segments[None].to(self.device)
         if tokens.numel() > 2048:
             raise ValueError("Text too long; split into sentences before synthesis")
@@ -425,7 +431,8 @@ class Synthesizer:
         prompt = torch.zeros(1, len(reference) + frames, self.codec.latent_dim, device=self.device)
         prompt[:, : len(reference)] = reference
         prompt_mask = torch.arange(prompt.size(1), device=self.device)[None] < len(reference)
-        only_tokens, only_segments = tokenize("", text, version=self.text_version, layout=layout)
+        only_tokens, only_segments = tokenize("", text, version=self.text_version, layout=layout,
+                                              units=self.text_units)
         return {
             "prompt": prompt,
             "prompt_mask": prompt_mask,
@@ -599,8 +606,9 @@ class Synthesizer:
         timing = self._articulation_timing(reference, seconds, duration_mode)
         requests = []
         for text in texts:
-            tokens, segments = tokenize(reference.transcript, text, version=self.text_version, layout=layout)
-            only_tokens, only_segments = tokenize("", text, version=self.text_version, layout=layout)
+            tokens, segments = tokenize(reference.transcript, text, version=self.text_version, layout=layout, units=self.text_units)
+            only_tokens, only_segments = tokenize("", text, version=self.text_version, layout=layout,
+                                              units=self.text_units)
             if tokens.numel() > 2048:
                 raise ValueError("Text too long; split into sentences before synthesis")
             if seconds is None and self.model.duration is not None:

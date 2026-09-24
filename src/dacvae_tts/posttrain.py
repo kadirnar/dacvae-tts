@@ -47,9 +47,10 @@ def representation_id(checkpoint):
 
 
 def model_layout(cfg):
-    """The transcript layout the model was trained with, for the cross-paired rows of these tools: a joined-layout
-    model (every Turkish config) reads [BOS ref SPACE target EOS] with one segment, never [BOS ref SEP target EOS]."""
-    return {"layout": cfg.text_layout}
+    """The transcript layout and text units the model was trained with, for the cross-paired rows of these tools: a
+    joined-layout model (every Turkish config) reads [BOS ref SPACE target EOS] with one segment, never
+    [BOS ref SEP target EOS]."""
+    return {"layout": cfg.text_layout, "text_units": cfg.text_units}
 
 
 def candidates(args):

@@ -41,6 +41,11 @@ class ModelConfig:
     # classes with the blank). A two-byte Turkish letter is one phone but two byte labels, and fast speakers
     # (16-19 bytes/s against 25 fps) leave byte CTC barely feasible; zero_infinity then zeroes those examples.
     ctc_targets: str = "bytes"
+    # Text input units. `chars`: one token per character (text.UNIT_CHARACTERS): ASCII keeps its byte id, so the
+    # vocabulary and embedding shape stay the byte model's, but the Turkish two-byte letters (ç ğ ı ö ş ü and
+    # capitals, ~12 % of letters) are one token instead of two: an even length-aware RoPE diagonal, one CTC label
+    # per letter, and a character duration rule at inference. Converted from the cached byte ids at load time.
+    text_units: str = "bytes"
     # Training-only teacher heads (alignment.py); absent from the module and its checkpoints when off.
     repa_layer: int = 0  # speech-REPA: block predicting teacher SSL frames; 0 off, 10-11 with CTC at 8
     repa_dim: int = 0  # width of the stored teacher frames (after the extraction PCA, e.g. 256)
@@ -88,6 +93,8 @@ class ModelConfig:
             raise ValueError("attn_gate must be none or head")
         if self.ffn_activation not in {"gelu", "swiglu"}:
             raise ValueError("ffn_activation must be gelu or swiglu")
+        if self.text_units not in {"bytes", "chars"}:
+            raise ValueError("text_units must be bytes or chars")
         if self.ctc_targets not in {"bytes", "chars"} or (self.ctc_targets == "chars" and not self.ctc_layer):
             raise ValueError("ctc_targets must be bytes or chars; chars needs a CTC head (ctc_layer > 0)")
         if self.ctc_layer and self.patch_size > 1 and self.ctc_targets == "bytes":

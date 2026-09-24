@@ -1,0 +1,55 @@
+# A/B: nano_tr_w512 + text_units chars, the only change (0 parameters: the vocabulary and embedding shapes stay).
+# One token per character (Latin-5 ids, text.UNIT_CODEC): the Turkish two-byte letters (ç ğ ı ö ş ü and capitals,
+# ~12 % of letters) become one token, so each takes one share of the length-aware RoPE diagonal, one byte CTC label,
+# and at inference the prompt-rate rule keeps frames per character. Converted from the cached byte ids at load time
+# (no cache rebuild). A warm start from a byte checkpoint is refused (different text units): train from scratch.
+# Run 20k updates of the unchanged 60k schedule (train --stop-after 20000) and compare at 20k with the baseline at
+# seeds 42/43 (nano_tr_w512.yaml, experiments/tr_w512_seed43.yaml): Freya CER/WER (by length bucket), SIM-o, UTMOS.
+model:
+  width: 512
+  depth: 12
+  heads: 8
+  text_depth: 4
+  text_attention: 4
+  patch_size: 1
+  latent_dim: 128
+  positions: rope
+  qk_norm: true
+  prediction: edm
+  text_layout: joined
+  duration: rule
+  cond_dropout: 0.2
+  ctc_layer: 8
+  adaln_rank: 64
+  text_units: chars
+train:
+  steps: 60000
+  batch_size: 96
+  accumulation: 1
+  learning_rate: 0.0008
+  warmup: 2000
+  weight_decay: 0.01
+  optimizer: muon
+  muon_momentum: 0.95
+  ema_decay: 0.9999
+  precision: bf16
+  workers: 4
+  prefetch_factor: 4
+  checkpoint_every: 1000
+  keep_every: 5000
+  validate_every: 1000
+  log_every: 100
+  grad_checkpoint: true    # eager on 24 GB needs recomputation at frame budget 12000
+  compile: false           # generator-only compile spent >15 min on the first step here (dynamic-shape recompiles); eager + checkpointing instead
+  seed: 42
+  flow_reduction: frame
+  pairing: within
+  prompt_fraction_min: 0.1
+  prompt_fraction_max: 0.6
+  prompt_dropout: 0.3
+  time_sampling: logit_normal
+  batch_expansion: 4       # run B (Ke=4) led run A (Ke=2) by 0.02-0.04 WER at 25k-30k updates and kept SIM higher
+  ctc_weight: 0.1
+  contrastive_weight: 0.2
+  contrastive_margin: 0.1
+  wandb_project: dacvae-tts-tr

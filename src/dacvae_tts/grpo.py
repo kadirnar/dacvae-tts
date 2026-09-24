@@ -370,8 +370,10 @@ class LatentDecoder:
         return resample_poly(audio, self.rate // factor, rate // factor).astype(np.float32)
 
 
-def target_frames(reference_frames, reference_text, text, version, mode="auto", scale=1.0, predictor=None):
-    """Target length of the deployed duration rules (mirrors `Synthesizer.target_frames`)."""
+def target_frames(reference_frames, reference_text, text, version, mode="auto", scale=1.0, predictor=None,
+                  unit="bytes"):
+    """Target length of the deployed duration rules (mirrors `Synthesizer.target_frames`; `unit` is the prompt-rate
+    rule's unit, "chars" for character-unit models)."""
     reference_text, text = normalize(reference_text, version), normalize(text, version)
     if mode == "auto":
         mode = auto_mode(reference_frames, reference_text)
@@ -380,7 +382,7 @@ def target_frames(reference_frames, reference_text, text, version, mode="auto", 
     elif mode == "predictor":
         frames = (predictor or DurationPredictor.load()).predict(reference_frames, reference_text, text)
     elif mode in ("rule", "clamp"):
-        frames = rule_frames(reference_frames, reference_text, text, "bytes")
+        frames = rule_frames(reference_frames, reference_text, text, unit)
         if mode == "clamp":
             frames *= clamp_scale(reference_frames, reference_text)
     else:
@@ -407,6 +409,7 @@ class PromptSource:
         if not len(self.indices):
             raise ValueError(f"The {split} split has no speaker with two recordings to pair a prompt with")
         self.layout = saved["config"]["model"]["text_layout"]
+        self.units = saved["config"]["model"].get("text_units", "bytes")
         self.version = saved["codec"].get("text_normalization", "unicode-v1")
         self.mode, self.scale, self.max_frames = duration_mode, duration_scale, max_frames
         self.device = torch.device(device)
@@ -431,6 +434,7 @@ class PromptSource:
             "speaker": target["speaker"],
             "text_normalization": self.data.meta.get("text_normalization", "unicode-v1"),
             "layout": self.layout,
+            **({"text_units": self.units} if self.units != "bytes" else {}),
         }
 
     def prompt(self, index, rng):
@@ -441,7 +445,7 @@ class PromptSource:
                 len(item["target"])
                 if self.mode == "gt"
                 else target_frames(len(item["reference"]), item["reference_text"], item["text"], self.version,
-                                   self.mode, self.scale, self.predictor)
+                                   self.mode, self.scale, self.predictor, "chars" if self.units == "chars" else "bytes")
             )
         except ValueError:
             return None

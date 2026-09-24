@@ -11,7 +11,7 @@ from .config import ModelConfig
 from .contracts import audio_shapes, mask_values, sanitize, text_shapes
 from .reference import ReferencePool, TemporalReference
 from .speed import block_checkpoint, run_block
-from .text import BYTE_OFFSET, CHAR_VOCAB_SIZE, VOCAB_SIZE, char_ctc_targets
+from .text import BYTE_OFFSET, CHAR_VOCAB_SIZE, CONTINUATION, VOCAB_SIZE, char_ctc_targets
 
 
 def sinusoidal(positions, width):
@@ -378,6 +378,10 @@ class FlowTTS(nn.Module):
         return voice
 
     def conditions(self, prompt, prompt_mask, tokens, segments, drop=None):
+        if self.strict_checks and self.cfg.text_units == "chars":
+            low, high = CONTINUATION  # UTF-8 continuation bytes never occur in character-unit rows
+            if ((tokens >= low) & (tokens <= high)).any():
+                raise ValueError("UTF-8 byte ids given to a character-unit model (text.to_units converts them)")
         text, text_valid = self.text(tokens, segments)
         voice = self.reference_summary(prompt, prompt_mask)
         if drop is not None:
@@ -404,6 +408,8 @@ class FlowTTS(nn.Module):
         features = [masked_mean(text, target_bytes), voice, rate]
         if self.cfg.duration_features == "text_stats":
             byte_values = tokens - BYTE_OFFSET
+            # Bytes that start a character; character units (Latin-5) never take continuation values, so this
+            # counts characters for both text units.
             characters = (target_bytes & ((byte_values & 0xC0) != 0x80)).sum(1).float().clamp_min(1)
             punctuation = torch.zeros_like(tokens, dtype=torch.bool)
             for value in b".,;:!?":
@@ -675,7 +681,8 @@ def ctc_labels(model, batch):
     if "ctc_targets" in batch:
         return batch["ctc_targets"], batch["ctc_target_lengths"]
     device = batch["tokens"].device
-    return tuple(value.to(device) for value in char_ctc_targets(batch["tokens"].cpu()))
+    units = getattr(model.cfg, "text_units", "bytes")
+    return tuple(value.to(device) for value in char_ctc_targets(batch["tokens"].cpu(), units))
 
 
 def guidance_direction(model, prediction, xt, time, batch, drop, cached=None):
