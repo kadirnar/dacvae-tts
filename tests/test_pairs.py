@@ -473,6 +473,28 @@ def test_configuration_guards():
         ModelConfig(**{**NANO, "ctc_targets": "phones"})
 
 
+def test_example_config_changes_only_the_pair_options():
+    cfg = Config.load(ROOT / "configs/experiments/tr_w512_pairs.yaml")
+    base = Config.load(ROOT / "configs/nano_tr_w512.yaml")
+    assert (
+        cfg.train.cross_prompt_prob > 0 and cfg.train.long_prompt_prob > 0 and cfg.train.tail_silence_prob > 0
+    )
+    assert cfg.train.prompt_cut == "quiet" and cfg.model.ctc_targets == "chars"
+    changed = {k for k, v in cfg.train.__dict__.items() if base.train.__dict__[k] != v}
+    assert changed <= {
+        "cross_prompt_prob",
+        "cross_prompt_max_utterances",
+        "cross_prompt_max_seconds",
+        "long_prompt_prob",
+        "prompt_fraction_long_max",
+        "tail_silence_prob",
+        "tail_silence_max_seconds",
+        "prompt_cut",
+        "steps",
+    }
+    assert {k for k, v in cfg.model.__dict__.items() if base.model.__dict__[k] != v} == {"ctc_targets"}
+
+
 def test_training_runs_with_every_pair_option(cache, tmp_path):
     from dacvae_tts import training
 

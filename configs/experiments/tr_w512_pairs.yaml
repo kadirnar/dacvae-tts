@@ -1,0 +1,72 @@
+# Issue #11 training pairs on run C (nano_tr_w512.yaml): every option on. Experimental; quality has not been
+# established. Everything except the pair options and the 20k-update A/B schedule is identical to run C, so the
+# baseline arm is `configs/nano_tr_w512.yaml --steps 20000` on the same cache and frame budget.
+# Each option should also be A/B'd on its own (base / +cross prompts / +tail silence + short targets + quiet cut /
+# +char CTC): they target different failures and one may hide another's effect.
+# Needs <cache>/silence.pt for tail silence and quiet cuts: python scripts/silence_latent.py --cache <cache>.
+# Validation keeps the baseline pairs, so validation_flow stays comparable across the arms.
+model:
+  width: 512
+  depth: 12
+  heads: 8
+  text_depth: 4
+  text_attention: 4
+  patch_size: 1
+  latent_dim: 128
+  positions: rope
+  qk_norm: true
+  prediction: edm
+  text_layout: joined
+  duration: rule
+  cond_dropout: 0.2
+  ctc_layer: 8
+  adaln_rank: 64
+  ctc_targets: chars       # Turkish letters + space (34 labels) instead of UTF-8 bytes: one label per letter,
+                           # feasible for fast speakers; changes the CTC head size (no warm start from byte runs)
+train:
+  steps: 20000
+  batch_size: 96
+  accumulation: 1
+  learning_rate: 0.0008
+  warmup: 2000
+  weight_decay: 0.01
+  optimizer: muon
+  muon_momentum: 0.95
+  ema_decay: 0.9999
+  precision: bf16
+  workers: 4
+  prefetch_factor: 4
+  checkpoint_every: 1000
+  keep_every: 5000
+  validate_every: 1000
+  log_every: 100
+  grad_checkpoint: true
+  compile: false
+  seed: 42
+  flow_reduction: frame
+  pairing: within
+  prompt_fraction_min: 0.1
+  prompt_fraction_max: 0.6
+  prompt_dropout: 0.3
+  time_sampling: logit_normal
+  batch_expansion: 4
+  ctc_weight: 0.1
+  contrastive_weight: 0.2
+  contrastive_margin: 0.1
+  wandb_project: dacvae-tts-tr
+  # Cross-utterance prompts (VoiceStar CPM: WER 8.49 -> 6.42): 40% of the prompted rows take 1-3 other
+  # utterances of the speaker label (<= 12 s, whole utterances, joined transcripts) as the prompt and their
+  # whole utterance as the target; prompt dropout keeps its 30%. Per-epoch exact costs keep batches within
+  # the frame budget; the static bound (+12 s per row) must fit it.
+  cross_prompt_prob: 0.4
+  cross_prompt_max_utterances: 3
+  cross_prompt_max_seconds: 12.0
+  # Short targets: 25% of the within cuts leave only 15-40% of the utterance as the target.
+  long_prompt_prob: 0.25
+  prompt_fraction_long_max: 0.85
+  # 30% of the targets end in 1-20 frames (<= 0.8 s) of encoded silence: learns to stop instead of adding
+  # filler words at the end of short sentences (Irodori v4.1 duration fix: CER 5.35 -> 4.69).
+  tail_silence_prob: 0.3
+  tail_silence_max_seconds: 0.8
+  # Prompts end on the quietest frame within +-0.3 s of the sampled cut, like inference prompts.
+  prompt_cut: quiet
