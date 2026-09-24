@@ -14,9 +14,10 @@ from tests.test_nano import NANO, nano_batch
 BASE = dict(NANO, adaln_rank=8)
 OPTIONS = {
     "long_skip": dict(long_skip=True),
+    "value_residual": dict(value_residual=True),
 }
 # Options whose new parameters start at zero (or identity): the model starts as the baseline function.
-ZERO_INIT = ["long_skip"]
+ZERO_INIT = ["long_skip", "value_residual"]
 ALL = {key: value for option in OPTIONS.values() for key, value in option.items()}
 
 # Captured from the architecture before these options existed (8f01f08): state_dict length and layout hash,
@@ -79,7 +80,7 @@ def test_options_off_keep_the_previous_model(overrides, keys, layout, expected):
     assert len(model.state_dict()) == keys and layout_hash(model) == layout
     assert fingerprint(model) == pytest.approx(expected, rel=1e-5, abs=1e-5)
     # Explicitly disabled options are the default: an old checkpoint loads strictly.
-    off = {"long_skip": False}
+    off = {"long_skip": False, "value_residual": False}
     FlowTTS(ModelConfig(**overrides, **off)).load_state_dict(model.state_dict(), strict=True)
 
 
@@ -134,6 +135,7 @@ def test_muon_partition_covers_the_new_parameters():
     muon = {names[id(p)]: count for p, count in zip(matrices, parts, strict=True)}
     adamw = {names[id(p)] for p in others}
     assert muon["skip.1.weight"] == 1 and {"skip.0.weight", "skip.1.bias"} <= adamw  # hidden [D,2D] map
+    assert "blocks.0.value_mix" in adamw  # two scalars
     assert muon["blocks.0.ff.0.weight"] == 1 and muon["blocks.1.self_attn.kv.weight"] == 2
 
 
@@ -142,6 +144,23 @@ def test_long_skip_fuses_the_input_embedding_before_the_output_head():
     assert model.skip[1].weight.shape == (32, 64) and not model.skip[1].weight.any()
     extra = sum(p.numel() for p in new_parameters(model).values())
     assert extra == 2 * 64 + 64 * 32 + 32  # LayerNorm over [h_0, h_L] + zero-init Linear
+
+
+def test_value_residual_feeds_the_first_block_values_to_later_blocks():
+    model = FlowTTS(ModelConfig(**BASE, value_residual=True))
+    assert all(block.value_mix.tolist() == [1.0, 0.0] for block in model.blocks)  # identity at init
+    assert sum(p.numel() for p in new_parameters(model).values()) == 2 * len(model.blocks)
+    model = perturbed(model).eval()
+    batch = nano_batch(prompts=(3, 4))
+    time = torch.tensor([0.3, 0.7])
+    second = model.blocks[1].self_attn.kv.weight
+    with torch.no_grad():
+        model.blocks[1].value_mix.copy_(torch.tensor([0.0, 1.0]))  # block 2 uses only the values of block 1
+        before = model(batch["latents"], time, **inputs(batch))
+        second[32:] += torch.randn_like(second[32:])  # block 2's own value projection no longer matters
+        assert torch.allclose(model(batch["latents"], time, **inputs(batch)), before, atol=1e-6)
+        model.blocks[1].value_mix.copy_(torch.tensor([1.0, 0.0]))
+        assert not torch.allclose(model(batch["latents"], time, **inputs(batch)), before, atol=1e-3)
 
 
 def test_example_configs_change_one_model_option_of_the_w512_recipe():

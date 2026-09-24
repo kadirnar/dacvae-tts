@@ -54,18 +54,26 @@ class Attention(nn.Module):
         self.q_norm = nn.RMSNorm(width // heads) if qk_norm else None
         self.k_norm = nn.RMSNorm(width // heads) if qk_norm else None
 
-    def forward(self, x, context, valid, query_angles=None, key_angles=None):
+    def forward(
+        self, x, context, valid, query_angles=None, key_angles=None, value_mix=None, first_value=None
+    ):
         b, n, d = x.shape
         q = self.q(x).view(b, n, self.heads, d // self.heads).transpose(1, 2)
         k, v = self.kv(context).chunk(2, dim=-1)
         k = k.view(b, -1, self.heads, d // self.heads).transpose(1, 2)
         v = v.view(b, -1, self.heads, d // self.heads).transpose(1, 2)
+        if value_mix is not None:
+            # Value residual: v <- l1 v + l2 v_1 with the first block's raw values [B,H,N,D/H], which are
+            # returned for the later blocks (the first block has none yet and mixes its own).
+            first_value = v if first_value is None else first_value
+            v = value_mix[0] * v + value_mix[1] * first_value
         if self.q_norm is not None:
             q, k = self.q_norm(q), self.k_norm(k)
         if query_angles is not None:
             q, k = rotate(q, query_angles), rotate(k, key_angles)
         y = F.scaled_dot_product_attention(q.to(v.dtype), k.to(v.dtype), v, attn_mask=valid[:, None, None, :])
-        return self.out(y.transpose(1, 2).reshape(b, n, d))
+        y = self.out(y.transpose(1, 2).reshape(b, n, d))
+        return y if value_mix is None else (y, first_value)
 
 
 class TextBlock(nn.Module):
@@ -142,6 +150,10 @@ class Block(nn.Module):
             self.ada = nn.Sequential(nn.SiLU(), nn.Linear(d, d * 9))
             nn.init.zeros_(self.ada[-1].weight)
             nn.init.zeros_(self.ada[-1].bias)
+        # Value residual (ResFormer, arXiv:2410.17897; 140M SR-DiT FID 4.02 -> 3.64): self-attention values
+        # v_l <- l1 v_l + l2 v_1 keep the first block's token features reachable in deep blocks. Two scalars
+        # per block, identity at init (l1 = 1, l2 = 0). Block 1 mixes its own values: all are used (DDP).
+        self.value_mix = nn.Parameter(torch.tensor([1.0, 0.0])) if cfg.value_residual else None
 
     def modulation(self, cond, shared):
         if shared is None:
@@ -159,15 +171,24 @@ class Block(nn.Module):
         query_angles=None,
         key_angles=None,
         shared=None,
+        first_value=None,
     ):
+        """Returns x, or (x, first-block values) with value_residual; the values are passed explicitly so
+        activation checkpointing recomputes each block from its inputs alone."""
         params = self.modulation(cond, shared).unsqueeze(1).chunk(9, dim=-1)
         s1, b1, g1, s2, b2, g2, s3, b3, g3 = params
         h = self.norm1(x) * (1 + s1) + b1
-        x = x + g1 * self.self_attn(h, h, valid, self_angles, self_angles)
+        if self.value_mix is None:
+            x = x + g1 * self.self_attn(h, h, valid, self_angles, self_angles)
+        else:
+            mix = self.value_mix
+            y, first_value = self.self_attn(h, h, valid, self_angles, self_angles, mix, first_value)
+            x = x + g1 * y
         h = self.norm2(x) * (1 + s2) + b2
         x = x + g2 * self.cross_attn(h, text, text_valid, query_angles, key_angles)
         x = x + g3 * self.ff(self.norm3(x) * (1 + s3) + b3)
-        return x * valid[..., None]
+        x = x * valid[..., None]
+        return x if self.value_mix is None else (x, first_value)
 
 
 class FlowTTS(nn.Module):
@@ -326,13 +347,18 @@ class FlowTTS(nn.Module):
         shared = self.ada_shared(cond) if self.ada_shared is not None else None
         ctc_logits = None
         first = h  # input embedding h_0, for the optional long skip
+        first_value = None  # first block's self-attention values, for the optional value residual
         for number, block in enumerate(self.blocks, 1):
             args = (h, text, packed_valid, text_valid, cond, *angles, shared)
+            if self.cfg.value_residual:
+                args = (*args, first_value)
             h = (
                 checkpoint(block, *args, use_reentrant=False)
                 if self.grad_checkpoint and self.training
                 else block(*args)
             )
+            if self.cfg.value_residual:
+                h, first_value = h
             if return_ctc and number == self.cfg.ctc_layer:
                 ctc_logits = self.ctc(h)
         if self.skip is not None:
