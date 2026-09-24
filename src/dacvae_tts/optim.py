@@ -13,6 +13,7 @@ one learning rate and one weight decay remain meaningful for both parameter fami
 """
 
 import math
+import re
 
 import torch
 from torch import nn
@@ -40,6 +41,9 @@ BOUNDARY = {
 # Per-head attention gate logits [heads, D] are a small zero-init output head, not a hidden map: Muon would
 # give every head an equally large update from the first step, whatever its gradient. AdamW, like the heads.
 ADAMW_SUFFIXES = (".gate.weight",)
+# TLA-SA heads (alignment.py) likewise: the zero-init time -> block-weight logits [blocks, hidden] and each
+# aligned block's output head into the speaker-embedding space.
+ADAMW_NAMES = re.compile(r"tla\.weights\.2\.weight|tla\.heads\.\d+\.2\.weight")
 
 
 def orthogonalize(matrices, steps=5):
@@ -62,7 +66,7 @@ def muon_parts(name, parameter, embeddings=frozenset()):
     """Number of independently orthogonalized row blocks; 0 keeps the parameter on AdamW."""
     if parameter.ndim != 2 or min(parameter.shape) < 2 or id(parameter) in embeddings or name in BOUNDARY:
         return 0
-    if name.endswith(ADAMW_SUFFIXES):
+    if name.endswith(ADAMW_SUFFIXES) or ADAMW_NAMES.fullmatch(name):
         return 0
     for suffix, parts in FUSED_ROWS.items():
         if name.endswith(suffix) and parameter.size(0) % parts == 0:
