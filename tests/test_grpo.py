@@ -1,18 +1,24 @@
 """Flow-GRPO post-training (dacvae_tts.grpo): SDE policy math, group rewards, clipped update, CLI, monitor, oracle."""
 
+import importlib.util
+import json
 import math
 import os
 import random
+import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 
+from dacvae_tts import cli, grpo, posttrain
 from dacvae_tts.config import Config, ModelConfig, TrainConfig
 from dacvae_tts.data import LatentDataset
 from dacvae_tts.grpo import (
     CompositeReward,
     Judges,
+    Monitor,
     PromptSource,
     build_terms,
     choose_window,
@@ -28,6 +34,7 @@ from dacvae_tts.grpo import (
 from dacvae_tts.model import FlowTTS, sample
 from dacvae_tts.text import tokenize
 
+GRPO_TRAIN = grpo.grpo_train  # the CLI tests replace the module attribute to capture parsed arguments
 NANO = dict(
     latent_dim=4, width=32, heads=2, depth=2, text_depth=1, text_attention=1, patch_size=1, positions="rope",
     qk_norm=True, prediction="edm", text_layout="joined", duration="rule", ctc_layer=1,
@@ -264,3 +271,108 @@ def test_prompts_pair_two_recordings_of_one_speaker_with_the_rule_length(cache):
         reference_frames = int(prompt.condition["prompt_mask"].sum())
         # Same text length in bytes for every cache sentence: the rule keeps the prompt's frames per byte.
         assert frames == reference_frames == len(prompt.reference)
+
+
+class LatentMean:
+    """Toy reward on latents (no codec, no judges): the mean value of each generated target."""
+
+    def __call__(self, group):
+        return [float(z.mean()) for z in group.latents]
+
+
+def parse_cli(monkeypatch, argv):
+    captured = {}
+    monkeypatch.setattr(grpo, "grpo_train", lambda args: captured.setdefault("args", args))
+    monkeypatch.setattr(posttrain, "post_train", lambda args: captured.setdefault("args", args))
+    monkeypatch.setattr(sys, "argv", ["dacvae-tts", *argv])
+    cli.main()
+    return captured["args"]
+
+
+def toy_reward_mean(model, prompts, seeds=4):
+    values = []
+    for i, prompt in enumerate(prompts):
+        for seed in range(seeds):
+            x = sample(model, **prompt.condition, steps=4, guidance=2.0, seed=100 * i + seed)
+            values.append(x[0, prompt.target].mean().item())
+    return float(np.mean(values))
+
+
+def test_grpo_cli_updates_raise_a_toy_reward(cache, tmp_path, monkeypatch):
+    checkpoint = toy_checkpoint(cache, tmp_path / "base.pt")
+    output = tmp_path / "grpo"
+    common = ["--checkpoint", str(checkpoint), "--cache", str(cache), "--output", str(output)]
+    with pytest.raises(SystemExit):  # the offline modes still need their data
+        parse_cli(monkeypatch, ["post-train", "--mode", "preference", *common])
+    assert parse_cli(monkeypatch, ["post-train", "--mode", "distill", *common, "--data", "x.jsonl"]).mode == "distill"
+    args = parse_cli(
+        monkeypatch,
+        ["post-train", "--mode", "grpo", *common, "--device", "cpu", "--precision", "fp32", "--steps", "12",
+         "--save-every", "6", "--sample-steps", "4", "--guidance", "2", "--window-max", "1", "--group-size", "8",
+         "--prompts-per-step", "2", "--learning-rate", "0.02", "--duration-mode", "rule", "--monitor-every", "6"],
+    )
+    assert args.reward_weights == "cer=1.0,sim=0.5,dnsmos=0.4,utmos=0.4" and args.kl == 0.04 and args.shared_noise
+    saved = torch.load(checkpoint, weights_only=True)
+    source = PromptSource(cache, "train", saved, duration_mode="rule")
+    prompts = source.fixed(6, seed=1)
+    reward = CompositeReward({"mean": LatentMean()}, {"mean": 1.0}, min_terms=1)
+    monitor = Monitor(source.fixed(3, seed=2), {"mean": LatentMean()}, None, args)
+    GRPO_TRAIN(args, reward=reward, monitor=monitor)
+
+    records = [json.loads(line) for line in (output / "grpo-log.jsonl").read_text().splitlines()]
+    steps = [r for r in records if "reward" in r]
+    assert [r["step"] for r in records if "monitor" in r] == [0, 6, 12] and len(steps) == 12
+    assert all(r["optimizer_steps"] == 1 and r["logp_mismatch"] < 1e-4 and r["kl_ref"] >= 0 for r in steps)
+    trained = torch.load(output / "grpo-000012.pt", weights_only=True)
+    assert trained["stage"] == "grpo" and trained["posttrain_args"]["mode"] == "grpo"
+    assert (output / "grpo-000006.pt").exists()
+    base = FlowTTS(ModelConfig(**saved["config"]["model"]))
+    base.load_state_dict(saved["model"])
+    policy = FlowTTS(ModelConfig(**saved["config"]["model"]))
+    policy.load_state_dict(trained["model"])
+    before, after = toy_reward_mean(base.eval(), prompts), toy_reward_mean(policy.eval(), prompts)
+    assert after > before + 0.5, (before, after)  # about 0 -> 2 over seeds 1-6
+
+
+def test_ppo_epochs_reuse_the_rollout_under_the_clip(cache, tmp_path, monkeypatch):
+    checkpoint = toy_checkpoint(cache, tmp_path / "base.pt")
+    args = parse_cli(
+        monkeypatch,
+        ["post-train", "--mode", "grpo", "--checkpoint", str(checkpoint), "--cache", str(cache), "--output",
+         str(tmp_path / "out"), "--device", "cpu", "--precision", "fp32", "--steps", "2", "--sample-steps", "4",
+         "--guidance", "1", "--window-max", "1", "--group-size", "4", "--micro-batch", "2", "--prompts-per-step", "2",
+         "--ppo-epochs", "2", "--updates-per-rollout", "2", "--clip", "1e-3", "--kl", "0", "--learning-rate", "0.05",
+         "--monitor-every", "0", "--no-shared-noise", "--advantage", "weighted", "--sigma-schedule", "flow",
+         "--sde-sigma", "0.7", "--duration-mode", "gt", "--logprob-reduction", "sum"],
+    )
+    reward = CompositeReward({"mean": LatentMean()}, {"mean": 1.0}, min_terms=1)
+    GRPO_TRAIN(args, reward=reward)
+    steps = [json.loads(line) for line in (tmp_path / "out" / "grpo-log.jsonl").read_text().splitlines()]
+    assert all(r["optimizer_steps"] == 4 and "kl_ref" in r for r in steps)
+    # Later passes are off-policy: some ratios leave the clip range.
+    assert max(r["clip_fraction"] for r in steps) > 0
+
+
+def load_oracle_script():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "oracle_best_of_n.py"
+    spec = importlib.util.spec_from_file_location("oracle_best_of_n", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("sampler", ["ode", "sde"])
+def test_oracle_best_of_n_with_a_toy_reward(cache, tmp_path, sampler):
+    checkpoint = toy_checkpoint(cache, tmp_path / "base.pt")
+    args = load_oracle_script().build_parser().parse_args(
+        ["--checkpoint", str(checkpoint), "--cache", str(cache), "--output", str(tmp_path / sampler), "--limit", "4",
+         "--candidates", "6", "--sampler", sampler, "--device", "cpu", "--precision", "fp32", "--sample-steps", "4",
+         "--window-max", "1", "--duration-mode", "rule", "--guidance", "2"]
+    )
+    reward = CompositeReward({"mean": LatentMean()}, {"mean": 1.0}, min_terms=1)
+    summary = grpo.oracle_best_of_n(args, reward=reward)
+    assert summary["prompts"] == 4 and summary["best"]["mean"] == summary["term_best"]["mean"]
+    assert summary["best"]["mean"] > summary["mean"]["mean"] and summary["group_std"]["mean"] > 0
+    rows = [json.loads(line) for line in (tmp_path / sampler / "oracle.jsonl").read_text().splitlines()]
+    assert len(rows) == 4 and all(len(r["raw"]["mean"]) == 6 for r in rows)
+    assert all(bool(r["window"]) == (sampler == "sde") for r in rows)
