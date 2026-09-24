@@ -20,6 +20,7 @@ import importlib
 import json
 import math
 import threading
+import unicodedata
 from pathlib import Path
 
 import numpy as np
@@ -86,7 +87,12 @@ MATCH_FOLD = str.maketrans({"ı": "i", "â": "a", "î": "i", "û": "u"})
 
 def match_key(text):
     """Turkish metric text (numbers spelled out, Turkish casing, no punctuation/apostrophes) with ı/i and â/î/û
-    folded: the form evaluation sentences are compared in."""
+    folded: the form evaluation sentences are compared in.
+
+    Combining marks that NFKC cannot attach are dropped first: Python's str.lower() turns "İstanbul" into
+    "i̇stanbul" (i + U+0307 combining dot above), which the frozen turkish-v1 metric text splits into "i stanbul".
+    """
+    text = "".join(c for c in unicodedata.normalize("NFKC", text) if unicodedata.category(c) != "Mn")
     return metric_text_turkish(text).translate(MATCH_FOLD)
 
 
