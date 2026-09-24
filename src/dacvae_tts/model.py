@@ -901,7 +901,8 @@ def sample(
     `cfg_rescale`, `apg_eta`, `apg_norm` and `apg_momentum` reshape the guided update (see `guided_update`); their
     defaults give plain CFG. `speaker_guidance` enables independent text/speaker guidance with a third, prompt-free
     branch built by `text_only_rows` (pass it as `text_only`): v_null + g (v_text - v_null) + g_s (v_full - v_text),
-    which equals plain CFG for g_s = g.
+    which equals plain CFG for g_s = g. It also acts where the text scale is 1 (then v_text + g_s (v_full - v_text),
+    without the null branch, which cancels).
 
     `guidance_split` cuts the guided interval into an early window [guidance_from, guidance_split), which uses the
     settings above, and a late window [guidance_split, guidance_until), whose scale and update shape come from
@@ -973,15 +974,23 @@ def sample(
         t = t0.expand(x.size(0))
         window = early if float(t0) < split else late
         scale = window["guidance"]
-        if scale == 1 or not guidance_from <= float(t0) < guidance_until:
+        # Speaker guidance guides even at text scale 1, where its update is v_text + g_s (v_full - v_text).
+        guided = scale != 1 or speaker_guidance is not None
+        if not guided or not guidance_from <= float(t0) < guidance_until:
             v = to_velocity(
                 model, model(x, t, prompt, prompt_mask, valid, tokens, segments, cached=cond), x, t
             )
             evaluations += 1
         else:
-            both = torch.cat([x, x.masked_fill(prompt_mask[..., None], 0)])
-            v, u = to_velocity(model, model(both, t.repeat(2), **pair), both, t.repeat(2)).chunk(2)
-            evaluations += 2
+            if scale == 1:  # the null branch cancels (v_null + 1 (v_text - v_null) = v_text): not evaluated
+                v = to_velocity(
+                    model, model(x, t, prompt, prompt_mask, valid, tokens, segments, cached=cond), x, t
+                )
+                evaluations += 1
+            else:
+                both = torch.cat([x, x.masked_fill(prompt_mask[..., None], 0)])
+                v, u = to_velocity(model, model(both, t.repeat(2), **pair), both, t.repeat(2)).chunk(2)
+                evaluations += 2
             if speaker_guidance is None:
                 v = guided_update(
                     v, u, x, t, mask, scale, window["rescale"], window["eta"], window["norm"], window["momentum"],
@@ -991,7 +1000,7 @@ def sample(
                 rows = sanitize(torch.gather(x, 1, index), text_valid)
                 w = to_velocity(model, model(rows, t, valid=text_valid, **branch), rows, t)
                 w = torch.zeros_like(x).scatter_add(1, index, sanitize(w, text_valid))
-                v = u + scale * (w - u) + speaker_guidance * (v - w)
+                v = (w if scale == 1 else u + scale * (w - u)) + speaker_guidance * (v - w)
                 evaluations += 1
             guided_steps += 1
             late_steps += guidance_split is not None and float(t0) >= split
