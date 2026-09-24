@@ -117,6 +117,9 @@ Results and decisions (Turkish): [docs/turkce-arastirma-2026-09-22.md](docs/turk
   training and quality research for small Turkish models (Turkish), with the evaluation caveats (SIM metric,
   Freya comparability, confidence intervals).
 - [docs/yol-haritasi.md](docs/yol-haritasi.md): the roadmap and its GitHub issues (tracking issue #17).
+- [docs/inceleme-ve-mimari-2026-09-24.md](docs/inceleme-ve-mimari-2026-09-24.md): code review fixes, training-free
+  evidence (interval calibration, Turkish normalization, speaker leakage) and the optional character units, prompt
+  tempo perturbation, speaker-embedding condition and multi-clip speaker context (Turkish).
 - `configs/tiny.yaml`, `configs/small.yaml`: the original baselines, untouched by the nano changes.
 
 The DACVAE codec keeps its upstream license; this repository ships no trained voice model.
