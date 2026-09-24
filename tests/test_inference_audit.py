@@ -78,6 +78,30 @@ def test_asr_dependency_is_lazy_and_empty_transcripts_fail(monkeypatch):
         tts.prepare_reference("any.wav")
 
 
+def test_reference_asr_accepts_waveform_pairs(monkeypatch):
+    # prepare_reference documents (waveform, rate) input, but its ASR fallback read the pair as a file path
+    # (TypeError: Invalid file) whenever no transcript was given.
+    import numpy as np
+
+    heard = []
+
+    class FakeWhisper:
+        def transcribe(self, audio, **options):
+            heard.append((audio.dtype, audio.shape, options["language"]))
+            return [SimpleNamespace(text=" Merhaba dünya. ")], None
+
+    tts = Synthesizer.__new__(Synthesizer)
+    tts.device = torch.device("cpu")
+    tts.asr_model, tts.asr_language, tts._asr = "fake", "tr", FakeWhisper()
+    monkeypatch.setattr(tts, "encode_reference", lambda audio, rate: torch.zeros(3, 4))
+    wave = (0.1 * np.sin(np.arange(48000) / 10)).astype(np.float32)  # 2 s at 24 kHz
+    prepared = tts.prepare_reference((wave, 24000))
+    assert prepared.transcript == "Merhaba dünya." and prepared.transcript_source == "asr:fake"
+    assert heard == [(np.float32, (32000,), "tr")]  # resampled to Whisper's 16 kHz
+    assert tts.transcribe_reference((torch.from_numpy(wave), 16000)) == "Merhaba dünya."
+    assert heard[-1][:2] == (np.float32, (48000,))
+
+
 def test_text_versions_and_accent_preservation():
     assert normalize("  José’s   café. ") == "José's café."
     assert metric_text("JOSÉ’S café!") == "josé's café"

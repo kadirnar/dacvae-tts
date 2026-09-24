@@ -104,8 +104,11 @@ class Synthesizer:
         timings[name] = time.perf_counter() - started
         return result
 
-    def transcribe_reference(self, path):
-        """Optional ASR convenience layer; the baseline TTS still consumes a transcript."""
+    def transcribe_reference(self, ref_audio):
+        """Optional ASR convenience layer; the baseline TTS still consumes a transcript.
+
+        `ref_audio`: a file path or a (waveform, sample_rate) pair of a mono recording, as prepare_reference takes.
+        """
         if self._asr is None:
             try:
                 from faster_whisper import WhisperModel
@@ -118,9 +121,19 @@ class Synthesizer:
                 device=self.asr_device,
                 compute_type="float16" if self.asr_device == "cuda" else "int8",
             )
-        audio = read_audio(path, 16000)
+        if isinstance(ref_audio, tuple):
+            import numpy as np
+            from scipy.signal import resample_poly
+
+            audio, rate = ref_audio
+            audio = np.asarray(audio.detach().cpu() if torch.is_tensor(audio) else audio, dtype=np.float32).reshape(-1)
+            if int(rate) != 16000:
+                factor = math.gcd(int(rate), 16000)
+                audio = resample_poly(audio, 16000 // factor, int(rate) // factor).astype(np.float32)
+        else:
+            audio = read_audio(ref_audio, 16000).numpy()
         segments, _ = self._asr.transcribe(
-            audio.numpy(),
+            audio,
             language=self.asr_language,
             beam_size=5,
             vad_filter=False,
