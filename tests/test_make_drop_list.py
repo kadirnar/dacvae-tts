@@ -55,18 +55,22 @@ def test_keep_unscored_still_applies_the_scores_a_row_has(tmp_path):
 
 
 def test_scores_without_dnsmos_still_filter_on_cer(tmp_path, capsys):
-    # transcribe_corpus.py without --dnsmos: every row lacks dnsmos_ovrl, which used to drop nothing at all.
+    # transcribe_corpus.py without --dnsmos: every row lacks dnsmos_ovrl, which used to drop nothing at all. The DNSMOS
+    # threshold cannot apply and is switched off with a warning; CER still filters, and nothing is "unscored".
     rows = [{k: v for k, v in row.items() if k != "dnsmos_ovrl"} for row in ROWS[:4]]
-    dropped, summary = run(tmp_path, rows, "--keep-unscored")
-    assert dropped == {"bad-cer", "short"} and summary["missing_scores"] == {"dnsmos_ovrl": 4}
-    dropped, summary = run(tmp_path, rows)
-    assert dropped == {row["uid"] for row in rows} and "no row has dnsmos_ovrl" in capsys.readouterr().err
+    for extra in ((), ("--keep-unscored",)):
+        dropped, summary = run(tmp_path, rows, *extra)
+        assert dropped == {"bad-cer", "short"} and summary["disabled_thresholds"] == ["dnsmos_ovrl"]
+        assert summary["missing_scores"] == {} and "no row has dnsmos_ovrl" in capsys.readouterr().err
 
 
 def test_optional_thresholds_need_their_scores_only_when_set(tmp_path):
     rows = [{"uid": "a", "text": TEXT, "cer": 0.05, "wer": 0.4, "dnsmos_ovrl": 3.0, "quality_score": None}]
     assert run(tmp_path, rows)[0] == set()
     assert run(tmp_path, rows, "--max-wer", "0.3")[1]["reasons"] == {"wer": 1}
-    dropped, summary = run(tmp_path, rows, "--min-quality", "60")
+    dropped, summary = run(tmp_path, rows, "--min-quality", "60")  # no row has a quality score: threshold off
+    assert dropped == set() and summary["disabled_thresholds"] == ["quality_score"]
+    rows.append({"uid": "b", "text": TEXT, "cer": 0.05, "dnsmos_ovrl": 3.0, "quality_score": 70.0})
+    dropped, summary = run(tmp_path, rows, "--min-quality", "60")  # some rows have it: the others are unscored
     assert dropped == {"a"} and summary["reasons"] == {"unscored": 1}
-    assert summary["missing_scores"] == {"quality_score": 1}
+    assert summary["missing_scores"] == {"quality_score": 1} and summary["disabled_thresholds"] == []

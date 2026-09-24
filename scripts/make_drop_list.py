@@ -4,9 +4,10 @@
       --min-words 3 --output data/drop-clean.json
 
 Every threshold is applied on its own whenever the row has that score, so a row with CER 0.6 is dropped even when
-DNSMOS failed on it. A row missing a score that an active threshold needs (Whisper/decode errors, DNSMOS errors,
-scores written without `transcribe_corpus.py --dnsmos`) is dropped as "unscored" unless `--keep-unscored`; the summary
-counts the missing scores per metric.
+DNSMOS failed on it. A row missing a score that other rows have (Whisper/decode errors, DNSMOS errors) is dropped as
+"unscored" unless `--keep-unscored`; the summary counts the missing scores per metric. A threshold whose score no row
+has at all (scores written without `transcribe_corpus.py --dnsmos`) cannot be applied: it is switched off with a
+warning and listed under `disabled_thresholds`, instead of dropping every row.
 """
 
 import argparse
@@ -49,6 +50,12 @@ def main(argv=None):
         ("quality_score", "quality", args.min_quality, lambda value: value < args.min_quality),
     ]
     checks = [check for check in checks if check[2] is not None]
+    # A score absent from every row was never computed: the threshold is off (and said so), not a reason to drop all.
+    disabled = [key for key, *_ in checks if rows and all(score(r, key) is None for r in rows)]
+    for key in disabled:
+        print(f"warning: no row has {key}; its threshold is disabled (score the corpus with it to apply it)",
+              file=sys.stderr)
+    checks = [check for check in checks if check[0] not in disabled]
     drop, reasons, missing, unscored_rows = [], {}, {}, 0
 
     def add(uid, reason):
@@ -68,10 +75,6 @@ def main(argv=None):
             add(r["uid"], "short")
         elif absent and not args.keep_unscored:
             add(r["uid"], "unscored")
-    for key, count in missing.items():
-        if count == len(rows) and not args.keep_unscored:
-            print(f"warning: no row has {key}, so every row is unscored; --keep-unscored applies the other thresholds "
-                  "only", file=sys.stderr)
     Path(args.output).write_text(json.dumps(drop))
     summary = {
         "rows": len(rows),
@@ -80,6 +83,7 @@ def main(argv=None):
         "reasons": reasons,
         "unscored_rows": unscored_rows,
         "missing_scores": missing,
+        "disabled_thresholds": disabled,
     }
     print(json.dumps(summary))
     return summary
