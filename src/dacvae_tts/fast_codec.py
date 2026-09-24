@@ -1,7 +1,7 @@
 """Exact codec optimization adapted from kadirnar/fast-dacvae.
 
 Derived from optimize.py at 406f2e5c803927ef18cc9bbe38d715e5417459b9.
-See third_party/fast-dacvae/LICENSE and docs/fast-codec-parallel.md.
+See third_party/fast-dacvae/LICENSE.
 The upstream replay/approximation/noise/watermark shortcuts are not used.
 Copyright (c) 2026 Kadir Nar. MIT license; see the attributed license file.
 """

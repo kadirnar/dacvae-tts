@@ -1,4 +1,4 @@
-# Nano recipe (22 September 2026): every change is motivated in docs/iyilestirme-yol-haritasi.md.
+# Nano recipe (22 September 2026): every choice is reviewed in docs/arastirma-raporu-2026-09-24.md.
 # Prompts are cut from the start of the target utterance, so no speaker labels are required.
 model:
   width: 448
