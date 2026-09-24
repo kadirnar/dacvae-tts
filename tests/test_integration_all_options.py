@@ -213,6 +213,33 @@ def test_compiled_blocks_with_value_residual_match_eager():
         torch._dynamo.reset()
 
 
+def test_dropout_with_block_options():
+    """#14 x #9: model.dropout installs on the SwiGLU and conv-GELU FFNs and on value-residual/gated
+    attention without new parameters; it is inactive in eval mode, active in training, and every
+    checkpoint mode reproduces the unchecked step (the RNG state is replayed on recomputation)."""
+    batch = tiny_batch()
+    for ffn in ("swiglu", "gelu"):
+        plain, dropped = block_model(ffn_activation=ffn), block_model(ffn_activation=ffn, dropout=0.3)
+        assert plain.state_dict().keys() == dropped.state_dict().keys()
+        dropped.load_state_dict(plain.state_dict())
+        args = (batch["latents"], torch.full((3,), 0.4), batch["prompt"], batch["prompt_mask"], batch["valid"],
+                batch["tokens"], batch["segments"])
+        with torch.no_grad():
+            assert torch.equal(plain.eval()(*args), dropped.eval()(*args))
+            dropped.train()
+            torch.manual_seed(3)
+            first = dropped(*args)
+            torch.manual_seed(4)
+            assert not torch.equal(first, dropped(*args))
+        reference = block_update(dropped, batch, grad_checkpoint=False)
+        assert all(torch.isfinite(g).all() for g in reference[1].values())
+        for mode in (True, "selective"):
+            loss, grads = block_update(dropped, batch, grad_checkpoint=mode)
+            assert torch.allclose(loss, reference[0], rtol=1e-6, atol=1e-7), (ffn, mode)
+            for name in grads:
+                assert torch.allclose(grads[name], reference[1][name], rtol=1e-5, atol=1e-6), (ffn, mode, name)
+
+
 def write_silence(cache, raw=(0.125, -0.375, 0.625, -0.875)):
     """<cache>/silence.pt in the format of scripts/silence_latent.py (#11)."""
     raw = torch.tensor(raw)

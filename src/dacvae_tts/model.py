@@ -246,16 +246,29 @@ class Block(nn.Module):
 
 
 def _output_dropout(module, args, output):
+    if isinstance(output, tuple):  # value-residual self-attention (#9): (output, first-block values)
+        return (F.dropout(output[0], module.output_dropout, module.training), *output[1:])
     return F.dropout(output, module.output_dropout, module.training)
 
 
 def add_dropout(block, p):
     """Residual-branch dropout where F5-TTS's DiT has it (0.1): after both attention output projections and on
     the FFN hidden activation. Only parameter-free pieces are added (an output hook, a Dropout next to the
-    activation), so state-dict keys, initialization and checkpoints are the same with and without it."""
-    if not isinstance(block.ff[1], nn.GELU):
-        raise TypeError("Dropout expects the block feed-forward as Linear, GELU, Linear")
-    block.ff[1] = nn.Sequential(block.ff[1], nn.Dropout(p))
+    activation), so state-dict keys, initialization and checkpoints are the same with and without it.
+
+    The #9 block options keep the same placement: the GELU FFN (also with ffn_conv_kernel, whose depthwise
+    convolution then sees the dropped activation) gets the Dropout next to its GELU; the SwiGLU FFN
+    ([SwiGLU, Linear]) gets the output hook on its gated activation instead, which keeps its state-dict keys;
+    the attention hook drops only the attention output of a value-residual self-attention, whose first-block
+    values pass through unchanged, and acts after the head gate (attn_gate), i.e. on what the block adds.
+    """
+    if isinstance(block.ff[0], SwiGLU):
+        block.ff[0].output_dropout = p
+        block.ff[0].register_forward_hook(_output_dropout)
+    elif len(block.ff) == 3 and isinstance(block.ff[1], nn.GELU):
+        block.ff[1] = nn.Sequential(block.ff[1], nn.Dropout(p))
+    else:
+        raise TypeError("Dropout expects the block feed-forward as Linear, GELU, Linear or SwiGLU, Linear")
     for attention in (block.self_attn, block.cross_attn):
         attention.output_dropout = p
         attention.register_forward_hook(_output_dropout)
