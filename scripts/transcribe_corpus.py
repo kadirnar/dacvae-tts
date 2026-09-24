@@ -1,10 +1,13 @@
 """Re-transcribe every corpus clip with Whisper and score DNSMOS, for transcript/quality-based filtering.
 
-Writes OUTPUT/scores.jsonl with one row per clip: uid (matching the latent cache: "data/train-XXXXX.parquet:<row>"),
-given text, Whisper hypothesis, Turkish-normalized WER/CER, duration, quality_score, DNSMOS SIG/BAK/OVRL.
+Writes OUTPUT/scores.jsonl with one row per clip: uid (matching the latent cache: the row's explicit `id` when it has
+one, as the scripts/data/ manifests do, else "data/train-XXXXX.parquet:<row>"), given text, Whisper hypothesis,
+Turkish-normalized WER/CER, duration, quality_score, DNSMOS SIG/BAK/OVRL.
 Raon-OpenTTS / Emilia practice: cut the worst ~15% CER tail and DNSMOS OVRL < ~2.8-3.0 before the final training stage.
 
   python scripts/transcribe_corpus.py --raw data/raw/data --output outputs/corpus-scores --device cuda --dnsmos models/sig_bak_ovr.onnx
+  python scripts/transcribe_corpus.py --raw data/sources/cv-tr/manifest --output outputs/scores-cv-tr --device cuda \
+      --dnsmos models/sig_bak_ovr.onnx      # a scripts/data/ manifest
 """
 
 import argparse
@@ -20,6 +23,22 @@ import soundfile as sf
 from scipy.signal import resample_poly
 
 from dacvae_tts.metrics import DNSMOS, error_counts
+
+
+def row_uid(name, index, row):
+    """The uid `prepare` stores: the explicit `id` column if present, else "<data/file>:<row>" (HF shards)."""
+    return str(row["id"]) if row.get("id") is not None else f"{name}:{index}"
+
+
+def row_audio(row, root):
+    """Embedded bytes ({"bytes": ...}), or a path relative to the manifest directory, as `prepare` accepts."""
+    audio = row["audio"]
+    if isinstance(audio, dict):
+        if audio.get("bytes"):
+            return audio["bytes"]
+        audio = audio["path"]
+    path = Path(audio)
+    return (path if path.is_absolute() else root / path).read_bytes()
 
 
 def decode(item):
@@ -98,8 +117,8 @@ def main():
             rows = table.to_pylist()
             if args.limit:
                 rows = rows[: args.limit]
-            items = [(f"{name}:{i}", r["audio"]["bytes"]) for i, r in enumerate(rows) if f"{name}:{i}" not in done]
-            meta = {f"{name}:{i}": r for i, r in enumerate(rows)}
+            meta = {row_uid(name, i, r): r for i, r in enumerate(rows)}
+            items = [(uid, row_audio(r, file.parent)) for uid, r in meta.items() if uid not in done]
             decoded = pool.map(decode, items, chunksize=8)
             dnsmos_jobs = [(args.dnsmos, uid, audio) for uid, audio, err in decoded if err is None and audio is not None]
             dnsmos_results = pool.map_async(dnsmos_worker, dnsmos_jobs, chunksize=4) if args.dnsmos else None
@@ -128,9 +147,9 @@ def main():
                 record = {
                     "uid": uid,
                     "text": r["text"],
-                    "duration_seconds": r["duration_seconds"],
-                    "quality_score": r["quality_score"],
-                    "speaker": r["speaker"],
+                    "duration_seconds": r.get("duration_seconds"),
+                    "quality_score": r.get("quality_score"),
+                    "speaker": r.get("speaker"),
                     **results.get(uid, {}),
                 }
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
