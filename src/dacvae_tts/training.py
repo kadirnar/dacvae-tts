@@ -16,6 +16,7 @@ from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
+from .codec import check_compatibility
 from .config import Config
 from .data import BucketBatchSampler, LatentDataset, collate, move_batch
 from .diagnostics import ActivationProbe, gradient_contributions, gradient_groups, loss_buckets
@@ -158,11 +159,93 @@ def load_model(path, device="cpu", ema=True):
     return model.to(device).eval(), checkpoint
 
 
-def lr_multiplier(step, warmup, steps):
+def decay_start(steps, decay_fraction):
+    """First update of the WSD decay phase."""
+    return steps - round(steps * decay_fraction)
+
+
+def lr_multiplier(
+    step, warmup, steps, schedule="cosine", decay_fraction=0.2, decay_shape="1-sqrt", floor=0.1
+):
+    """Linear warmup, then cosine to `floor`, or WSD: constant until `decay_start`, then a linear or 1-sqrt
+    decay to `floor` (Hägele et al., arXiv:2405.18392). The defaults are the original cosine schedule."""
     if step < warmup:
         return (step + 1) / max(warmup, 1)
+    if schedule == "wsd":
+        start = decay_start(steps, decay_fraction)
+        progress = min(max(step - start, 0) / max(steps - start, 1), 1)
+        return floor + (1 - floor) * (1 - (math.sqrt(progress) if decay_shape == "1-sqrt" else progress))
     progress = (step - warmup) / max(steps - warmup, 1)
-    return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(progress, 1)))
+    return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * min(progress, 1)))
+
+
+def schedule_multiplier(step, train):
+    return lr_multiplier(
+        step,
+        train.warmup,
+        train.steps,
+        train.lr_schedule,
+        train.decay_fraction,
+        train.decay_shape,
+        train.min_lr_ratio,
+    )
+
+
+def time_sampling_at(step, train):
+    """Flow-time distribution of an update: `final_time_sampling` from its start on (a function of the step
+    only, so exact resume is unaffected)."""
+    if train.final_time_sampling is None:
+        return train.time_sampling
+    start = train.final_time_sampling_start
+    first = decay_start(train.steps, train.decay_fraction) if start == "decay" else round(start * train.steps)
+    return train.final_time_sampling if step >= first else train.time_sampling
+
+
+def decay_phase_loader(cache, reference, cfg, rank, world, frame_budget, device):
+    """Sampler and loader over the WSD decay cache, built like the main training loader.
+
+    Latents are normalized with the main cache's statistics, so the latent space does not shift at the
+    switch and the checkpoint's mean/std stay valid for inference; the codec metadata must match.
+    """
+    data = LatentDataset(
+        cache,
+        "train",
+        cfg.train.seed,
+        prompt_dropout=cfg.train.prompt_dropout,
+        pairing=cfg.train.pairing,
+        layout=cfg.model.text_layout,
+        prompt_fraction=(cfg.train.prompt_fraction_min, cfg.train.prompt_fraction_max),
+    )
+    if not data.meta.get("merged"):
+        raise ValueError("Run merge on the decay cache before training")
+    check_compatibility(data.meta, reference.meta)
+    if data.channels != reference.channels:
+        raise ValueError("The decay cache has a different latent width")
+    data.mean, data.std = reference.mean, reference.std
+    sampler = BucketBatchSampler(
+        data.costs,
+        cfg.train.batch_size,
+        rank,
+        world,
+        cfg.train.seed,
+        frame_budget,
+        speaker_counts=data.group_end - data.group_start,
+        speaker_balance=cfg.train.speaker_balance,
+    )
+    loader = DataLoader(
+        data,
+        batch_sampler=sampler,
+        collate_fn=collate,
+        **loader_options(
+            cfg.train.workers,
+            device,
+            cfg.train.prefetch_factor,
+            cfg.train.worker_threads,
+            cfg.train.loader_start_method,
+        ),
+        generator=torch.Generator().manual_seed(cfg.train.seed + rank),
+    )
+    return sampler, loader
 
 
 def rng_state(device):
@@ -286,6 +369,11 @@ def train(args):
             ),
             generator=loader_rng,
         )
+        decay_loader = None
+        if cfg.train.decay_cache:
+            decay_loader = decay_phase_loader(
+                cfg.train.decay_cache, data, cfg, rank, world, args.frame_budget, device
+            )
         validation = None
         if not args.no_validation:
             val_data = LatentDataset(args.cache, "val", cfg.train.seed, **pairing)
@@ -432,11 +520,21 @@ def train(args):
                 ),
                 flush=True,
             )
+        switch = decay_start(cfg.train.steps, cfg.train.decay_fraction) if decay_loader else None
+        if decay_loader is not None and start_step > switch:
+            # Resumed inside the decay phase: the saved epoch and offset count decay-cache batches.
+            sampler, loader = decay_loader
         sampler.epoch, sampler.start_batch = epoch, batch_offset
         iterator = iter(loader)
         last_time = time.monotonic()
         inactive = {}
         for step in range(start_step, cfg.train.steps):
+            if decay_loader is not None and step == switch:
+                sampler, loader = decay_loader
+                epoch, batch_offset = 0, 0
+                sampler.epoch, sampler.start_batch = 0, 0
+                iterator = iter(loader)
+            raw_objective.time_sampling = time_sampling_at(step, cfg.train)
             # Collect a window before backward so variable batches receive exact example weighting.
             batches = []
             for _ in range(cfg.train.accumulation):
@@ -463,7 +561,7 @@ def train(args):
             # Batch expansion multiplies the flow terms only; duration terms stay per utterance.
             flow_examples = denominator * cfg.train.batch_expansion
             frame_denominator = frame_denominator * cfg.train.batch_expansion
-            learning_rate = cfg.train.learning_rate * lr_multiplier(step, cfg.train.warmup, cfg.train.steps)
+            learning_rate = cfg.train.learning_rate * schedule_multiplier(step, cfg.train)
             for group in optimizer.param_groups:
                 group["lr"] = learning_rate
             optimizer.zero_grad(set_to_none=True)

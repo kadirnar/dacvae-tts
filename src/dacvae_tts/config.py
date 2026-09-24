@@ -98,6 +98,22 @@ class TrainConfig:
     contrastive_weight: float = 0.0  # skip/repeat text negatives (RobustSpeechFlow-style hinge)
     contrastive_margin: float = 0.1  # required loss gap, relative to the positive loss
     wandb_project: str = ""  # set (or pass --wandb-project) to mirror the JSONL logs to Weights & Biases
+    # Schedule and regularization options (issue #14); every default reproduces the original recipe exactly.
+    # wsd: warmup, constant LR, then a decay over the last `decay_fraction` of the updates. A 20% 1-sqrt
+    # cooldown matches cosine and any stable-phase checkpoint can branch into a cooldown (Hägele et al.,
+    # arXiv:2405.18392); Echo-TTS and Irodori train with Muon + WSD.
+    lr_schedule: str = "cosine"  # cosine (warmup + cosine to min_lr_ratio) or wsd
+    decay_fraction: float = 0.2  # wsd: share of all updates in the final decay
+    decay_shape: str = "1-sqrt"  # wsd: 1-sqrt or linear decay
+    min_lr_ratio: float = 0.1  # final LR / peak LR of either schedule (0.1: the original cosine floor)
+    # wsd: from the decay start on, train on this second merged cache (e.g. the hq subset), MiniCPM's
+    # (arXiv:2404.06395) switch to high-quality data in the decay: the warm-started stages in one run.
+    decay_cache: object = None
+    # Time sampling from `final_time_sampling_start` on (a fraction of `steps`, or "decay": the wsd decay
+    # start). BareWave (arXiv:2606.09048), logit-normal -> uniform late: SIM 0.522 -> 0.543,
+    # UTMOS 3.70 -> 3.82, WER flat (2.86 -> 2.93).
+    final_time_sampling: object = None  # null, uniform or logit_normal
+    final_time_sampling_start: object = "decay"
 
     def __post_init__(self):
         if self.worker_threads < 1 or self.prefetch_factor < 1:
@@ -139,6 +155,24 @@ class TrainConfig:
             raise ValueError("contrastive settings must be nonnegative")
         if self.batch_expansion < 1 or self.keep_every < 0 or self.ctc_weight < 0:
             raise ValueError("batch_expansion must be positive and keep_every nonnegative")
+        if self.lr_schedule not in {"cosine", "wsd"} or self.decay_shape not in {"linear", "1-sqrt"}:
+            raise ValueError("lr_schedule must be cosine or wsd; decay_shape linear or 1-sqrt")
+        if not 0 < self.decay_fraction <= 1 or not 0 <= self.min_lr_ratio <= 1:
+            raise ValueError("decay_fraction must lie in (0,1] and min_lr_ratio in [0,1]")
+        if self.lr_schedule == "wsd" and self.steps - round(self.steps * self.decay_fraction) < self.warmup:
+            raise ValueError("The wsd decay would start inside the warmup; lower decay_fraction or warmup")
+        if self.decay_cache is not None and (
+            not isinstance(self.decay_cache, str) or self.lr_schedule != "wsd"
+        ):
+            raise ValueError("decay_cache is a cache path and needs lr_schedule: wsd")
+        start = self.final_time_sampling_start
+        if self.final_time_sampling not in {None, "uniform", "logit_normal"} or not (
+            start == "decay"
+            or (isinstance(start, (int, float)) and not isinstance(start, bool) and 0 < start < 1)
+        ):
+            raise ValueError("final_time_sampling: null, uniform or logit_normal; start: decay or in (0,1)")
+        if self.final_time_sampling is not None and start == "decay" and self.lr_schedule != "wsd":
+            raise ValueError("final_time_sampling_start: decay needs lr_schedule: wsd; give a fraction")
 
 
 @dataclass
