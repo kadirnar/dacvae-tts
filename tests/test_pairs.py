@@ -1,9 +1,11 @@
 """Training pairs (issue #11): cross-utterance prompts, short targets, tail silence, quiet cuts, char CTC."""
 
 import hashlib
+import importlib.util
 import json
 import sqlite3
 import types
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -12,7 +14,15 @@ import torch.nn.functional as F
 import yaml
 
 from dacvae_tts.config import Config, ModelConfig, TrainConfig
-from dacvae_tts.data import SCHEMA, BucketBatchSampler, LatentDataset, ShardWriter, collate, save_stats
+from dacvae_tts.data import (
+    SCHEMA,
+    BucketBatchSampler,
+    LatentDataset,
+    ShardWriter,
+    collate,
+    load_stats,
+    save_stats,
+)
 from dacvae_tts.model import FlowTTS, ctc_alignment_loss, flow_loss
 from dacvae_tts.text import (
     BOS,
@@ -30,6 +40,7 @@ from dacvae_tts.text import (
 )
 from dacvae_tts.training import Objective, load_model
 
+ROOT = Path(__file__).resolve().parents[1]
 CHANNELS = 4
 TEXTS = ["İstanbul'da KIRMIZI elma.", "Işık hâlâ yanıyor!", "Bugün kitap okudum", "Çok güzel, değil mi?"]
 SPEAKERS = {"a": [30, 42, 25, 38], "b": [50, 20, 33]}
@@ -508,3 +519,44 @@ def test_training_runs_with_every_pair_option(cache, tmp_path):
     assert saved["step"] == 3 and Config.from_dict(saved["config"]).train.prompt_cut == "quiet"
     records = [json.loads(line) for line in (tmp_path / "run" / "train.jsonl").read_text().splitlines()]
     assert all(np.isfinite(r["ctc"]) for r in records if "ctc" in r)
+
+
+class FakeCodec:
+    """Stands in for DACVAE: a level-dependent frame with padding artifacts at both edges."""
+
+    def __init__(self, checkpoint, device, encoder_only=False, loudness=None):
+        self.checkpoint, self.sample_rate, self.hop_length = checkpoint, 2500, 100
+
+    @property
+    def metadata(self):
+        return dict(
+            checkpoint=self.checkpoint, sample_rate=2500, hop_length=100, latent_dim=4, posterior="mean"
+        )
+
+    def encode(self, audio):
+        frames = len(audio) // self.hop_length
+        level = audio[: frames * self.hop_length].reshape(frames, -1).std(1, keepdim=True)
+        z = SILENCE.repeat(frames, 1) + level
+        z[0] = z[-1] = 9.0
+        return z
+
+
+def test_silence_latent_script(tmp_path, monkeypatch):
+    from dacvae_tts import codec
+
+    cache = build_cache(tmp_path / "c")
+    monkeypatch.setattr(codec, "Codec", FakeCodec)
+    spec = importlib.util.spec_from_file_location("silence_latent", ROOT / "scripts" / "silence_latent.py")
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    with pytest.warns(UserWarning, match="Legacy metadata"):
+        script.main(["--cache", str(cache), "--device", "cpu", "--probe", "3"])
+    saved = torch.load(cache / "silence.pt", weights_only=True)
+    stats = load_stats(cache)
+    assert torch.allclose(saved["raw"], SILENCE, atol=1e-3)  # edges trimmed, -80 dBFS noise negligible
+    assert torch.allclose(saved["frame"], (saved["raw"] - stats["mean"]) / stats["std"])
+    assert set(saved["report"]["cache_frame_distance_quantiles"]) == {"p1", "p5", "p25", "p50"}
+    data = LatentDataset(cache, **WITHIN, tail_silence_prob=1.0)
+    assert torch.allclose(data.silence, saved["frame"])
+    with pytest.raises(SystemExit):
+        script.main(["--cache", str(cache), "--device", "cpu"])  # never overwrites silently
