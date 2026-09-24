@@ -45,7 +45,7 @@ def rotate(x, angles):
 
 
 class Attention(nn.Module):
-    def __init__(self, width, heads, qk_norm=False):
+    def __init__(self, width, heads, qk_norm=False, gate=False):
         super().__init__()
         self.heads = heads
         self.q = nn.Linear(width, width)
@@ -53,19 +53,38 @@ class Attention(nn.Module):
         self.out = nn.Linear(width, width)
         self.q_norm = nn.RMSNorm(width // heads) if qk_norm else None
         self.k_norm = nn.RMSNorm(width // heads) if qk_norm else None
+        # Head-wise output gate y_h <- 2 sigmoid(w_h . x + b_h) y_h from the query-side input (Qwen gated
+        # attention, arXiv:2505.06708: query-dependent sparsity, no attention sink, higher-LR stability; Echo,
+        # Irodori and Darya gate too; no TTS ablation). 2 sigmoid with zero init is exactly 1: starts as the
+        # baseline and can still open to 2. skip_init draws no random numbers (baseline weights per seed).
+        self.gate = None
+        if gate:
+            self.gate = nn.utils.skip_init(nn.Linear, width, heads)
+            nn.init.zeros_(self.gate.weight)
+            nn.init.zeros_(self.gate.bias)
 
-    def forward(self, x, context, valid, query_angles=None, key_angles=None):
+    def forward(
+        self, x, context, valid, query_angles=None, key_angles=None, value_mix=None, first_value=None
+    ):
         b, n, d = x.shape
         q = self.q(x).view(b, n, self.heads, d // self.heads).transpose(1, 2)
         k, v = self.kv(context).chunk(2, dim=-1)
         k = k.view(b, -1, self.heads, d // self.heads).transpose(1, 2)
         v = v.view(b, -1, self.heads, d // self.heads).transpose(1, 2)
+        if value_mix is not None:
+            # Value residual: v <- l1 v + l2 v_1 with the first block's raw values [B,H,N,D/H], which are
+            # returned for the later blocks (the first block has none yet and mixes its own).
+            first_value = v if first_value is None else first_value
+            v = value_mix[0] * v + value_mix[1] * first_value
         if self.q_norm is not None:
             q, k = self.q_norm(q), self.k_norm(k)
         if query_angles is not None:
             q, k = rotate(q, query_angles), rotate(k, key_angles)
         y = F.scaled_dot_product_attention(q.to(v.dtype), k.to(v.dtype), v, attn_mask=valid[:, None, None, :])
-        return self.out(y.transpose(1, 2).reshape(b, n, d))
+        if self.gate is not None:
+            y = y * (2 * torch.sigmoid(self.gate(x))).transpose(1, 2)[..., None].to(y.dtype)
+        y = self.out(y.transpose(1, 2).reshape(b, n, d))
+        return y if value_mix is None else (y, first_value)
 
 
 class TextBlock(nn.Module):
@@ -119,6 +138,18 @@ class TextEncoder(nn.Module):
         return self.norm(x) * valid[..., None], valid
 
 
+class SwiGLU(nn.Module):
+    """silu(gate) * value from one fused projection; its two row halves are separate maps for Muon."""
+
+    def __init__(self, width, hidden):
+        super().__init__()
+        self.proj = nn.Linear(width, 2 * hidden)
+
+    def forward(self, x):
+        gate, value = self.proj(x).chunk(2, dim=-1)
+        return F.silu(gate) * value
+
+
 class Block(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -126,11 +157,17 @@ class Block(nn.Module):
         self.norm1 = nn.LayerNorm(d, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(d, elementwise_affine=False)
         self.norm3 = nn.LayerNorm(d, elementwise_affine=False)
-        self.self_attn = Attention(d, cfg.heads, cfg.qk_norm)
-        self.cross_attn = Attention(d, cfg.heads, cfg.qk_norm)
-        self.ff = nn.Sequential(
-            nn.Linear(d, d * cfg.ff_mult), nn.GELU(approximate="tanh"), nn.Linear(d * cfg.ff_mult, d)
-        )
+        self.self_attn = Attention(d, cfg.heads, cfg.qk_norm, cfg.attn_gate == "head")
+        self.cross_attn = Attention(d, cfg.heads, cfg.qk_norm, cfg.attn_gate == "head")
+        if cfg.ffn_activation == "swiglu":
+            # Equal parameters: hidden 2/3 of the GELU width, rounded to a multiple of 64 (1024 at 512 x 3).
+            # T5 and LightningDiT gain from GLUs; the 140M SR-DiT ablation was neutral: an A/B, not a default.
+            hidden = max(64, 64 * round(2 * d * cfg.ff_mult / 3 / 64))
+            self.ff = nn.Sequential(SwiGLU(d, hidden), nn.Linear(hidden, d))
+        else:
+            self.ff = nn.Sequential(
+                nn.Linear(d, d * cfg.ff_mult), nn.GELU(approximate="tanh"), nn.Linear(d * cfg.ff_mult, d)
+            )
         if cfg.adaln_rank:
             # Low-rank per-block correction on top of a modulation shared by every block
             # (PixArt-alpha / EzAudio SOLA / Echo-TTS style); the up projection starts at zero.
@@ -142,11 +179,36 @@ class Block(nn.Module):
             self.ada = nn.Sequential(nn.SiLU(), nn.Linear(d, d * 9))
             nn.init.zeros_(self.ada[-1].weight)
             nn.init.zeros_(self.ada[-1].bias)
+        # Value residual (ResFormer, arXiv:2410.17897; 140M SR-DiT FID 4.02 -> 3.64): self-attention values
+        # v_l <- l1 v_l + l2 v_1 keep the first block's token features reachable in deep blocks. Two scalars
+        # per block, identity at init (l1 = 1, l2 = 0). Block 1 mixes its own values: all are used (DDP).
+        self.value_mix = nn.Parameter(torch.tensor([1.0, 0.0])) if cfg.value_residual else None
+        # Depthwise time convolution on the FFN hidden units, after the activation and residual (Mix-FFN
+        # style): the only local mixing along frames in the generator. ZipVoice WER 1.69 -> 9.79 without
+        # its conv modules, FastSpeech CMOS -0.11 without conv in the FFN, U-DiT/SANA gains; F5's
+        # Conv2Audio is the counter-example (4.17 -> 5.78). Zero-init, so the model starts as the baseline;
+        # skip_init draws no random numbers, so the other weights stay the baseline's for the same seed.
+        self.ff_conv = None
+        if cfg.ffn_conv_kernel:
+            hidden, kernel = self.ff[-1].in_features, cfg.ffn_conv_kernel
+            self.ff_conv = nn.utils.skip_init(
+                nn.Conv1d, hidden, hidden, kernel, padding=kernel // 2, groups=hidden
+            )
+            nn.init.zeros_(self.ff_conv.weight)
+            nn.init.zeros_(self.ff_conv.bias)
 
     def modulation(self, cond, shared):
         if shared is None:
             return self.ada(cond)
         return shared + self.ada_up(F.silu(self.ada_down(cond)))
+
+    def conv_feed_forward(self, h, valid):
+        """The FFN with its depthwise time convolution between the activation and the output projection."""
+        *project, down = self.ff
+        for layer in project:
+            h = layer(h)
+        h = h * valid[..., None]  # padded frames hold bias-driven activations: keep them from neighbours
+        return down(h + self.ff_conv(h.transpose(1, 2)).transpose(1, 2))
 
     def forward(
         self,
@@ -159,15 +221,27 @@ class Block(nn.Module):
         query_angles=None,
         key_angles=None,
         shared=None,
+        first_value=None,
     ):
+        """Returns x, or (x, first-block values) with value_residual; the values are passed explicitly so
+        activation checkpointing recomputes each block from its inputs alone."""
         params = self.modulation(cond, shared).unsqueeze(1).chunk(9, dim=-1)
         s1, b1, g1, s2, b2, g2, s3, b3, g3 = params
         h = self.norm1(x) * (1 + s1) + b1
-        x = x + g1 * self.self_attn(h, h, valid, self_angles, self_angles)
+        if self.value_mix is None:
+            x = x + g1 * self.self_attn(h, h, valid, self_angles, self_angles)
+        else:
+            mix = self.value_mix
+            y, first_value = self.self_attn(h, h, valid, self_angles, self_angles, mix, first_value)
+            x = x + g1 * y
         h = self.norm2(x) * (1 + s2) + b2
         x = x + g2 * self.cross_attn(h, text, text_valid, query_angles, key_angles)
-        x = x + g3 * self.ff(self.norm3(x) * (1 + s3) + b3)
-        return x * valid[..., None]
+        if self.ff_conv is None:
+            x = x + g3 * self.ff(self.norm3(x) * (1 + s3) + b3)
+        else:
+            x = x + g3 * self.conv_feed_forward(self.norm3(x) * (1 + s3) + b3, valid)
+        x = x * valid[..., None]
+        return x if self.value_mix is None else (x, first_value)
 
 
 class FlowTTS(nn.Module):
@@ -201,6 +275,36 @@ class FlowTTS(nn.Module):
         # Auxiliary CTC head on intermediate frames (A-DMA, arXiv:2505.19595): training only. It makes
         # the generator route every transcript byte to its frames early, i.e. learn the alignment.
         self.ctc = nn.Linear(d, VOCAB_SIZE) if cfg.ctc_layer else None
+        # Input -> output long skip: the input embedding re-enters just before the output head, fused with the
+        # last block by LN + Linear over [h_0, h_L] (the pre-norm matches their scales; the head's LayerNorm
+        # then normalizes the sum, Hunyuan-DiT's fix for loss spikes after skip fusion). DiTTo, a
+        # cross-attention DiT like this one: WER 3.30 -> 2.93, SIM 0.573 -> 0.588; EzAudio: faster
+        # convergence. Counter-evidence is in-context only (F5 4.17 -> 5.17). Zero-init: starts as baseline.
+        self.skip = None
+        if cfg.long_skip:
+            self.skip = nn.Sequential(nn.LayerNorm(2 * d), nn.Linear(2 * d, d))
+            nn.init.zeros_(self.skip[-1].weight)
+            nn.init.zeros_(self.skip[-1].bias)
+        # Final adaLN (the DiT / F5 final layer): shift and scale of the output LayerNorm come from the
+        # condition, so the velocity head can adapt to flow time and voice. Rank-r like the blocks when
+        # adaln_rank > 0, else a full D -> 2D map; the last projection starts at zero (baseline at init).
+        self.final_ada = None
+        if cfg.final_adaln:
+            r = cfg.adaln_rank
+            self.final_ada = (
+                nn.Sequential(nn.Linear(d, r), nn.SiLU(), nn.Linear(r, 2 * d))
+                if r
+                else nn.Sequential(nn.SiLU(), nn.Linear(d, 2 * d))
+            )
+            nn.init.zeros_(self.final_ada[-1].weight)
+            nn.init.zeros_(self.final_ada[-1].bias)
+        # Pooled transcript in the condition (DiTTo: WER 3.00 -> 2.93): the masked mean of the target-byte
+        # encodings joins time + voice, so every adaLN sees the whole sentence. No bias and zero-init: it
+        # starts as the baseline, and text dropped for guidance (all zeros) adds nothing to the null branch.
+        self.text_pool = None
+        if cfg.cond_text_pool:
+            self.text_pool = nn.Linear(d, d, bias=False)
+            nn.init.zeros_(self.text_pool.weight)
         self.grad_checkpoint = False
         self.strict_checks = True  # train.strict_checks: false skips value checks that wait for the GPU
         self.block_runner = run_block  # train.compile: blocks swaps in a compiled runner (speed.py)
@@ -315,14 +419,30 @@ class FlowTTS(nn.Module):
         if time_embedding.shape != voice.shape:
             raise ValueError("Time embedding and reference summary must both be [B,D]")
         cond = time_embedding + voice
+        if self.text_pool is not None:  # target bytes, as the duration head; `text` is zero where dropped
+            cond = cond + self.text_pool(masked_mean(text, (segments == 1) & (tokens >= BYTE_OFFSET)))
         shared = self.ada_shared(cond) if self.ada_shared is not None else None
         ctc_logits = None
+        first = h  # input embedding h_0, for the optional long skip
+        first_value = None  # first block's self-attention values, for the optional value residual
         for number, block in enumerate(self.blocks, 1):
             args = (h, text, packed_valid, text_valid, cond, *angles, shared)
+            if self.cfg.value_residual:
+                args = (*args, first_value)
+            # block_runner/block_checkpoint (speed.py): every train.grad_checkpoint mode and compile: blocks
+            # see the value-residual input and (x, first-block values) output like any other block tensor.
             h = self.block_runner(block, args, block_checkpoint(self.grad_checkpoint, number, self.training))
+            if self.cfg.value_residual:
+                h, first_value = h
             if return_ctc and number == self.cfg.ctc_layer:
                 ctc_logits = self.ctc(h)
-        output = self.output(h)
+        if self.skip is not None:
+            h = h + self.skip(torch.cat([first, h], -1))
+        if self.final_ada is None:
+            output = self.output(h)
+        else:
+            shift, scale = self.final_ada(cond).unsqueeze(1).chunk(2, dim=-1)
+            output = self.output[1](self.output[0](h) * (1 + scale) + shift)
         expected_packs = (length + pad) // p
         if output.shape != (b, expected_packs, channels * p):
             raise ValueError("Velocity projection returned an unexpected packed length or width")

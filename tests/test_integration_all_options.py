@@ -133,3 +133,81 @@ def test_inference_options_combine(monkeypatch, cache, tmp_path):
         assert [c["duration_factor"] for c in row] == [1.0, 0.8, 1.25]
         assert row[best]["duration_factor"] == 1.25 and "selection" in row[best] and "latent_moments" in row[best]
         assert all(torch.isfinite(torch.as_tensor(c["audio"])).all() for c in row)
+
+
+BLOCK_OPTIONS = dict(
+    long_skip=True,
+    value_residual=True,
+    ffn_conv_kernel=3,
+    attn_gate="head",
+    ffn_activation="swiglu",
+    final_adaln=True,
+    cond_text_pool=True,
+)
+
+
+def block_model(**overrides):
+    """A small generator with every #9 block option on and its zero-init parts randomized, so that
+    every option changes the output and receives gradients."""
+    cfg = dict(latent_dim=4, width=32, heads=2, depth=3, text_depth=1, positions="rope", qk_norm=True,
+               adaln_rank=8, ctc_layer=2, **BLOCK_OPTIONS)
+    cfg.update(overrides)
+    torch.manual_seed(0)
+    model = FlowTTS(ModelConfig(**cfg))
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if not parameter.abs().sum():  # zero-init: ada_up, output, skip, gates, ff_conv, final_ada, text_pool
+                parameter.normal_(0, 0.05)
+            if name.endswith("value_mix"):
+                parameter.copy_(torch.tensor([0.8, 0.3]))
+    return model
+
+
+def block_update(model, batch, **options):
+    torch.manual_seed(1)
+    for key, value in options.items():
+        setattr(model, key, value)
+    model.zero_grad(set_to_none=True)
+    objective = Objective(model, ctc_weight=0.1).train()
+    losses = objective(batch)
+    (losses["loss"].mean() + objective.auxiliary(losses).mean()).backward()
+    return losses["loss"].detach(), {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+
+
+def test_block_options_under_every_checkpoint_mode():
+    """#7 x #9: the speed helper's block runner carries the value-residual tensors through every
+    grad_checkpoint mode; losses and all gradients equal the unchecked run."""
+    batch = tiny_batch()
+    model = block_model()
+    reference = block_update(model, batch, grad_checkpoint=False)
+    assert {"blocks.1.value_mix", "skip.1.weight", "final_ada.2.weight", "text_pool.weight"} <= set(reference[1])
+    for mode in (True, "selective", 2):
+        loss, grads = block_update(model, batch, grad_checkpoint=mode)
+        assert torch.equal(loss, reference[0]), mode
+        assert grads.keys() == reference[1].keys()
+        for name in grads:
+            assert torch.allclose(grads[name], reference[1][name], rtol=1e-5, atol=1e-7), (mode, name)
+
+
+def test_compiled_blocks_with_value_residual_match_eager():
+    """#7 x #9: `compile: blocks` compiles run_block, whose block call now also takes and returns the
+    first block's values."""
+    import pytest
+
+    from dacvae_tts.speed import compile_blocks
+
+    try:
+        torch._dynamo.reset()
+        torch.compile(lambda x: x * 2 + 1)(torch.ones(3))
+    except Exception:
+        pytest.skip("torch.compile has no working backend here")
+    batch = tiny_batch()
+    eager, compiled = block_model(), block_model()
+    compile_blocks(compiled, "batch")
+    try:
+        results = [block_update(model, batch, grad_checkpoint="selective") for model in (eager, compiled)]
+        assert torch.allclose(results[0][0], results[1][0], rtol=1e-4, atol=1e-5)
+        for name, grad in results[0][1].items():
+            assert torch.allclose(grad, results[1][1][name], rtol=1e-4, atol=1e-5), name
+    finally:
+        torch._dynamo.reset()

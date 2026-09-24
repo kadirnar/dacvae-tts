@@ -26,6 +26,14 @@ class ModelConfig:
     duration: str = "head"
     ctc_layer: int = 0
     adaln_rank: int = 0  # 0: one D->9D modulation per block; r>0: shared modulation + rank-r per block
+    # DiT block options (issue #9), all off by default: off, the model and its state_dict are unchanged.
+    long_skip: bool = False  # input embedding -> output head skip, h_L + Linear0(LN([h_0, h_L])); +~2D^2
+    value_residual: bool = False  # self-attention v_l <- l1 v_l + l2 v_1 (ResFormer); 2 scalars per block
+    ffn_conv_kernel: int = 0  # odd k > 0: residual depthwise time conv on the FFN hidden units (5 suggested)
+    attn_gate: str = "none"  # head: per-head 2*sigmoid output gate on generator self-/cross-attention
+    ffn_activation: str = "gelu"  # swiglu: generator FFN as SwiGLU at equal parameters (hidden 2/3 of GELU's)
+    final_adaln: bool = False  # output LayerNorm shift/scale from the condition (rank adaln_rank, zero-init)
+    cond_text_pool: bool = False  # condition += Linear0(mean of the target-byte text encodings); +D^2
 
     def __post_init__(self):
         if min(self.latent_dim, self.width, self.depth, self.heads, self.patch_size) < 1:
@@ -58,6 +66,12 @@ class ModelConfig:
             raise ValueError("ctc_layer must be 0 (off) or the index of a generator block")
         if self.text_layout == "joined" and self.duration == "head":
             raise ValueError("The duration head needs separate transcripts; use duration: rule when joined")
+        if self.ffn_conv_kernel < 0 or (self.ffn_conv_kernel and self.ffn_conv_kernel % 2 == 0):
+            raise ValueError("ffn_conv_kernel must be 0 (off) or odd, so the convolution stays centred")
+        if self.attn_gate not in {"none", "head"}:
+            raise ValueError("attn_gate must be none or head")
+        if self.ffn_activation not in {"gelu", "swiglu"}:
+            raise ValueError("ffn_activation must be gelu or swiglu")
 
 
 @dataclass

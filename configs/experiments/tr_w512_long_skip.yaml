@@ -1,0 +1,53 @@
+# Issue #9 A/B: nano_tr_w512 + long_skip, the only change (66.52M -> 67.05M, +526,848 parameters).
+# Input embedding -> output head skip, LN + zero-init Linear over [h_0, h_L]; starts as the baseline.
+# DiTTo (cross-attention DiT): WER 3.30 -> 2.93, SIM 0.573 -> 0.588; in-context F5 got worse (4.17 -> 5.17).
+# Run 20k updates of the unchanged 60k schedule (train --stop-after 20000) and compare at 20k with the
+# baseline at seeds 42/43 (nano_tr_w512.yaml, experiments/tr_w512_seed43.yaml): Freya CER/WER, SIM-o, UTMOS, step time.
+model:
+  width: 512
+  depth: 12
+  heads: 8
+  text_depth: 4
+  text_attention: 4
+  patch_size: 1
+  latent_dim: 128
+  positions: rope
+  qk_norm: true
+  prediction: edm
+  text_layout: joined
+  duration: rule
+  cond_dropout: 0.2
+  ctc_layer: 8
+  adaln_rank: 64
+  long_skip: true
+train:
+  steps: 60000
+  batch_size: 96
+  accumulation: 1
+  learning_rate: 0.0008
+  warmup: 2000
+  weight_decay: 0.01
+  optimizer: muon
+  muon_momentum: 0.95
+  ema_decay: 0.9999
+  precision: bf16
+  workers: 4
+  prefetch_factor: 4
+  checkpoint_every: 1000
+  keep_every: 5000
+  validate_every: 1000
+  log_every: 100
+  grad_checkpoint: true    # eager on 24 GB needs recomputation at frame budget 12000
+  compile: false           # generator-only compile spent >15 min on the first step here (dynamic-shape recompiles); eager + checkpointing instead
+  seed: 42
+  flow_reduction: frame
+  pairing: within
+  prompt_fraction_min: 0.1
+  prompt_fraction_max: 0.6
+  prompt_dropout: 0.3
+  time_sampling: logit_normal
+  batch_expansion: 4       # run B (Ke=4) led run A (Ke=2) by 0.02-0.04 WER at 25k-30k updates and kept SIM higher
+  ctc_weight: 0.1
+  contrastive_weight: 0.2
+  contrastive_margin: 0.1
+  wandb_project: dacvae-tts-tr

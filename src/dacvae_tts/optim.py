@@ -19,7 +19,15 @@ from torch import nn
 
 NEWTON_SCHULZ = (3.4445, -4.7750, 2.0315)
 # Row-wise concatenations of independent square-ish maps: orthogonalize every part separately.
-FUSED_ROWS = {".kv.weight": 2, ".ada.1.weight": 9, ".ada_up.weight": 9, "ada_shared.1.weight": 9}
+FUSED_ROWS = {
+    ".kv.weight": 2,
+    ".ada.1.weight": 9,
+    ".ada_up.weight": 9,
+    "ada_shared.1.weight": 9,
+    ".ff.0.proj.weight": 2,  # SwiGLU gate | value
+    "final_ada.1.weight": 2,  # final adaLN shift | scale (full rank)
+    "final_ada.2.weight": 2,  # final adaLN shift | scale (rank-r up projection)
+}
 # Boundary layers (raw latents in, velocities / log-rate out) follow the AdamW convention.
 BOUNDARY = {
     "input.weight",
@@ -29,6 +37,9 @@ BOUNDARY = {
     "duration.2.weight",
     "ctc.weight",
 }
+# Per-head attention gate logits [heads, D] are a small zero-init output head, not a hidden map: Muon would
+# give every head an equally large update from the first step, whatever its gradient. AdamW, like the heads.
+ADAMW_SUFFIXES = (".gate.weight",)
 
 
 def orthogonalize(matrices, steps=5):
@@ -50,6 +61,8 @@ def orthogonalize(matrices, steps=5):
 def muon_parts(name, parameter, embeddings=frozenset()):
     """Number of independently orthogonalized row blocks; 0 keeps the parameter on AdamW."""
     if parameter.ndim != 2 or min(parameter.shape) < 2 or id(parameter) in embeddings or name in BOUNDARY:
+        return 0
+    if name.endswith(ADAMW_SUFFIXES):
         return 0
     for suffix, parts in FUSED_ROWS.items():
         if name.endswith(suffix) and parameter.size(0) % parts == 0:
