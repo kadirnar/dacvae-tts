@@ -131,17 +131,28 @@ def main():
             yield offset, rows
             offset += len(rows)
 
+    def submit(name, file, base, rows):
+        """Start decoding one chunk in the worker pool; the GPU transcribes the previous chunk meanwhile."""
+        if args.limit:
+            if base >= args.limit:
+                return None
+            rows = rows[: args.limit - base]
+        meta = {row_uid(name, base + i, r): r for i, r in enumerate(rows)}
+        items = [(uid, row_audio(r, file.parent)) for uid, r in meta.items() if uid not in done]
+        return meta, [uid for uid, _ in items], pool.map_async(decode, items, chunksize=8)
+
     with open(log, "a") as stream:
         for file in files:
             name = f"data/{file.name}"
-            for base, rows in row_chunks(file):
-                if args.limit:
-                    if base >= args.limit:
-                        break
-                    rows = rows[: args.limit - base]
-                meta = {row_uid(name, base + i, r): r for i, r in enumerate(rows)}
-                items = [(uid, row_audio(r, file.parent)) for uid, r in meta.items() if uid not in done]
-                decoded = pool.map(decode, items, chunksize=8)
+            chunks = row_chunks(file)
+            following = next(chunks, None)
+            current = submit(name, file, *following) if following is not None else None
+            while current is not None:
+                following = next(chunks, None)
+                upcoming = submit(name, file, *following) if following is not None else None
+                meta, uids, handle = current
+                decoded = handle.get()
+                current = upcoming
                 dnsmos_jobs = [(args.dnsmos, uid, audio) for uid, audio, err in decoded if err is None and audio is not None]
                 dnsmos_results = None
                 if args.dnsmos and args.dnsmos_device == "cpu":
@@ -173,7 +184,7 @@ def main():
                         chunk = dnsmos_jobs[start : start + 512]
                         for (_, uid, _), score in zip(chunk, gpu_dnsmos.score_many([audio for _, _, audio in chunk])):
                             results.setdefault(uid, {}).update(score)
-                for uid, _ in items:
+                for uid in uids:
                     r = meta[uid]
                     record = {
                         "uid": uid,
@@ -185,10 +196,10 @@ def main():
                     }
                     stream.write(json.dumps(record, ensure_ascii=False) + "\n")
                 stream.flush()
-                total += len(items)
+                total += len(uids)
                 elapsed = time.time() - started
-                print(f"{file.name}: {len(items)} rows, total {total}, {elapsed/60:.1f} min", flush=True)
-                del rows, decoded
+                print(f"{file.name}: {len(uids)} rows, total {total}, {elapsed/60:.1f} min", flush=True)
+                del decoded
     pool.close()
     pool.join()
 
