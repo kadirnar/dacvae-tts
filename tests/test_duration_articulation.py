@@ -1,5 +1,7 @@
+import importlib.util
 import json
 import math
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -7,7 +9,7 @@ import pytest
 import torch
 
 from dacvae_tts.audio import speech_timing
-from dacvae_tts.duration import articulation_seconds, pause_budget, rule_frames, units
+from dacvae_tts.duration import DurationPredictor, articulation_seconds, pause_budget, rule_frames, units
 from dacvae_tts.inference import Synthesizer, VoiceReference
 
 RATE = 24000
@@ -248,3 +250,121 @@ def test_duration_factors_cycle_over_candidates(monkeypatch, cache, tmp_path):
     for bad in ([1.0, 0.9, 1.1, 1.2], [1.0, 0.0], [float("nan")], []):
         with pytest.raises(ValueError, match="duration_factors"):
             tts.synthesize_many(texts, voice, candidates=3, steps=1, duration_factors=bad)
+
+
+def load_fit_script():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "fit_duration_best_factor.py"
+    spec = importlib.util.spec_from_file_location("fit_duration_best_factor", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+WORDS = "bugün hava çok güzel dışarı çıkalım mı yarın okula gideceğim kitap okumayı severim deniz kenarında".split()
+
+
+def synthetic_pairs(count, seed=0):
+    rng = np.random.default_rng(seed)
+    pairs = []
+    for index in range(count):
+        prompt_text = " ".join(rng.choice(WORDS, rng.integers(5, 14))) + "."
+        text = " ".join(rng.choice(WORDS, rng.integers(2, 16))) + "."
+        rate = rng.uniform(10, 21)  # prompt speaking rate, characters per second
+        pairs.append({"pair": index, "speaker": f"s{index % 7}", "prompt_index": index, "prompt_text": prompt_text,
+                      "prompt_frames": len(prompt_text) / rate * 25, "text": text})
+    return pairs
+
+
+class FakeTTS:
+    """synthesize_many stand-in: the 'audio' of a candidate is its factor, frames follow the byte rule."""
+
+    text_version = "turkish-v1"
+    codec = SimpleNamespace(sample_rate=16000)
+
+    def __init__(self):
+        self.calls = 0
+
+    def synthesize_many(self, texts, voice, *, candidates, duration_factors, duration_mode, seed, **synthesis):
+        self.calls += 1
+        base = rule_frames(len(voice.latents), voice.transcript, texts[0])
+        row = [{"audio": np.full(4, duration_factors[k % len(duration_factors)], np.float32),
+                "frames": round(base * duration_factors[k % len(duration_factors)]),
+                "duration_factor": duration_factors[k % len(duration_factors)]} for k in range(candidates)]
+        return [row], {}
+
+
+def fast_prompt_scorer(best_fast=1.15, best_other=1.0):
+    """Fake scorer: CER grows with the distance to 1.15 for prompts of > 17 chars/s and to 1.0 otherwise."""
+
+    def score(text, audios, sample_rate, prompt=None):
+        best = best_fast if score.fast else best_other
+        return [{"cer": abs(float(a[0]) - best), "score": abs(float(a[0]) - best)} for a in audios]
+
+    score.fast = False
+    return score
+
+
+def test_fit_script_search_picks_best_factor_resumes_and_refits(tmp_path):
+    from dacvae_tts.duration import speaking_rate
+
+    fit_script = load_fit_script()
+    factors = fit_script.parse_factors("1.0,0.85,1.15")
+    with pytest.raises(ValueError):
+        fit_script.parse_factors("1.0,1.0")
+    pairs = synthetic_pairs(80)
+    tts, scorer = FakeTTS(), fast_prompt_scorer()
+
+    def latents(pair):  # prompt_frames rounded to whole latent frames; flags the scorer's regime for this pair
+        scorer.fast = speaking_rate(round(pair["prompt_frames"]), pair["prompt_text"]) > 17
+        return torch.zeros(round(pair["prompt_frames"]), 4)
+
+    records_path = tmp_path / "records.jsonl"
+    records = fit_script.search(tts, pairs[:50], latents, scorer, factors, "rule", records_path, seeds=2)
+    assert tts.calls == 50 and len(fit_script.read_records(records_path)) == 50
+    records = fit_script.search(tts, pairs, latents, scorer, factors, "rule", records_path, seeds=2)
+    assert tts.calls == 80 and len(records) == 80  # the first 50 pairs were resumed, not synthesized again
+    with pytest.raises(ValueError, match="another base mode or factor set"):
+        fit_script.search(tts, pairs, latents, scorer, [1.0, 0.9], "rule", records_path)
+    for record in records:
+        fast = speaking_rate(record["prompt_frames"], record["prompt_text"]) > 17
+        assert record["best_factor"] == (1.15 if fast else 1.0)
+        assert record["target_frames"] == record["factor_frames"][str(record["best_factor"])]
+        assert record["base_frames"] == record["factor_frames"]["1.0"] and len(record["candidates"]) == 6
+    predictor, report = fit_script.refit(records, holdout=0.2)
+    assert report["fit_pairs"] == 64 and report["holdout_pairs"] == 16
+    assert report["fast_prompts_mean_log_best_factor"] == pytest.approx(math.log(1.15))
+    assert report["normal_prompts_mean_log_best_factor"] == 0.0
+    assert report["fit_refit_mae_log"] < report["fit_base_mae_log"]
+    path = tmp_path / "predictor.json"
+    predictor.save(path)
+    loaded = DurationPredictor.load(path)
+    assert loaded.weights == predictor.weights and loaded.metadata["best_factor_counts"]
+
+
+def test_fit_script_refit_recovers_a_uniform_best_factor():
+    fit_script = load_fit_script()
+    records = []
+    for pair in synthetic_pairs(200, seed=3):
+        base = rule_frames(pair["prompt_frames"], pair["prompt_text"], pair["text"])
+        records.append({**pair, "best_factor": 1.1, "base_frames": base, "target_frames": base * 1.1})
+    records.append({"pair": 999, "error": "Target duration outside .25–30 s"})
+    predictor, report = fit_script.refit(records, ridge=1e-6)
+    assert report["failed"] == 1 and report["changed_fraction"] == 1.0
+    for record in records[:-1]:
+        predicted = predictor.predict(record["prompt_frames"], record["prompt_text"], record["text"])
+        assert predicted == pytest.approx(record["target_frames"], rel=0.02)
+
+
+def test_fit_script_samples_same_speaker_pairs(cache):
+    from dacvae_tts.data import LatentDataset
+
+    fit_script = load_fit_script()
+    data = LatentDataset(cache, "train", pairing="within", layout="joined")
+    pairs = fit_script.sample_pairs(data, "train", 20, seed=1, min_prompt=1, max_prompt=100)
+    assert len(pairs) == 12  # every train recording is a target once (4 speakers x 3 recordings)
+    assert len({p["uid"] for p in pairs}) == 12
+    for pair in pairs:
+        row = data.row(pair["prompt_index"])
+        assert pair["prompt_uid"] != pair["uid"] and row["uid"] == pair["prompt_uid"]
+        assert row["speaker"] == pair["speaker"] == pair["uid"].rsplit("-", 1)[0]
+        assert pair["prompt_frames"] == len(row["latents"])
