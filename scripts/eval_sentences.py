@@ -17,6 +17,17 @@ recording (the published SIM-o). The originals come from the dataset: this scrip
   python scripts/eval_sentences.py ... --rescore --protocol-v2 --prompt-audio data/tr55/eval-audio \
       --dnsmos models/sig_bak_ovr.onnx [--band-limit-8k] [--utmosv2]
 
+Leak-free prompts (`--prompt-set`, instead of `--cache`): a JSON list of {"audio", "text", "speaker"[, "uid"]} entries,
+e.g. Common Voice test speakers from scripts/data/make_prompt_set.py, which never occur in the podcast training data.
+The prompt audio is encoded like any reference (loudness, codec) and is itself the original recording of `sim_o`:
+
+  python scripts/data/make_prompt_set.py --parquet data/cv17-tr/test --exclude-sentences data/eval/freya_tr_eval.jsonl \
+      --speakers 48 --dnsmos models/sig_bak_ovr.onnx --output data/eval/cv-tr-prompts
+  python scripts/eval_sentences.py ... --prompt-set data/eval/cv-tr-prompts/prompts.json --protocol-v2 --sim-o
+
+The cache prompts come from ~10 held-out podcast speakers, most of whose voices also occur in training under other
+episode labels; many independent voices also make the speaker-clustered intervals much tighter.
+
 `--band-limit-8k` is the ASR input of the FreyaTTS scoring protocol (8 kHz resample before ASR only). Their text
 scoring differs from ours (apostrophes become spaces, CER counts spaces): `--freya-metric` adds `freya_wer` /
 `freya_cer` under that convention next to the usual `wer` / `cer`; use both for Freya-TR-Eval tables.
@@ -149,14 +160,39 @@ def audio_stats(path):
             "lufs": float(loudness) if np.isfinite(loudness) else -70.0}
 
 
+def load_prompt_set(path, count=None):
+    """Cases of a --prompt-set JSON list of {"audio", "text", "speaker"[, "uid"]}: the select_cases fields a prompt
+    needs (speaker, prompt_uid, prompt_text) plus `prompt_audio`, the recording (relative paths: to the JSON file).
+    The first `count` entries (all when None), in file order."""
+    entries = json.loads(Path(path).read_text())
+    cases = []
+    for entry in entries:
+        audio = Path(entry["audio"])
+        audio = audio if audio.is_absolute() else Path(path).parent / audio
+        if not audio.exists():
+            raise SystemExit(f"--prompt-set: missing prompt recording {audio}")
+        if not str(entry.get("text", "")).strip() or not str(entry.get("speaker", "")).strip():
+            raise SystemExit(f"--prompt-set: entry {entry.get('audio')} needs a transcript and a speaker")
+        uid = str(entry.get("uid") or audio.name)
+        cases.append({"speaker": str(entry["speaker"]), "prompt_uid": uid, "prompt_text": entry["text"],
+                      "prompt_audio": str(audio)})
+    if len({case["prompt_uid"] for case in cases}) != len(cases):
+        raise SystemExit("--prompt-set: prompt uids (or file names) must be unique")
+    return cases[:count] if count else cases
+
+
 def original_prompt_finder(args, prompts, cases):
-    """prompt WAV name -> original recording (export_case_audio.py naming) or None; never the codec prompt."""
-    if not args.prompt_audio:
+    """prompt WAV name -> original recording (a --prompt-set file, else export_case_audio.py naming) or None; never
+    the codec prompt."""
+    sets = {prompt_name(number): case["prompt_audio"] for number, case in enumerate(cases) if case.get("prompt_audio")}
+    if not args.prompt_audio and not sets:
         return lambda name: None
     uids = {wav.name: case["prompt_uid"] for (_, wav, _), case in zip(prompts, cases)}
 
     def find(name):
-        if name not in uids:  # rows of a previous pass with a different prompt set
+        if name in sets:
+            return Path(sets[name])
+        if name not in uids or not args.prompt_audio:  # rows of a previous pass with a different prompt set
             return None
         path = Path(args.prompt_audio) / (uids[name].replace("/", "_").replace(":", "_") + ".wav")
         return path if path.exists() else None
@@ -282,11 +318,15 @@ def score_hf(rows, out, args, protocol=None, originals=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--cache", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--cache", help="Latent cache whose held-out validation recordings are the prompts")
+    source.add_argument("--prompt-set", help="JSON list of {audio, text, speaker[, uid]} prompt recordings (leak-free "
+                        "voices, e.g. scripts/data/make_prompt_set.py) instead of cache prompts")
     parser.add_argument("--sentences", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--prompts", type=int, default=24, help="Number of held-out prompt voices used in rotation")
+    parser.add_argument("--prompts", type=int, default=None,
+                        help="Number of prompt voices used in rotation (default: 24 cache prompts, every --prompt-set entry)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--steps", type=int, default=32)
     parser.add_argument("--guidance", type=float, default=3.0)
@@ -367,7 +407,10 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     sentences = load_sentences(args.sentences, args.limit)
     exclude = read_speaker_list(args.exclude_speakers) if args.exclude_speakers else ()
-    data, cases = select_cases(args.cache, args.prompts, args.seed, exclude=exclude)
+    if args.prompt_set:
+        data, cases = None, load_prompt_set(args.prompt_set, args.prompts)
+    else:
+        data, cases = select_cases(args.cache, args.prompts or 24, args.seed, exclude=exclude)
     wavs_exist = all((out / f"{s['id']}.wav").exists() for s in sentences)
     reuse = args.rescore and ((out / "results.jsonl").exists() or wavs_exist)
     previous = None  # rows of the previous pass (rescore)
@@ -383,11 +426,16 @@ def main():
             tts.duration_model = args.duration_model  # loaded by the predictor/auto modes
     prompts = []
     for number, case in enumerate(cases):
-        latents = data.row(case["prompt_index"])["latents"]
         wav = out / prompt_name(number)
+        if "prompt_audio" in case:  # a recording: encoded (and timed) like any reference; nothing to do on rescore
+            voice = tts.prepare_reference(case["prompt_audio"], case["prompt_text"]) if tts is not None else None
+            latents = None if voice is None else voice.latents
+        else:
+            latents = data.row(case["prompt_index"])["latents"]
+            voice = VoiceReference(latents, case["prompt_text"], "cache", {})
         if tts is not None:  # always: a prompt-NN.wav left by a pass with other prompts must not be scored against
             sf.write(wav, tts.codec.decode(latents.to(tts.device) * tts.std + tts.mean).numpy(), tts.codec.sample_rate)
-        prompts.append((VoiceReference(latents, case["prompt_text"], "cache", {}), wav, case["speaker"]))
+        prompts.append((voice, wav, case["speaker"]))
     rows = []
     started = time.time()
     sampler = dict(guidance_from=args.guidance_from, cfg_rescale=args.cfg_rescale, apg_eta=args.apg_eta,
