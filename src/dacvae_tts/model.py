@@ -274,6 +274,17 @@ def add_dropout(block, p):
         attention.register_forward_hook(_output_dropout)
 
 
+def set_dropout(model, p):
+    """Set the rate of the residual-branch dropout that `add_dropout` installed in the generator blocks; 0
+    turns it off in training mode too (e.g. for GRPO, whose PPO ratio needs the rollout policy)."""
+    for block in model.blocks:
+        for module in block.modules():
+            if hasattr(module, "output_dropout"):
+                module.output_dropout = p
+            elif isinstance(module, nn.Dropout):
+                module.p = p
+
+
 class FlowTTS(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()

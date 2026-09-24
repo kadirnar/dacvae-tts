@@ -105,7 +105,7 @@ from .codec import backend_options, check_compatibility
 from .contracts import mask_values, sanitize
 from .data import LatentDataset, collate
 from .duration import DurationPredictor, auto_mode, clamp_scale, rule_frames
-from .model import guided_update, sample, time_grid, to_velocity
+from .model import guided_update, sample, set_dropout, time_grid, to_velocity
 from .optim import build_optimizer
 from .text import normalize
 from .training import atomic_save, autocast, distributed_device, load_model
@@ -878,6 +878,10 @@ def grpo_train(args, reward=None, monitor=None):
     torch.manual_seed(args.seed)
     policy, saved = load_model(args.checkpoint, device)
     policy.grad_checkpoint = args.grad_checkpoint
+    # A checkpoint trained with model.dropout (#14) would drop units in the train-mode gradient passes but not
+    # in the eval-mode rollouts and old log-densities, so the on-policy ratio would drift from 1: the policy is
+    # optimized without dropout (parameter-free, so its weights and checkpoints are unaffected).
+    set_dropout(policy, 0.0)
     reference = copy.deepcopy(policy).requires_grad_(False) if args.kl > 0 else None
     ema = copy.deepcopy(policy).requires_grad_(False)
     source = PromptSource(args.cache, "train", saved, args.seed, args.duration_mode, args.duration_scale,

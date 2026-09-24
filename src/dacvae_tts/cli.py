@@ -421,7 +421,9 @@ def add_grpo_args(parser, training=True):
     g.add_argument("--dnsmos-model", help="Official sig_bak_ovr.onnx (needed by the dnsmos term)")
     g.add_argument("--utmos-repo", default="tarepan/SpeechMOS:v1.2.0", help="torch.hub repo of UTMOS22-strong")
     g.add_argument("--language", default="tr", help="Whisper language of the judges")
-    g.add_argument("--metric-normalization", choices=["english-unicode-v2", "legacy-ascii-v1", "turkish-v1"])
+    g.add_argument(
+        "--metric-normalization", choices=["english-unicode-v2", "legacy-ascii-v1", "turkish-v1", "turkish-v2"]
+    )
     g.add_argument("--reward-device", help="Device of the codec and judges (default: the policy device)")
     if not training:
         return

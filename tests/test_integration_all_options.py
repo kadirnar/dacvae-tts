@@ -386,3 +386,48 @@ def test_decay_phase_loader_keeps_every_data_option(cache, tmp_path):
     assert isinstance(loader.collate_fn, TrainCollate)
     batch = next(iter(loader))
     assert batch["valid"].size(1) % 8 == 0 and batch["tokens"].size(1) % 8 == 0 and "ctc_targets" in batch
+
+
+def test_grpo_optimizes_a_dropout_checkpoint_on_policy(cache, tmp_path, monkeypatch):
+    """#16 x #14 x #9: GRPO on a checkpoint trained with model.dropout and block options switches the
+    dropout off, so the train-mode gradient pass reproduces the eval-mode rollout policy (ratio 1)."""
+    import json
+    import sys
+
+    from dacvae_tts import cli, grpo
+    from dacvae_tts.config import Config
+    from dacvae_tts.data import LatentDataset
+    from dacvae_tts.grpo import CompositeReward
+
+    data = LatentDataset(cache)
+    cfg = Config(ModelConfig(latent_dim=4, width=16, depth=2, heads=2, text_depth=1, dropout=0.3,
+                             ffn_activation="swiglu", value_residual=True, attn_gate="head"), TrainConfig())
+    model = FlowTTS(cfg.model)
+    with torch.no_grad():  # a "trained" model: zero-init gates and output layers would hide the dropout
+        for parameter in model.parameters():
+            if not parameter.abs().sum():
+                parameter.normal_(0, 0.1)
+    state = model.state_dict()
+    checkpoint = tmp_path / "dropout.pt"
+    torch.save({"model": state, "ema": state, "config": cfg.to_dict(), "codec": data.meta, "mean": data.mean,
+                "std": data.std}, checkpoint)
+    captured = {}
+    run = grpo.grpo_train
+    monkeypatch.setattr(grpo, "grpo_train", lambda args: captured.setdefault("args", args))
+    monkeypatch.setattr(sys, "argv", [
+        "dacvae-tts", "post-train", "--mode", "grpo", "--checkpoint", str(checkpoint), "--cache", str(cache),
+        "--output", str(tmp_path / "grpo"), "--device", "cpu", "--precision", "fp32", "--steps", "2",
+        "--sample-steps", "4", "--guidance", "2", "--window-max", "1", "--group-size", "4",
+        "--prompts-per-step", "1", "--duration-mode", "rule", "--monitor-every", "0",
+        "--metric-normalization", "turkish-v2",
+    ])
+    cli.main()
+
+    class LatentMean:
+        def __call__(self, group):
+            return [float(z.mean()) for z in group.latents]
+
+    run(captured["args"], reward=CompositeReward({"mean": LatentMean()}, {"mean": 1.0}, min_terms=1))
+    records = [json.loads(line) for line in (tmp_path / "grpo" / "grpo-log.jsonl").read_text().splitlines()]
+    steps = [record for record in records if "reward" in record and record.get("optimizer_steps")]
+    assert steps and all(r["clip_fraction"] == 0 and abs(r["approx_kl"]) < 1e-6 for r in steps)
