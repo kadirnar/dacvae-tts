@@ -23,7 +23,10 @@ Why each part exists:
   `asr_trim_silence` optionally cuts trailing silence before ASR (the raw audio is still what every other metric
   sees).
 - `band_limit_8k` (FreyaTTS scoring protocol): the audio is resampled to 8 kHz and back to 16 kHz before ASR only,
-  so WER is comparable with Freya-TR-Eval tables.
+  as FreyaTTS scores Freya-TR-Eval. That alone does not make our WER/CER comparable with Freya-TR-Eval tables: their
+  text scoring turns apostrophes into spaces and counts spaces in CER, ours deletes apostrophes and computes CER
+  without spaces. `metrics.freya_error_counts` (`eval_sentences.py --freya-metric`: `freya_wer`/`freya_cer` next to
+  `wer`/`cer`) follows their convention; the ASR model and decoding can still differ from theirs.
 
 Everything is opt-in: `protocol_from_args` returns None unless a v2 flag is given, and an `Evaluator` without a
 protocol keeps its decoding (WHISPER_V1, with the sampling fallback) and row keys exactly as before, so v1 numbers
@@ -346,6 +349,10 @@ def summary_extras(rows):
     for key in ("word_substitutions", "word_deletions", "word_insertions"):
         if all(key in r for r in rows):
             result[key] = int(sum(r[key] for r in rows))
+    for prefix, denominator in (("freya_word", "freya_words"), ("freya_char", "freya_chars")):  # --freya-metric
+        if all(f"{prefix}_edits" in r for r in rows):
+            key = "freya_wer" if prefix == "freya_word" else "freya_cer"
+            result[key] = sum(r[f"{prefix}_edits"] for r in rows) / sum(r[denominator] for r in rows)
     if all("word_edits_filtered" in r and "char_edits_filtered" in r for r in rows):
         result["wer_filtered"] = sum(r["word_edits_filtered"] for r in rows) / sum(r["words"] for r in rows)
         result["cer_filtered"] = sum(r["char_edits_filtered"] for r in rows) / sum(r["chars"] for r in rows)

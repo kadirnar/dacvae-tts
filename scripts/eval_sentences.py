@@ -17,7 +17,9 @@ recording (the published SIM-o). The originals come from the dataset: this scrip
   python scripts/eval_sentences.py ... --rescore --protocol-v2 --prompt-audio data/tr55/eval-audio \
       --dnsmos models/sig_bak_ovr.onnx [--band-limit-8k] [--utmosv2]
 
-`--band-limit-8k` is the FreyaTTS scoring protocol (8 kHz resample before ASR only) for Freya-TR-Eval tables.
+`--band-limit-8k` is the ASR input of the FreyaTTS scoring protocol (8 kHz resample before ASR only). Their text
+scoring differs from ours (apostrophes become spaces, CER counts spaces): `--freya-metric` adds `freya_wer` /
+`freya_cer` under that convention next to the usual `wer` / `cer`; use both for Freya-TR-Eval tables.
 UTMOS comes from the protocol switches: `--utmos` (or `--utmos utmos22`) scores every output with UTMOS22-strong
 into `utmos`, `--utmosv2` (or `--utmos utmosv2`) with UTMOSv2 into `utmosv2`; `--select-utmos` is only the best-of-N
 selector's UTMOS.
@@ -49,6 +51,7 @@ from dacvae_tts.metrics import (  # noqa: E402
     METRIC_NORMALIZATIONS,
     Evaluator,
     default_metric_normalization,
+    freya_error_counts,
     row_identity,
     summarize,
 )
@@ -223,6 +226,8 @@ def score_hf(rows, out, args, protocol=None, originals=None):
         similarity = float((evaluator.embedding(audio) * prompt_embeddings[r["prompt"]]).sum())
         record = {**r, **counts, "hypothesis": hypotheses[r["audio"]], "speaker_similarity": similarity, "asr_backend": "hf-greedy",
                   "evaluator": identity}
+        if args.freya_metric:
+            record.update(freya_error_counts(r["text"], hypotheses[r["audio"]], normalization))
         if dnsmos is not None:
             record.update(dnsmos(audio.numpy()))
         if scorer is not None:
@@ -287,6 +292,10 @@ def main():
         "--metric-normalization", choices=METRIC_NORMALIZATIONS,
         help="WER/CER text normalization of both --asr-backend paths (default: turkish-v1 for --language tr, else "
              "english-unicode-v2)",
+    )
+    parser.add_argument(
+        "--freya-metric", action="store_true",
+        help="Also score WER/CER the Freya-TR-Eval way (apostrophes -> spaces, CER with spaces) as freya_wer/freya_cer",
     )
     parser.add_argument("--asr-model", default="large-v3")
     parser.add_argument("--asr-device", default="cuda")
@@ -416,6 +425,8 @@ def main():
             score = evaluator.score(row["audio"], row["text"], out / row["prompt"], original_prompt=original,
                                     codec_prompt=out / row["prompt"])
             extra = {"prompt_original": str(original)} if protocol is not None and original else {}
+            if args.freya_metric:
+                extra.update(freya_error_counts(row["text"], score["hypothesis"], evaluator.metric_normalization))
             scored.append({**row, **score, "evaluator": evaluator.row_identity, **extra})
     for row in scored:
         if "error" not in row:

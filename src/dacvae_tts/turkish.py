@@ -259,16 +259,17 @@ def normalize_turkish_v2(text):
     return normalize_turkish(text, "turkish-v2")
 
 
-def metric_text_turkish(text):
+def metric_text_turkish(text, apostrophe=""):
     """WER/CER normalization for Turkish: numbers spelled out, Turkish lower-case, letters only.
 
     Metric version `turkish-v1`, frozen so that published scores stay comparable; metric_text_turkish_v2 fixes
-    its mistakes.
+    its mistakes. `apostrophe` replaces the apostrophes left after the numbers are spelled out (deleted by default,
+    İsveç'ten -> isveçten; " " is the Freya-TR-Eval convention, isveç ten).
     """
     text = unicodedata.normalize("NFKC", text)
     text = normalize_numbers(text)
     text = tr_lower(text)
-    text = "".join(c if c.isalnum() or c.isspace() else ("" if c in "'’" else " ") for c in text)
+    text = "".join(c if c.isalnum() or c.isspace() else (apostrophe if c in "'’" else " ") for c in text)
     text = "".join(c for c in text if unicodedata.category(c) != "Mn")
     return " ".join(text.split())
 
@@ -362,7 +363,7 @@ def _fold_marks(text):
     )
 
 
-def metric_text_turkish_v2(text):
+def metric_text_turkish_v2(text, apostrophe=""):
     """WER/CER normalization `turkish-v2`: the `turkish-v1` metric text without its known mistakes (issue #5).
 
     Order: apostrophe/hyphen variants, NFKC, then rewrites that need the original case and punctuation, Turkish
@@ -380,7 +381,8 @@ def metric_text_turkish_v2(text):
       ikincisi);
     - combining marks are removed after lower-casing, so "i̇stanbul" (a non-Turkish lower() of İstanbul) is
       "istanbul" rather than "i stanbul"; â/î/û/ô and foreign accents fold (kâr -> kar);
-    - apostrophes are deleted (İsveç'ten -> isveçten), other punctuation separates words;
+    - apostrophes are deleted (İsveç'ten -> isveçten; `apostrophe` replaces them instead), other punctuation
+      separates words;
     - METRIC_VARIANTS unify spellings (euro -> avro, herşey -> her şey).
     Plain sentences (letters, apostrophes and sentence punctuation, no abbreviation, all-caps word or variant
     spelling) come out exactly as with `turkish-v1`; this holds for all 495 Freya-TR-Eval sentences. The default
@@ -409,5 +411,5 @@ def metric_text_turkish_v2(text):
     text = rules["unit"].sub(lambda m: f"{m.group(1)} {METRIC_UNITS[m.group(2)]}", text)
     text = normalize_numbers(text, v2=True)
     text = _fold_marks(tr_lower(text))
-    text = "".join(c if c.isalnum() or c.isspace() else ("" if c == "'" else " ") for c in text)
+    text = "".join(c if c.isalnum() or c.isspace() else (apostrophe if c == "'" else " ") for c in text)
     return " ".join(" ".join(METRIC_VARIANTS.get(word, word) for word in text.split()).split())

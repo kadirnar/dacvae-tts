@@ -28,7 +28,7 @@ from dacvae_tts.eval_protocol import (
     summary_extras,
     trim_trailing_silence,
 )
-from dacvae_tts.metrics import error_counts, summarize
+from dacvae_tts.metrics import error_counts, freya_error_counts, metric_text, summarize
 
 
 def band_limited_noise(cutoff, rate, seconds=2.0, seed=0):
@@ -148,6 +148,28 @@ def test_summary_extras_partial_metrics_and_filtered_wer():
                    hallucination=row is b)
     extras = summary_extras([a, b])
     assert extras["wer_filtered"] == 0 and extras["cer_filtered"] == 0 and extras["hallucination_rate"] == 0.5
+
+
+def test_freya_metric_splits_at_apostrophes_and_counts_spaces():
+    reference, hypothesis = "İstanbul'da 2010'da kaldık.", "İstanbul'da iki bin onda kaldık"
+    ours = error_counts(reference, hypothesis, "turkish-v1")
+    assert (ours["words"], ours["chars"], ours["wer"]) == (5, 26, 0)  # istanbulda iki bin onda kaldık
+    freya = freya_error_counts(reference, hypothesis, "turkish-v1")
+    # istanbul da iki bin onda kaldık: the apostrophe is a word break, CER counts the 5 spaces.
+    assert (freya["freya_words"], freya["freya_chars"], freya["freya_wer"]) == (6, 31, 0)
+    joined = freya_error_counts(reference, "istanbulda iki bin onda kaldık", "turkish-v1")
+    assert joined["freya_word_edits"] == 2 and joined["freya_char_edits"] == 1  # 0 edits under our convention
+    assert metric_text("Don't stop", apostrophe=" ") == "don t stop" and metric_text("Don't stop") == "don't stop"
+    assert metric_text("İsveç'ten", "turkish-v2", " ") == "isveç ten" and metric_text("İsveç'ten", "turkish-v2") == (
+        "isveçten"
+    )
+    with pytest.raises(ValueError, match="empty"):
+        freya_error_counts("...", "bir")
+    rows = [{**error_counts("bir iki", "bir iki"), **freya_error_counts("bir iki", "bir")},
+            {**error_counts("üç", "üç"), **freya_error_counts("üç", "üç")}]
+    extras = summary_extras(rows)
+    assert extras["freya_wer"] == pytest.approx(1 / 3) and extras["freya_cer"] == pytest.approx(4 / 9)
+    assert "freya_wer" not in summary_extras([error_counts("bir", "bir")])
 
 
 # ---------------------------------------------------------------------------------------------- options / flags
@@ -549,4 +571,17 @@ def test_eval_sentences_metric_normalization_reaches_both_asr_paths(fake_whisper
                                           texts=("Hello there.",), output="hf-en")
     assert rows[0]["evaluator"]["metric_normalization"] == summary["metric_normalization"] == "english-unicode-v2"
     assert fake_whisper.calls[-1][1]["language"] == "en"
+
+
+def test_eval_sentences_freya_metric(fake_whisper, fake_transformers, tmp_path, monkeypatch):
+    fake_whisper.text = "İstanbul'da kaldık."
+    texts = ("İstanbul'da kaldık.", "Ankara'ya gittik.")
+    for backend in ("faster-whisper", "hf"):
+        rows, summary, _ = run_eval_sentences(tmp_path, monkeypatch, "--speaker-model", "", "--asr-backend", backend,
+                                              "--freya-metric", texts=texts, output=f"freya-{backend}")
+        assert rows[0]["wer"] == rows[0]["freya_wer"] == 0
+        assert (rows[0]["words"], rows[0]["freya_words"], rows[0]["freya_chars"]) == (2, 3, 18)
+        assert summary["freya_wer"] > 0 and summary["wer"] > 0 and "freya_cer" in summary
+    rows, summary, _ = run_eval_sentences(tmp_path, monkeypatch, "--speaker-model", "", texts=texts, output="plain")
+    assert "freya_wer" not in rows[0] and "freya_wer" not in summary  # opt-in
 

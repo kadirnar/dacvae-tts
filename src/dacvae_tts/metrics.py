@@ -22,15 +22,18 @@ def default_metric_normalization(language):
     return "turkish-v1" if language == "tr" else "english-unicode-v2"
 
 
-def metric_text(text, version="english-unicode-v2"):
+def metric_text(text, version="english-unicode-v2", apostrophe=None):
+    """WER/CER text of a normalization version. `apostrophe` (None: the version's own rule, Turkish deletes and
+    English keeps them) replaces the apostrophes that survive the normalization; " " is the Freya-TR-Eval convention
+    (`freya_error_counts`)."""
     if version == "turkish-v1":
         from .turkish import metric_text_turkish
 
-        return metric_text_turkish(text)
+        return metric_text_turkish(text, apostrophe or "")
     if version == "turkish-v2":  # opt-in; turkish-v1 stays the default for Turkish so scores remain comparable
         from .turkish import metric_text_turkish_v2
 
-        return metric_text_turkish_v2(text)
+        return metric_text_turkish_v2(text, apostrophe or "")
     text = unicodedata.normalize("NFKC", text).lower().replace("’", "'")
     if version == "legacy-ascii-v1":
         text = re.sub(r"[^a-z0-9'\s]", " ", text)
@@ -41,6 +44,8 @@ def metric_text(text, version="english-unicode-v2"):
         )
     else:
         raise ValueError("Unsupported metric normalization version")
+    if apostrophe is not None:
+        text = text.replace("'", apostrophe)
     return " ".join(text.split())
 
 
@@ -88,6 +93,31 @@ def error_counts(reference, hypothesis, normalization="english-unicode-v2"):
         "word_substitutions": substitutions,
         "word_deletions": deletions,
         "word_insertions": insertions,
+    }
+
+
+def freya_error_counts(reference, hypothesis, normalization="turkish-v1"):
+    """WER/CER under the Freya-TR-Eval (FreyaTTS) scoring convention, next to our own `error_counts`.
+
+    Freya's scoring turns apostrophes into spaces (İstanbul'da -> istanbul da: two words) and counts spaces in
+    CER; ours deletes apostrophes (one word, istanbulda) and computes CER without spaces. Everything else is the
+    given normalization (Turkish casing, numbers spelled out), so this reproduces those two conventions, not
+    FreyaTTS's code: compare with published Freya-TR-Eval tables using freya_wer/freya_cer and 8 kHz band-limited
+    ASR input (`--band-limit-8k`), keeping in mind that the ASR model and decoding may still differ.
+    """
+    ref = metric_text(reference, normalization, apostrophe=" ")
+    hyp = metric_text(hypothesis, normalization, apostrophe=" ")
+    if not ref:
+        raise ValueError("Reference transcript is empty after metric normalization")
+    words, edits = ref.split(), word_edit_counts(ref.split(), hyp.split())[0]
+    chars = edit_distance(ref, hyp)
+    return {
+        "freya_word_edits": edits,
+        "freya_words": len(words),
+        "freya_char_edits": chars,
+        "freya_chars": len(ref),
+        "freya_wer": edits / len(words),
+        "freya_cer": chars / len(ref),
     }
 
 
