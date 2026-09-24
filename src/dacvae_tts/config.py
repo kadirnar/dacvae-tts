@@ -98,6 +98,8 @@ class TrainConfig:
     contrastive_weight: float = 0.0  # skip/repeat text negatives (RobustSpeechFlow-style hinge)
     contrastive_margin: float = 0.1  # required loss gap, relative to the positive loss
     wandb_project: str = ""  # set (or pass --wandb-project) to mirror the JSONL logs to Weights & Biases
+    # Throughput options (speed.py). Every default reproduces the previous training numerics exactly.
+    strict_checks: bool = True  # false: skip value checks that stall the host (shapes still checked)
 
     def __post_init__(self):
         if self.worker_threads < 1 or self.prefetch_factor < 1:

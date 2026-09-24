@@ -22,6 +22,7 @@ from .diagnostics import ActivationProbe, gradient_contributions, gradient_group
 from .model import FlowTTS, flow_loss, reduce_flow
 from .optim import build_optimizer
 from .parallel import device_batches, loader_options
+from .speed import NonfiniteWatch
 from .text import BYTE_OFFSET, corrupt_transcript
 from .tracking import Tracker
 
@@ -299,6 +300,7 @@ def train(args):
             )
         model = FlowTTS(cfg.model).to(device)
         model.grad_checkpoint = cfg.train.grad_checkpoint
+        model.strict_checks = cfg.train.strict_checks
         ema = copy.deepcopy(model).eval().requires_grad_(False)
         optimizer = build_optimizer(
             model,
@@ -433,6 +435,8 @@ def train(args):
                 flush=True,
             )
         sampler.epoch, sampler.start_batch = epoch, batch_offset
+        # strict_checks: false defers the loss/gradient finiteness checks to the next host sync.
+        watch = None if cfg.train.strict_checks else NonfiniteWatch(device)
         iterator = iter(loader)
         last_time = time.monotonic()
         inactive = {}
@@ -507,7 +511,9 @@ def train(args):
                             diagnostics["gradient_contributions"] = (
                                 "Use a single-process diagnostic run; autograd.grad is not used inside DDP"
                             )
-                    if not torch.isfinite(loss):
+                    if watch is not None:
+                        watch.note("objective", loss, step)
+                    elif not torch.isfinite(loss):
                         raise FloatingPointError(f"Nonfinite objective at update {step + 1}")
                     loss.backward()
                 buckets += loss_buckets(losses["flow"], losses["times"], losses["frames"])
@@ -523,7 +529,9 @@ def train(args):
                     ]
                 )
             norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            if not torch.isfinite(norm):
+            if watch is not None:
+                watch.note("gradient", norm, step)
+            elif not torch.isfinite(norm):
                 raise FloatingPointError(f"Nonfinite gradient at update {step + 1}")
             if diagnose:
                 diagnostics["gradient_groups_after_clip"] = gradient_groups(model)
@@ -536,6 +544,8 @@ def train(args):
                 decay = min(cfg.train.ema_decay, (1 + step) / (10 + step))
                 torch._foreach_lerp_(list(ema.parameters()), list(model.parameters()), 1 - decay)
             if (step + 1) % cfg.train.log_every == 0 or step == start_step or diagnose:
+                if watch is not None:
+                    watch.check()
                 if world > 1:
                     dist.all_reduce(metrics)
                     dist.all_reduce(buckets)
@@ -568,6 +578,8 @@ def train(args):
                     tracker.log(record, step=step + 1, prefix="train/")
                 last_time = time.monotonic()
             if validation is not None and (step + 1) % cfg.train.validate_every == 0:
+                if watch is not None:
+                    watch.check()
                 val = validate(
                     ema,
                     validation,
@@ -590,6 +602,8 @@ def train(args):
                 or stopping
                 or keeping
             ):
+                if watch is not None:
+                    watch.check()  # never write a checkpoint after an unnoticed nonfinite update
                 states = [None] * world
                 state = rng_state(device)
                 if world > 1:
