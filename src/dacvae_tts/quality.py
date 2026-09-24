@@ -17,7 +17,7 @@ def channel_moments(latents):
     """Per-channel mean, standard deviation and excess kurtosis of [frames, C] latents (float64)."""
     if latents.ndim != 2 or latents.size(0) < 2:
         raise ValueError("Latent moments need [frames>=2, C]")
-    x = latents.detach().double()
+    x = latents.detach().cpu().double()  # float64 on the host: MPS has no float64
     mean = x.mean(0)
     centered = x - mean
     variance = centered.square().mean(0)
@@ -36,7 +36,7 @@ def latent_moments(generated, reference):
     g_mean, g_std, g_kurtosis = channel_moments(generated)
     r_mean, r_std, r_kurtosis = channel_moments(reference)
     ratio = g_std / r_std.clamp_min(1e-6)
-    rms = [value.detach().double().square().mean().sqrt() for value in (generated, reference)]
+    rms = [value.detach().cpu().double().square().mean().sqrt() for value in (generated, reference)]
     return {
         "std_ratio_mean": float(ratio.mean()),
         "std_ratio_min": float(ratio.min()),
@@ -63,7 +63,8 @@ def match_moments(generated, reference, mode="std", limits=(0.5, 2.0)):
     r_mean, r_std, _ = channel_moments(reference)
     factor = (r_std / g_std.clamp_min(1e-6)).clamp(*limits)
     center = r_mean if mode == "meanstd" else g_mean
-    return ((generated.double() - g_mean) * factor + center).to(generated.dtype)
+    matched = (generated.detach().cpu().double() - g_mean) * factor + center
+    return matched.to(device=generated.device, dtype=generated.dtype)
 
 
 # Best-of-N selection. Direction: +1 higher is better, -1 lower is better.
