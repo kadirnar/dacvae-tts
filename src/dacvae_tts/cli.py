@@ -264,12 +264,12 @@ def main():
     p.add_argument("--student-steps", type=positive_int, default=8)
 
     p = sub.add_parser(
-        "post-train", help="Experimental preference learning or trajectory distillation with DDP"
+        "post-train", help="Experimental preference learning or trajectory distillation with DDP, or online Flow-GRPO"
     )
-    p.add_argument("--mode", choices=["preference", "distill"], required=True)
+    p.add_argument("--mode", choices=["preference", "distill", "grpo"], required=True)
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--cache", required=True)
-    p.add_argument("--data", required=True, help="Pair or trajectory JSONL")
+    p.add_argument("--data", help="Pair or trajectory JSONL (required for preference/distill)")
     p.add_argument("--output", required=True)
     p.add_argument("--device", default="auto", choices=["auto", "cpu"])
     p.add_argument("--steps", type=positive_int, default=1000)
@@ -288,8 +288,11 @@ def main():
     p.add_argument("--grad-checkpoint", action="store_true")
     p.add_argument("--save-every", type=positive_int, default=100)
     p.add_argument("--seed", type=int, default=42)
+    add_grpo_args(p)
 
     args = parser.parse_args()
+    if args.command == "post-train" and args.mode != "grpo" and not args.data:
+        parser.error("--data is required for --mode preference/distill")
     if getattr(args, "languages", None) is not None:
         from .prepare import ENGLISH_TAGS
 
@@ -332,6 +335,10 @@ def main():
         from .comparison import compare
 
         compare(args)
+    elif args.command == "post-train" and args.mode == "grpo":
+        from .grpo import grpo_train
+
+        grpo_train(args)
     elif args.command in {"audit-cache", "codec-reconstruct", "make-cases", "run-eval"}:
         from . import experiments
 
@@ -374,6 +381,67 @@ def add_loader_args(parser):
     parser.add_argument("--worker-threads", type=positive_int)
     parser.add_argument("--prefetch-factor", type=positive_int)
     parser.add_argument("--loader-start-method", choices=["spawn", "forkserver"])
+
+
+def add_grpo_args(parser, training=True):
+    """Options of `post-train --mode grpo`; training=False keeps the sampler/reward part (best-of-N oracle).
+
+    Only read in grpo mode (see dacvae_tts/grpo.py for the math and the defaults' sources).
+    """
+    add_codec_args(parser)
+    g = parser.add_argument_group("GRPO sampler and reward")
+    g.add_argument("--sample-steps", type=positive_int, default=16, help="Euler steps of a rollout (FlowTTS-GRPO: 16)")
+    g.add_argument("--guidance", type=float, default=5.0, help="CFG of the sampled policy (deployed default 5)")
+    g.add_argument("--sway", type=float, default=-1.0)
+    g.add_argument("--guidance-from", type=float, default=0.0)
+    g.add_argument("--guidance-until", type=float, default=1.0)
+    g.add_argument(
+        "--duration-mode", choices=["gt", "rule", "clamp", "syllable", "predictor", "auto"], default="auto",
+        help="Target length of a prompt: the deployed rules, or gt = the recorded length",
+    )
+    g.add_argument("--duration-scale", type=float, default=1.0)
+    g.add_argument("--max-frames", type=positive_int, default=1000, help="Skip longer prompts (prompt+target frames)")
+    g.add_argument("--sde-window", type=positive_int, default=2, help="Consecutive stochastic (SDE) steps")
+    g.add_argument("--sde-sigma", type=float, default=0.5, help="Constant sigma, or `a` of the flow schedule")
+    g.add_argument("--sigma-schedule", choices=["constant", "flow"], default="constant")
+    g.add_argument("--window-max", type=float, default=0.5, help="The window ends within this fraction of the steps")
+    g.add_argument(
+        "--shared-noise", action=argparse.BooleanOptionalAction, default=True,
+        help="Samples of a group share the initial noise (differences come from the SDE window only)",
+    )
+    g.add_argument(
+        "--reward-weights", default="cer=1.0,sim=0.5,dnsmos=0.4,utmos=0.4",
+        help="name=weight list: cer, wer, sim, dnsmos, utmos, distillmos or module:attr",
+    )
+    g.add_argument("--reward-floors", default="", help="name=value overrides of the minimum group spread per term")
+    g.add_argument("--advantage", choices=["standardized", "weighted"], default="standardized")
+    g.add_argument("--allow-single-reward", action="store_true", help="Permit one reward term (hacking risk)")
+    g.add_argument("--asr-model", default="openai/whisper-large-v3-turbo", help="Reward ASR (transformers Whisper)")
+    g.add_argument("--speaker-model", default="microsoft/unispeech-sat-base-plus-sv", help="Reward SV model")
+    g.add_argument("--dnsmos-model", help="Official sig_bak_ovr.onnx (needed by the dnsmos term)")
+    g.add_argument("--utmos-repo", default="tarepan/SpeechMOS:v1.2.0", help="torch.hub repo of UTMOS22-strong")
+    g.add_argument("--language", default="tr", help="Whisper language of the judges")
+    g.add_argument("--metric-normalization", choices=["english-unicode-v2", "legacy-ascii-v1", "turkish-v1"])
+    g.add_argument("--reward-device", help="Device of the codec and judges (default: the policy device)")
+    if not training:
+        return
+    t = parser.add_argument_group("GRPO optimization and held-out monitor")
+    t.add_argument("--group-size", type=positive_int, default=8, help="Samples per prompt (FlowTTS-GRPO: 10)")
+    t.add_argument("--prompts-per-step", type=positive_int, default=4, help="Groups per rollout step")
+    t.add_argument("--micro-batch", type=positive_int, default=8, help="Samples per gradient forward")
+    t.add_argument("--clip", type=float, default=1e-4, help="PPO ratio clip (per-element mean log-ratio)")
+    t.add_argument("--kl", type=float, default=0.04, help="Weight of the closed-form KL to the start model")
+    t.add_argument("--ppo-epochs", type=positive_int, default=1)
+    t.add_argument("--updates-per-rollout", type=positive_int, default=1)
+    t.add_argument("--logprob-reduction", choices=["mean", "sum"], default="mean")
+    t.add_argument("--max-grad-norm", type=float, default=1.0)
+    t.add_argument("--monitor-every", type=int, default=50, help="Held-out monitor interval in steps; 0 disables")
+    t.add_argument("--monitor-prompts", type=int, default=32)
+    t.add_argument("--monitor-steps", type=positive_int, default=32, help="Steps of the deployed ODE sampler")
+    t.add_argument("--monitor-terms", default="cer,wer,sim,dnsmos", help="Held-out metrics (add distillmos)")
+    t.add_argument("--monitor-asr-model", default="large-v3")
+    t.add_argument("--monitor-speaker-model", default="microsoft/wavlm-base-plus-sv")
+    t.add_argument("--monitor-audio", type=int, default=4, help="Monitor samples saved per evaluation")
 
 
 def add_inference_args(parser, steps=True):
