@@ -168,6 +168,32 @@ def original_prompt_finder(args, prompts, cases):
     return find
 
 
+def prompt_name(number):
+    return f"prompt-{number:02d}.wav"
+
+
+def check_rescore_prompts(out, cases, rows=()):
+    """--rescore scores the WAVs of an earlier pass, whose prompts are the files prompt-NN.wav, named by position
+    only. `cases` are recomputed from the current --cache/--seed/--prompts/--exclude-speakers; if they are not the
+    pass's own, prompt-NN.wav would be paired with another speaker's original (sim_o) and rows with the wrong voice.
+    Checked against the pass's cases.json and against the prompt_uid of every previous row; exits on a mismatch."""
+    stored = out / "cases.json"
+    if stored.exists():
+        before = [case.get("prompt_uid") for case in json.loads(stored.read_text())]
+        if before != [case["prompt_uid"] for case in cases]:
+            raise SystemExit(
+                f"--rescore: the prompts selected now differ from {stored} (written by the synthesis pass); rerun with "
+                "that pass's --cache, --seed, --prompts and --exclude-speakers"
+            )
+    expected = {prompt_name(number): case["prompt_uid"] for number, case in enumerate(cases)}
+    wrong = [r.get("id") for r in rows if r.get("prompt_uid") and expected.get(r.get("prompt")) != r["prompt_uid"]]
+    if wrong:
+        raise SystemExit(
+            f"--rescore: {len(wrong)} rows (e.g. {wrong[:3]}) were synthesized with other prompts than the ones "
+            "selected now; rerun with the synthesis pass's --cache, --seed, --prompts and --exclude-speakers"
+        )
+
+
 def score_hf(rows, out, args, protocol=None, originals=None):
     """Batched GPU scoring: transformers Whisper (greedy) for WER/CER, WavLM-SV similarity and DNSMOS per clip.
 
@@ -309,7 +335,11 @@ def main():
         help="hf = transformers Whisper on the GPU with cross-clip batching (~30x faster than CPU faster-whisper; greedy decoding)",
     )
     parser.add_argument("--asr-batch", type=int, default=24)
-    parser.add_argument("--rescore", action="store_true", help="Skip synthesis when the WAVs already exist; only score")
+    parser.add_argument(
+        "--rescore", action="store_true",
+        help="Skip synthesis when the WAVs already exist; only score. Give the synthesis pass's --cache, --seed, "
+             "--prompts and --exclude-speakers: the prompts are checked against its cases.json and rows",
+    )
     parser.add_argument(
         "--prompt-audio",
         help="Directory of ORIGINAL prompt recordings (export_case_audio.py --cases OUTPUT/cases.json); with a "
@@ -326,9 +356,14 @@ def main():
     sentences = load_sentences(args.sentences, args.limit)
     exclude = read_speaker_list(args.exclude_speakers) if args.exclude_speakers else ()
     data, cases = select_cases(args.cache, args.prompts, args.seed, exclude=exclude)
-    (out / "cases.json").write_text(json.dumps(cases, indent=1, ensure_ascii=False))  # input of export_case_audio.py
     wavs_exist = all((out / f"{s['id']}.wav").exists() for s in sentences)
     reuse = args.rescore and ((out / "results.jsonl").exists() or wavs_exist)
+    previous = None  # rows of the previous pass (rescore)
+    if reuse:  # before cases.json is rewritten: it is the record of the synthesis pass
+        if (out / "results.jsonl").exists():
+            previous = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines() if line.strip()]
+        check_rescore_prompts(out, cases, previous or ())
+    (out / "cases.json").write_text(json.dumps(cases, indent=1, ensure_ascii=False))  # input of export_case_audio.py
     tts = None if reuse else Synthesizer(args.checkpoint, device=args.device)
     if tts is not None:
         tts.articulation_options = args.articulation_options  # None: the defaults of duration.articulation_seconds
@@ -337,8 +372,8 @@ def main():
     prompts = []
     for number, case in enumerate(cases):
         latents = data.row(case["prompt_index"])["latents"]
-        wav = out / f"prompt-{number:02d}.wav"
-        if not wav.exists() and tts is not None:
+        wav = out / prompt_name(number)
+        if tts is not None:  # always: a prompt-NN.wav left by a pass with other prompts must not be scored against
             sf.write(wav, tts.codec.decode(latents.to(tts.device) * tts.std + tts.mean).numpy(), tts.codec.sample_rate)
         prompts.append((VoiceReference(latents, case["prompt_text"], "cache", {}), wav, case["speaker"]))
     rows = []
@@ -346,16 +381,16 @@ def main():
     sampler = dict(guidance_from=args.guidance_from, cfg_rescale=args.cfg_rescale, apg_eta=args.apg_eta,
                    apg_norm=args.apg_norm, apg_momentum=args.apg_momentum, speaker_guidance=args.speaker_guidance,
                    **{name: getattr(args, name) for name in (*WINDOW_OPTIONS, *OUTPUT_OPTIONS)})
-    if tts is None and (out / "results.jsonl").exists():  # rescore: reuse the synthesis rows of the previous pass
-        previous = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines() if line.strip()]
-        rows = [{k: v for k, v in r.items() if k in {"id", "text", "speaker", "prompt", "audio", "audio_seconds", "rtf", "error", "selected_factor"}} for r in previous]
+    if previous is not None:  # rescore: reuse the synthesis rows of the previous pass
+        rows = [{k: v for k, v in r.items() if k in {"id", "text", "speaker", "prompt", "prompt_uid", "audio", "audio_seconds", "rtf", "error", "selected_factor"}} for r in previous]
         sentences = []
     elif tts is None:  # rescore an interrupted pass: rebuild the rows from the WAVs and their JSON sidecars
         for index, sentence in enumerate(sentences):
             _, prompt_wav, speaker = prompts[index % len(prompts)]
             path = out / f"{sentence['id']}.wav"
             meta = json.loads(path.with_suffix(".json").read_text()) if path.with_suffix(".json").exists() else {}
-            rows.append({**sentence, "speaker": speaker, "prompt": prompt_wav.name, "audio": str(path),
+            rows.append({**sentence, "speaker": speaker, "prompt": prompt_wav.name,
+                         "prompt_uid": cases[index % len(cases)]["prompt_uid"], "audio": str(path),
                          "audio_seconds": meta.get("audio_seconds", sf.info(str(path)).duration), "rtf": meta.get("rtf")})
         sentences = []
     rule, selector, selection_bias = parse_select_by(args.select_by), None, None
@@ -403,7 +438,8 @@ def main():
         except ValueError as error:
             rows.append({**sentence, "speaker": speaker, "error": str(error)})
             continue
-        rows.append({**sentence, "speaker": speaker, "prompt": prompt_wav.name, "audio": str(path), **extra})
+        rows.append({**sentence, "speaker": speaker, "prompt": prompt_wav.name,
+                     "prompt_uid": cases[index % len(cases)]["prompt_uid"], "audio": str(path), **extra})
     if selector is not None:
         del selector
     print(f"synthesized {len(rows)} in {time.time() - started:.0f}s", flush=True)

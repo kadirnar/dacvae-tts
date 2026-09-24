@@ -517,8 +517,9 @@ EVAL_CASES = [{"speaker": "spk", "prompt_uid": "shard/a.parquet:7", "prompt_text
 
 
 def run_eval_sentences(tmp_path, monkeypatch, *flags, texts=("Bir iki üç.", "Dört beş."), output="out",
-                       cases=EVAL_CASES, seconds=None):
-    """scripts/eval_sentences.py --rescore over WAVs of a first pass (one prompt); returns (rows, summary, out)."""
+                       cases=EVAL_CASES, seconds=None, synthesizer=None):
+    """scripts/eval_sentences.py --rescore over WAVs of a first pass (one prompt), or a synthesis pass with the
+    given `synthesizer` class; returns (rows, summary, out)."""
     import importlib.util
     from pathlib import Path
 
@@ -529,6 +530,8 @@ def run_eval_sentences(tmp_path, monkeypatch, *flags, texts=("Bir iki üç.", "D
     spec.loader.exec_module(module)
     data = SimpleNamespace(row=lambda index: {"latents": torch.zeros(5, 4)})
     monkeypatch.setattr(module, "select_cases", lambda cache, count, seed, exclude=(): (data, cases))
+    if synthesizer is not None:
+        monkeypatch.setattr(module, "Synthesizer", synthesizer)
     out = tmp_path / output
     out.mkdir(exist_ok=True)
     sentences = tmp_path / f"{output}.jsonl"
@@ -542,7 +545,8 @@ def run_eval_sentences(tmp_path, monkeypatch, *flags, texts=("Bir iki üç.", "D
         write(out / "prompt-00.wav", speech_like(48000, seed=5), 48000)
     monkeypatch.setattr(sys, "argv", [
         "eval_sentences.py", "--checkpoint", "unused.pt", "--cache", "unused", "--sentences", str(sentences),
-        "--output", str(out), "--prompts", "1", "--rescore", "--asr-device", "cpu", "--device", "cpu", *flags,
+        "--output", str(out), "--prompts", "1", *([] if synthesizer else ["--rescore"]), "--asr-device", "cpu",
+        "--device", "cpu", *flags,
     ])
     module.main()
     rows = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()]
@@ -584,4 +588,47 @@ def test_eval_sentences_freya_metric(fake_whisper, fake_transformers, tmp_path, 
         assert summary["freya_wer"] > 0 and summary["wer"] > 0 and "freya_cer" in summary
     rows, summary, _ = run_eval_sentences(tmp_path, monkeypatch, "--speaker-model", "", texts=texts, output="plain")
     assert "freya_wer" not in rows[0] and "freya_wer" not in summary  # opt-in
+
+
+OTHER_CASES = [{**EVAL_CASES[0], "speaker": "spk2", "prompt_uid": "shard/b.parquet:3"}]
+
+
+def test_eval_sentences_rescore_refuses_other_prompts(fake_whisper, tmp_path, monkeypatch):
+    """prompt-NN.wav is named by position only: a --rescore whose --seed/--prompts/--exclude-speakers select other
+    prompts than the synthesis pass must stop instead of scoring SIM against the wrong voice."""
+    fake_whisper.text = "Bir iki üç."
+    rows, _, out = run_eval_sentences(tmp_path, monkeypatch, "--speaker-model", "")
+    assert all(r["prompt_uid"] == "shard/a.parquet:7" for r in rows)
+    record = (out / "cases.json").read_text()
+    with pytest.raises(SystemExit, match="differ from .*cases.json"):
+        run_eval_sentences(tmp_path, monkeypatch, "--speaker-model", "", cases=OTHER_CASES)
+    assert (out / "cases.json").read_text() == record  # the synthesis pass's record is kept
+    (out / "cases.json").unlink()  # e.g. an output written before cases.json existed: the rows still tell
+    with pytest.raises(SystemExit, match="2 rows .* other prompts"):
+        run_eval_sentences(tmp_path, monkeypatch, "--speaker-model", "", cases=OTHER_CASES)
+    rows, _, _ = run_eval_sentences(tmp_path, monkeypatch, "--speaker-model", "")  # the right prompts still work
+    assert [r["prompt_uid"] for r in rows] == ["shard/a.parquet:7"] * 2
+
+
+def test_eval_sentences_synthesis_rewrites_prompt_wavs(fake_whisper, tmp_path, monkeypatch):
+    class StubSynthesizer:
+        def __init__(self, checkpoint, device="cpu"):
+            self.device, self.std, self.mean = "cpu", 1.0, 0.0
+            self.codec = SimpleNamespace(sample_rate=48000, decode=lambda latents: torch.full((4800,), 0.25))
+
+        def synthesize(self, text, reference=None, output=None, **kwargs):
+            write(output, speech_like(48000), 48000)
+            return SimpleNamespace(metadata={"audio_seconds": 2.0, "rtf": 0.1})
+
+    fake_whisper.text = "Bir iki üç."
+    out = tmp_path / "out"
+    out.mkdir()
+    write(out / "prompt-00.wav", speech_like(48000, seed=7), 48000)  # left by a pass with other prompts
+    rows, _, _ = run_eval_sentences(tmp_path, monkeypatch, "--speaker-model", "", cases=OTHER_CASES,
+                                    synthesizer=StubSynthesizer)
+    np.testing.assert_allclose(sf.read(str(out / "prompt-00.wav"))[0], 0.25, atol=1e-4)
+    assert [(r["prompt"], r["prompt_uid"], r["speaker"]) for r in rows] == [
+        ("prompt-00.wav", "shard/b.parquet:3", "spk2")
+    ] * 2
+    assert json.loads((out / "cases.json").read_text()) == OTHER_CASES
 
