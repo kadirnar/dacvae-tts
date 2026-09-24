@@ -17,9 +17,18 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from .config import Config
+from .contracts import sanitize, target_mask
 from .data import BucketBatchSampler, LatentDataset, collate, move_batch
 from .diagnostics import ActivationProbe, gradient_contributions, gradient_groups, loss_buckets
-from .model import FlowTTS, flow_loss, reduce_flow
+from .model import FlowTTS, flow_loss, flow_target, reduce_flow
+from .negatives import (
+    augmented_negatives,
+    delta_record,
+    delta_sums,
+    load_silence,
+    negative_distance,
+    random_negatives,
+)
 from .optim import build_optimizer
 from .parallel import device_batches, loader_options
 from .speed import NonfiniteWatch, compile_blocks, training_loader
@@ -33,6 +42,10 @@ class Objective(nn.Module):
     `expansion` > 1 is context-sharing batch expansion (SupertonicTTS, arXiv:2503.23108): every
     utterance receives several independent (time, noise) draws that share one condition encoding.
     Flow entries are then [B * expansion] while duration entries stay [B].
+
+    `contrastive_mode` picks the negatives: `text_hinge` (a one-word skip/repeat transcript, one more
+    text encoding and generator pass), `latent_delta` (corrupted target latents with the correct text,
+    target-only, see `dacvae_tts.negatives`) or `none`.
     """
 
     def __init__(
@@ -44,6 +57,14 @@ class Objective(nn.Module):
         ctc_weight=0.0,
         contrastive_weight=0.0,
         contrastive_margin=0.1,
+        contrastive_mode="text_hinge",
+        random_weight=0.2,
+        aug_weight=0.2,
+        span=(3, 125),
+        repeat_coverage=(0.2, 0.4),
+        skip_coverage=(0.4, 0.8),
+        negative_cap=0.0,
+        silence=None,
     ):
         super().__init__()
         self.model = model
@@ -51,6 +72,13 @@ class Objective(nn.Module):
         self.contrastive_weight, self.contrastive_margin = contrastive_weight, contrastive_margin
         self.time_sampling, self.expansion = time_sampling, expansion
         self.rng = random.Random(0)
+        if contrastive_mode not in {"text_hinge", "latent_delta", "none"}:
+            raise ValueError("contrastive_mode must be text_hinge, latent_delta or none")
+        self.contrastive_mode = contrastive_mode
+        # latent_delta only (see dacvae_tts.negatives); `silence` is a standardized [C] tail padding.
+        self.random_weight, self.aug_weight, self.negative_cap = random_weight, aug_weight, negative_cap
+        self.augment = dict(span=tuple(span), repeat_coverage=repeat_coverage, skip_coverage=skip_coverage)
+        self.silence = silence
 
     def negatives(self, batch):
         """Corrupted transcripts [B,S'] plus a mask of the examples that could be corrupted."""
@@ -70,6 +98,35 @@ class Objective(nn.Module):
         device = batch["tokens"].device
         return padded_tokens.to(device), padded_segments.to(device), torch.tensor(usable, device=device)
 
+    def latent_delta(self, batch, prediction, details, copies):
+        """RobustSpeechFlow/ΔFM latent negatives on the (expanded) batch, from this pass's prediction.
+
+        Returns per-row [B * expansion] tensors: the raw distances `negative_random` and `negative_aug`
+        (zero where not applied) and `latent_delta` = -λ_rand d_rand - λ_aug d_aug, which the training
+        loop adds with the flow term's own weights. Rows dropped for classifier-free guidance learn the
+        unconditional field and get no negatives; prompt and padding frames never enter a distance.
+        """
+        valid, prompt_mask = batch["valid"], batch["prompt_mask"]
+        x1, mask = sanitize(batch["latents"], valid), target_mask(valid, prompt_mask)
+        noise, time = details["noise"], details["times"]
+        positive = flow_target(self.model, x1, noise, time) if self.negative_cap > 0 else None
+        terms = {"latent_delta": torch.zeros(x1.size(0), device=x1.device)}
+        for name, weight in (("negative_random", self.random_weight), ("negative_aug", self.aug_weight)):
+            terms[name] = torch.zeros_like(terms["latent_delta"])
+            if weight == 0:
+                continue
+            negative, usable = (
+                random_negatives(x1, valid, prompt_mask, copies, self.silence)
+                if name == "negative_random"
+                else augmented_negatives(x1, valid, prompt_mask, **self.augment, fill=self.silence)
+            )
+            distance = negative_distance(
+                self.model, prediction, negative, noise, time, mask, positive, self.negative_cap
+            )
+            terms[name] = distance.masked_fill(details["drop"] | ~usable, 0)
+            terms["latent_delta"] = terms["latent_delta"] - weight * terms[name]
+        return terms
+
     def forward(self, batch):
         cached = self.model.conditions(
             batch["prompt"], batch["prompt_mask"], batch["tokens"], batch["segments"]
@@ -86,6 +143,7 @@ class Objective(nn.Module):
             cached=shared,
             time_sampling=self.time_sampling,
         )
+        prediction = details.pop("prediction")
         flow = details["flow"]
         if self.model.duration is None:
             duration_loss = flow.new_zeros(batch["latents"].size(0))
@@ -98,7 +156,7 @@ class Objective(nn.Module):
             )
             duration_loss = F.smooth_l1_loss(duration.float(), log_rate, reduction="none")
         copies = flow.numel() // duration_loss.numel()
-        if self.contrastive_weight > 0 and self.training:
+        if self.contrastive_mode == "text_hinge" and self.contrastive_weight > 0 and self.training:
             # Same audio, noise and time as each utterance's first draw, wrong transcript by one word:
             # the true transcript must explain the audio better by a margin.
             tokens, segments, usable = self.negatives(batch)
@@ -115,6 +173,9 @@ class Objective(nn.Module):
             hinge = F.relu(positive + self.contrastive_margin * positive.detach() - negative)
             hinge = hinge.masked_fill(details["drop"][::copies] | ~usable, 0)
             details["contrastive"] = hinge.repeat_interleave(copies) / copies
+        elif self.contrastive_mode == "latent_delta" and self.training:
+            # Correct text, corrupted target latents: only the regression target changes (no forward).
+            details.update(self.latent_delta(expanded, prediction, details, copies))
         total = flow + self.duration_weight * duration_loss.repeat_interleave(copies)
         return {"loss": total, "duration": duration_loss, **details}
 
@@ -346,6 +407,14 @@ def train(args):
                 ema.load_state_dict(warm["ema"])
             torch.manual_seed(cfg.train.seed + rank)
             random.seed(cfg.train.seed + rank)
+        silence = None
+        if cfg.train.contrastive_mode == "latent_delta":
+            # Tail padding of skip and short random negatives: the cache's silence latent if it has one.
+            silence = load_silence(args.cache, data.channels)
+            silence = None if silence is None else silence.to(device)
+            if rank == 0:
+                fill = "last target frame (no silence.pt)" if silence is None else "silence.pt"
+                print(json.dumps({"latent_negative_fill": fill}), flush=True)
         objective = Objective(
             model,
             cfg.train.duration_weight,
@@ -354,6 +423,14 @@ def train(args):
             cfg.train.ctc_weight,
             cfg.train.contrastive_weight,
             cfg.train.contrastive_margin,
+            contrastive_mode=cfg.train.contrastive_mode,
+            random_weight=cfg.train.contrastive_random_weight,
+            aug_weight=cfg.train.contrastive_aug_weight,
+            span=(cfg.train.contrastive_span_min, cfg.train.contrastive_span_max),
+            repeat_coverage=cfg.train.contrastive_repeat_coverage,
+            skip_coverage=cfg.train.contrastive_skip_coverage,
+            negative_cap=cfg.train.contrastive_negative_cap,
+            silence=silence,
         ).train()
         raw_objective = objective  # compile/DDP wrap the module; helper methods stay reachable here
         eager_forward = model.forward
@@ -480,6 +557,7 @@ def train(args):
                 group["lr"] = learning_rate
             optimizer.zero_grad(set_to_none=True)
             metrics = torch.zeros(5, device=device)
+            negative_metrics = torch.zeros(5, device=device)  # latent_delta only, see delta_sums
             buckets = torch.zeros(9, 2, device=device)
             diagnostics = {}
             diagnose = cfg.train.diagnostics_every > 0 and step % cfg.train.diagnostics_every == 0
@@ -505,6 +583,11 @@ def train(args):
                         auxiliary = raw_objective.auxiliary(losses)
                         if auxiliary is not None:
                             loss = loss + auxiliary.sum() * world / flow_examples
+                        if "latent_delta" in losses:
+                            # The flow term's own weights and denominator: per frame the objective stays
+                            # a convex quadratic in the prediction (see dacvae_tts.negatives).
+                            delta = (losses["latent_delta"] * flow_weights).sum()
+                            loss = loss + delta * world / flow_denominator
                     if probe is not None:
                         diagnostics["activation_max_abs"] = probe.close()
                         if model.grad_checkpoint == "selective":
@@ -540,6 +623,8 @@ def train(args):
                         else losses["flow"].new_zeros(()),
                     ]
                 )
+                if "latent_delta" in losses:
+                    negative_metrics += delta_sums(losses, flow_weights)
             norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             if watch is not None:
                 watch.note("gradient", norm, step)
@@ -561,6 +646,8 @@ def train(args):
                 if world > 1:
                     dist.all_reduce(metrics)
                     dist.all_reduce(buckets)
+                    if cfg.train.contrastive_mode == "latent_delta":
+                        dist.all_reduce(negative_metrics)
                 if rank == 0:
                     record = {
                         "step": step + 1,
@@ -584,6 +671,8 @@ def train(args):
                         "time_and_length_buckets_sum_count": buckets.cpu().tolist(),
                         "diagnostics_rank0": diagnostics,
                     }
+                    if cfg.train.contrastive_mode == "latent_delta":
+                        record.update(delta_record(negative_metrics, flow_denominator))
                     print(json.dumps(record), flush=True)
                     with open(out / "train.jsonl", "a") as stream:
                         stream.write(json.dumps(record) + "\n")

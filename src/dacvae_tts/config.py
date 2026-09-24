@@ -104,6 +104,17 @@ class TrainConfig:
     text_pad_multiple: int = 1  # the same for transcript tokens
     loader_negatives: bool = False  # draw the contrastive text negatives in the loader workers
     compile_dynamic: str = "batch"  # compile: blocks -- batch (only batch dim symbolic) or auto
+    # Negatives. text_hinge: the transcript hinge above (contrastive_weight/margin; one more text encoding
+    # and generator pass, ~20-25% compute). latent_delta: RobustSpeechFlow/ΔFM corrupted target latents
+    # with the correct text, L_pos - λ_rand L_rand - λ_aug L_aug, target-only (dacvae_tts.negatives).
+    contrastive_mode: str = "text_hinge"  # text_hinge | latent_delta | none
+    contrastive_random_weight: float = 0.2  # latent_delta: λ_rand, another utterance's target latents
+    contrastive_aug_weight: float = 0.2  # latent_delta: λ_aug, spans repeated or skipped in the target
+    contrastive_span_min: int = 3  # latent_delta edit span in frames (paper: 0.1-5 s; 25 fps)
+    contrastive_span_max: int = 125
+    contrastive_repeat_coverage: tuple = (0.2, 0.4)  # share of the target a repeat negative overwrites
+    contrastive_skip_coverage: tuple = (0.4, 0.8)  # share a skip negative removes (tail -> silence)
+    contrastive_negative_cap: float = 0.0  # 0: plain subtraction; >0: distance <= cap x target gap
 
     def __post_init__(self):
         if self.worker_threads < 1 or self.prefetch_factor < 1:
@@ -157,6 +168,22 @@ class TrainConfig:
             raise ValueError("pad_multiple and text_pad_multiple must be positive integers")
         if self.compile_dynamic not in {"batch", "auto"}:
             raise ValueError("compile_dynamic must be batch or auto")
+        if self.contrastive_mode not in {"text_hinge", "latent_delta", "none"}:
+            raise ValueError("contrastive_mode must be text_hinge, latent_delta or none")
+        weights = (self.contrastive_random_weight, self.contrastive_aug_weight)
+        if min(*weights, self.contrastive_negative_cap) < 0:
+            raise ValueError("latent negative weights and cap must be nonnegative")
+        if sum(weights) >= 1 and not self.contrastive_negative_cap:
+            # Below 1 each frame's objective is a convex quadratic in the prediction: bounded below.
+            raise ValueError("Uncapped latent negative weights must sum below 1")
+        if not 1 <= self.contrastive_span_min <= self.contrastive_span_max:
+            raise ValueError("latent negative spans need 1 <= contrastive_span_min <= contrastive_span_max")
+        # YAML gives lists, defaults are tuples: normalize so resume's config comparison matches.
+        self.contrastive_repeat_coverage = tuple(self.contrastive_repeat_coverage)
+        self.contrastive_skip_coverage = tuple(self.contrastive_skip_coverage)
+        for pair in (self.contrastive_repeat_coverage, self.contrastive_skip_coverage):
+            if len(pair) != 2 or not 0 < pair[0] <= pair[1] < 1:
+                raise ValueError("latent negative coverages must be [low, high] with 0 < low <= high < 1")
 
 
 @dataclass

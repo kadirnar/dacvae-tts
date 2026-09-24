@@ -1,0 +1,70 @@
+# Experimental; quality has not been established (issue #8).
+# nano_tr_w512 with RobustSpeechFlow/ΔFM latent negatives (arXiv:2605.22083, arXiv:2506.05350) in place
+# of the transcript hinge: the correct text with corrupted target latents, loss
+# L_pos - 0.2 L_rand - 0.2 L_aug. Only the regression target changes, so there is no second text
+# encoding or generator pass (the hinge costs ~20-25% per step). Everything else is nano_tr_w512.
+#
+# A/B at equal wall-clock (20k updates of the hinge arm): the same file with
+#   contrastive_mode: text_hinge   (baseline: skip/repeat transcript hinge, contrastive_weight 0.2)
+#   contrastive_mode: latent_delta (this file)
+#   contrastive_mode: none         (no negatives)
+# Logs: `latent_delta` (added to `flow` it is the optimized flow objective), `negative_random` and
+# `negative_aug` (mean distances of the prediction from the negative targets over the rows that had
+# one; they should grow above `flow`) and their `*_coverage` shares. Skip negatives pad their tail with
+# the cache's `silence.pt` when present, otherwise with each row's last target frame (see the
+# `latent_negative_fill` line at start-up).
+model:
+  width: 512
+  depth: 12
+  heads: 8
+  text_depth: 4
+  text_attention: 4
+  patch_size: 1
+  latent_dim: 128
+  positions: rope
+  qk_norm: true
+  prediction: edm
+  text_layout: joined
+  duration: rule
+  cond_dropout: 0.2
+  ctc_layer: 8
+  adaln_rank: 64
+train:
+  steps: 60000
+  batch_size: 96
+  accumulation: 1
+  learning_rate: 0.0008
+  warmup: 2000
+  weight_decay: 0.01
+  optimizer: muon
+  muon_momentum: 0.95
+  ema_decay: 0.9999
+  precision: bf16
+  workers: 4
+  prefetch_factor: 4
+  checkpoint_every: 1000
+  keep_every: 5000
+  validate_every: 1000
+  log_every: 100
+  grad_checkpoint: true
+  compile: false
+  seed: 42
+  flow_reduction: frame
+  pairing: within
+  prompt_fraction_min: 0.1
+  prompt_fraction_max: 0.6
+  prompt_dropout: 0.3
+  time_sampling: logit_normal
+  batch_expansion: 4
+  ctc_weight: 0.1
+  contrastive_weight: 0.2    # text_hinge only; unused by latent_delta
+  contrastive_margin: 0.1    # text_hinge only
+  wandb_project: dacvae-tts-tr
+  contrastive_mode: latent_delta
+  contrastive_random_weight: 0.2   # λ_rand (paper)
+  contrastive_aug_weight: 0.2      # λ_aug (paper); weights must sum below 1 unless capped
+  contrastive_span_min: 3          # edit spans 0.1-5 s at 25 fps (paper)
+  contrastive_span_max: 125
+  contrastive_repeat_coverage: [0.2, 0.4]  # share of the target overwritten by repeats (paper)
+  contrastive_skip_coverage: [0.4, 0.8]    # share removed by skips, tail padded with silence (paper)
+  contrastive_negative_cap: 0.0    # plain subtraction; bounded because 0.2 + 0.2 < 1
