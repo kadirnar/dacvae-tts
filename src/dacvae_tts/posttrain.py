@@ -46,9 +46,15 @@ def representation_id(checkpoint):
     return digest.hexdigest()
 
 
+def model_layout(cfg):
+    """The transcript layout the model was trained with, for the cross-paired rows of these tools: a joined-layout
+    model (every Turkish config) reads [BOS ref SPACE target EOS] with one segment, never [BOS ref SEP target EOS]."""
+    return {"layout": cfg.text_layout}
+
+
 def candidates(args):
     tts = Synthesizer(args.checkpoint, args.device, args.precision, codec_options=backend_options(args))
-    dataset = LatentDataset(args.cache, args.split)
+    dataset = LatentDataset(args.cache, args.split, **model_layout(tts.model.cfg))
     check_compatibility(dataset.meta, tts.checkpoint["codec"])
     if not torch.equal(dataset.mean, tts.mean.cpu()) or not torch.equal(dataset.std, tts.std.cpu()):
         raise ValueError("Candidate cache and model must use the same training statistics")
@@ -234,7 +240,7 @@ def distill_cache(args):
     if args.teacher_steps % args.student_steps or args.student_steps < 1:
         raise ValueError("teacher-steps must be divisible by student-steps")
     tts = Synthesizer(args.checkpoint, args.device, args.precision, codec_options=backend_options(args))
-    data = LatentDataset(args.cache, "train")
+    data = LatentDataset(args.cache, "train", **model_layout(tts.model.cfg))
     check_compatibility(data.meta, tts.checkpoint["codec"])
     if not torch.equal(data.mean, tts.mean.cpu()) or not torch.equal(data.std, tts.std.cpu()):
         raise ValueError("Teacher and cache statistics differ")
@@ -341,7 +347,7 @@ def post_train(args):
         model.train()
         model.grad_checkpoint = args.grad_checkpoint
         identity = representation_id(saved)
-        real = LatentDataset(args.cache, "train", args.seed)
+        real = LatentDataset(args.cache, "train", args.seed, **model_layout(model.cfg))
         check_compatibility(real.meta, saved["codec"])
         if not torch.equal(real.mean, saved["mean"]) or not torch.equal(real.std, saved["std"]):
             raise ValueError("Replay cache differs from pretraining statistics")

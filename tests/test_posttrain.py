@@ -6,7 +6,7 @@ import torch
 from dacvae_tts.config import Config, ModelConfig, TrainConfig
 from dacvae_tts.data import LatentDataset, collate
 from dacvae_tts.model import FlowTTS, sample
-from dacvae_tts.posttrain import DistillObjective, PreferenceObjective, representation_id
+from dacvae_tts.posttrain import DistillObjective, PreferenceObjective, model_layout, representation_id
 
 
 def test_preference_and_distill_backward(cache):
@@ -145,3 +145,15 @@ def test_preference_and_distill_cli(cache, tmp_path):
         assert result.returncode == 0, result.stderr
         result = torch.load(output / f"{mode}-000002.pt", weights_only=True)
         assert result["stage"] == mode
+
+
+def test_posttrain_rows_use_the_model_text_layout(cache):
+    # candidates/distill_cache/replay rows are cross pairs; a joined-layout model must get [BOS ref SPACE target EOS]
+    # in one segment, as in training, not the segments layout [BOS ref SEP target EOS] with segments 0/1.
+    from dacvae_tts.text import SEP
+
+    joined = ModelConfig(latent_dim=4, width=16, heads=2, text_layout="joined", duration="rule")
+    batch = collate([LatentDataset(cache, "train", **model_layout(joined))[0]])
+    assert (batch["segments"] == 1).all() and not (batch["tokens"] == SEP).any()
+    segments = collate([LatentDataset(cache, "train", **model_layout(ModelConfig(latent_dim=4, width=16, heads=2)))[0]])
+    assert (segments["tokens"] == SEP).any() and (segments["segments"] == 0).any()
