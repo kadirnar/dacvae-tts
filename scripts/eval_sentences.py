@@ -194,12 +194,17 @@ def check_rescore_prompts(out, cases, rows=()):
         )
 
 
+HF_WHISPER_SECONDS = 30.0  # WhisperFeatureExtractor pads or truncates every clip to one 30 s window
+
+
 def score_hf(rows, out, args, protocol=None, originals=None):
     """Batched GPU scoring: transformers Whisper (greedy) for WER/CER, WavLM-SV similarity and DNSMOS per clip.
 
     With a protocol, ASR sees the protocol's input (trailing-silence trim / 8 kHz band limit) and each row gets the
     protocol extras; decoding stays greedy (already deterministic, `--asr-deterministic` concerns faster-whisper).
-    Returns (rows, protocol identity or None).
+    Whisper hears only the first 30 s of a clip here: longer rows are flagged with `asr_truncated_seconds` (their
+    WER counts the cut words as deletions) and a warning suggests the faster-whisper backend, which transcribes
+    long audio in windows. Returns (rows, protocol identity or None).
     """
     from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
@@ -227,6 +232,11 @@ def score_hf(rows, out, args, protocol=None, originals=None):
     good = [r for r in rows if "error" not in r]
     audios = {r["audio"]: read_audio(r["audio"], 16000) for r in good}
     asr_inputs = {k: scorer.asr_audio(a) if scorer else (a, {}) for k, a in audios.items()}
+    truncated = {k: round(len(a) / 16000 - HF_WHISPER_SECONDS, 3) for k, (a, _) in asr_inputs.items()
+                 if len(a) > HF_WHISPER_SECONDS * 16000}
+    if truncated:
+        print(f"warning: {len(truncated)} clips are longer than {HF_WHISPER_SECONDS:g} s; --asr-backend hf transcribes "
+              "only their first 30 s (rows flagged asr_truncated_seconds; use --asr-backend faster-whisper)", flush=True)
     hypotheses = {}
     for start in range(0, len(good), args.asr_batch):
         chunk = good[start : start + args.asr_batch]
@@ -252,6 +262,8 @@ def score_hf(rows, out, args, protocol=None, originals=None):
         similarity = float((evaluator.embedding(audio) * prompt_embeddings[r["prompt"]]).sum())
         record = {**r, **counts, "hypothesis": hypotheses[r["audio"]], "speaker_similarity": similarity, "asr_backend": "hf-greedy",
                   "evaluator": identity}
+        if r["audio"] in truncated:
+            record["asr_truncated_seconds"] = truncated[r["audio"]]
         if args.freya_metric:
             record.update(freya_error_counts(r["text"], hypotheses[r["audio"]], normalization))
         if dnsmos is not None:
@@ -458,11 +470,15 @@ def main():
                 scored.append(row)
                 continue
             original = originals(row["prompt"])
-            score = evaluator.score(row["audio"], row["text"], out / row["prompt"], original_prompt=original,
-                                    codec_prompt=out / row["prompt"])
-            extra = {"prompt_original": str(original)} if protocol is not None and original else {}
-            if args.freya_metric:
-                extra.update(freya_error_counts(row["text"], score["hypothesis"], evaluator.metric_normalization))
+            try:  # one bad row (empty reference after normalization, empty audio) must not discard the others
+                score = evaluator.score(row["audio"], row["text"], out / row["prompt"], original_prompt=original,
+                                        codec_prompt=out / row["prompt"])
+                extra = {"prompt_original": str(original)} if protocol is not None and original else {}
+                if args.freya_metric:
+                    extra.update(freya_error_counts(row["text"], score["hypothesis"], evaluator.metric_normalization))
+            except (RuntimeError, ValueError, OSError) as error:
+                scored.append({**row, "error": f"score: {error}"[:300]})
+                continue
             scored.append({**row, **score, "evaluator": evaluator.row_identity, **extra})
     for row in scored:
         if "error" not in row:
@@ -486,6 +502,7 @@ def main():
         select_by=args.select_by if args.candidates > 1 else None, selection_judge_overlap=selection_bias,
         utmos_model=utmos_models(protocol) or None,  # the means are `utmos` / `utmosv2` (summarize)
         sentences=str(args.sentences), prompts=len(prompts),
+        asr_truncated=sum("asr_truncated_seconds" in r for r in good) if args.asr_backend == "hf" else None,
     )
     if protocol is not None:
         summary.update(protocol=protocol_identity, prompt_audio=args.prompt_audio)

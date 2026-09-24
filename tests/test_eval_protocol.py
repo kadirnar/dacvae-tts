@@ -650,3 +650,25 @@ def test_seedtts_normalization_deletes_punctuation_like_upstream():
     assert normalize("e.g. U.S.A.") == "eg usa"
     assert len(module.HANZI_PUNCTUATION) == 82 and "\u3002" in module.HANZI_PUNCTUATION
 
+
+def test_eval_sentences_keeps_scoring_after_a_bad_row(fake_whisper, tmp_path, monkeypatch):
+    """A row that cannot be scored (here: a reference with no word after normalization) is an error row; the
+    other rows are still scored and written."""
+    fake_whisper.text = "Bir iki üç."
+    rows, summary, out = run_eval_sentences(tmp_path, monkeypatch, "--speaker-model", "", texts=("Bir iki üç.", "…"))
+    assert rows[0]["wer"] == 0 and "error" not in rows[0]
+    assert rows[1]["error"].startswith("score: Reference transcript is empty") and "wer" not in rows[1]
+    assert summary["failed"] == 1 and summary["count"] == 1 and summary["asr_truncated"] is None
+
+
+def test_eval_sentences_hf_flags_clips_whisper_truncates(fake_whisper, fake_transformers, tmp_path, monkeypatch,
+                                                         capsys):
+    fake_whisper.text = "Bir iki üç."
+    rows, summary, _ = run_eval_sentences(tmp_path, monkeypatch, "--asr-backend", "hf", texts=("Bir iki üç.",),
+                                          seconds=31.0, output="long")
+    assert rows[0]["asr_truncated_seconds"] == pytest.approx(2.0)  # 31 s of tone + 1 s of silence
+    assert summary["asr_truncated"] == 1 and "--asr-backend hf transcribes only" in capsys.readouterr().out
+    rows, summary, _ = run_eval_sentences(tmp_path, monkeypatch, "--asr-backend", "hf", texts=("Bir iki üç.",),
+                                          output="short")
+    assert "asr_truncated_seconds" not in rows[0] and summary["asr_truncated"] == 0
+
