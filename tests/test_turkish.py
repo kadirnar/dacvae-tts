@@ -76,6 +76,10 @@ V1_PINS = {
     "Prof.Dr. Ahmet": "Prof.Dr. Ahmet",
     "Öğr.Gör. Ali": "Öğr.Gör. Ali",
     "3.30'a": "üç nokta otuza",
+    "14:00'te": "on dört sıfır sıfırte",
+    "11.30'da": "on bir nokta otuzda",
+    "15.07.2016": "on beş nokta sıfır yedi.iki bin on altı",
+    "-5 derece": "-beş derece",
     "21.yüzyıl": "yirmi bir.yüzyıl",
     "e-posta": "e-posta",
 }
@@ -128,6 +132,15 @@ def test_turkish_v1_outputs_are_pinned(raw, v1):
         ("6'ıncısı", "altıncısı"),
         ("4'üncüsü", "dördüncüsü"),
         ("2'nci", "ikinci"),
+        # Dates, clock times and minus signs are read as the synthesis frontend reads them.
+        ("14:00'te", "on dörtte"),
+        ("11.30'da", "on bir otuzda"),
+        ("saat 09.05", "saat dokuz sıfır beş"),
+        ("15.07.2016", "on beş temmuz iki bin on altı"),
+        ("15.07.2016'da", "on beş temmuz iki bin on altıda"),
+        ("-5 derece", "eksi beş derece"),
+        ("3-4 milyar", "üç dört milyar"),
+        ("3.5 puan", "üç nokta beş puan"),
         # Issue #5 table: abbreviations are expanded.
         ("T.C. vatandaşıyım.", "te ce vatandaşıyım."),
         ("Koç Holding A.Ş.", "Koç Holding anonim şirketi."),
@@ -158,6 +171,15 @@ def test_turkish_v1_outputs_are_pinned(raw, v1):
 def test_turkish_v2_softening_and_abbreviations(raw, v2):
     assert normalize_turkish_v2(raw) == v2
     assert normalize(raw, "turkish-v2") == v2
+
+
+def test_turkish_v2_training_text_matches_the_frontend():
+    """Labels say what the model is given at inference: speakable() rewrites clocks, dates and signs the same way."""
+    from dacvae_tts.frontend import speakable
+
+    for raw in ("Toplantı 14:00'te başladı.", "Saat 11.30'da geldi.", "15.07.2016 tarihinde -5 derece ölçüldü.",
+                "Saat 09:05'te çıktık."):
+        assert normalize_turkish_v2(raw) == speakable(raw)[0]
 
 
 def test_turkish_v2_is_v1_elsewhere_and_pins_its_abbreviations():

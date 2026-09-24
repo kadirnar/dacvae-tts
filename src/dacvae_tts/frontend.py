@@ -16,10 +16,13 @@ from dataclasses import dataclass, field
 
 from .turkish import (
     ABBREVIATIONS,
+    DATE,
     LATIN_EXTRA,
+    MINUS,
     PUNCTUATION,
     abbreviation_rules,
     ordinal_words,
+    spoken_date,
     tr_lower,
     tr_title,
     tr_upper,
@@ -28,7 +31,6 @@ from .turkish import (
 LETTERS = "a-zA-ZçğıöşüâîûÇĞİÖŞÜÂÎÛ"
 UPPER = "A-ZÇĞİÖŞÜÂÎÛ"
 VOWELS = set("aeıioöuüâîûAEIİOÖUÜÂÎÛ")
-MONTHS = ["ocak", "şubat", "mart", "nisan", "mayıs", "haziran", "temmuz", "ağustos", "eylül", "ekim", "kasım", "aralık"]
 # Letter names used when an acronym is spelled out ("ABD" -> "a be de", "CHP" -> "ce ha pe", "PKK" -> "pe ka ka").
 LETTER_NAMES = {
     "A": "a", "B": "be", "C": "ce", "Ç": "çe", "D": "de", "E": "e", "F": "fe", "G": "ge", "Ğ": "yumuşak ge",
@@ -196,13 +198,7 @@ def prepare_text(text):
     text = r.sub(rf"\b([{LETTERS}0-9-]+)\.(com|net|org|ai|io|co|gov|edu|tr|de|uk)(\.tr)?(/\S*)?",
                  lambda m: m.group(1) + " nokta " + m.group(2) + (" nokta tr" if m.group(3) else ""), text, "adres")
     # Dates: 23.09.2026, 23/09/2026, 23-09-2026 -> 23 eylül 2026 (the year keeps its suffix: 2026'da).
-    def date(m):
-        day, month = int(m.group(1)), int(m.group(2))
-        if not (1 <= day <= 31 and 1 <= month <= 12):
-            return m.group(0)
-        return f"{day} {MONTHS[month - 1]} {m.group(3)}"
-
-    text = r.sub(r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{4})\b", date, text, "tarih")
+    text = r.sub(DATE, spoken_date, text, "tarih")
     # Clock times written with a dot or with a leading zero: 09.30'da -> 9 30'da, 14:00 -> 14, 14:05 -> 14 sıfır 5.
     def clock(m):
         hour, minute = int(m.group(2)), int(m.group(3))
@@ -247,7 +243,7 @@ def prepare_text(text):
     text = r.sub(r"(\d)\s*/\s*(\d)", r"\1 bölü \2", text, "bölü")
     text = r.sub(rf"([{LETTERS}])/([{LETTERS}])", r"\1 \2", text, "eğik çizgi")
     # Negative numbers and approximate values.
-    text = r.sub(r"(?<![\w\d])-(?=\d)", "eksi ", text, "eksi")
+    text = r.sub(MINUS, "eksi ", text, "eksi")
     # Phone-style groups with a leading zero read as "sıfır beş yüz otuz iki".
     text = r.sub(r"(?<![\d.,])0(\d{3})(?=\s\d{3}\b)", r"sıfır \1", text, "telefon")
     # Numbered items at a line or sentence start: "1. Madde" -> "birinci Madde" (turkish-v1 only reads an ordinal

@@ -116,6 +116,19 @@ def _int_words(s):
 
 LETTER = "a-zA-ZçğıöşüâîûÇĞİÖŞÜÂÎÛ"
 UPPER = "A-ZÇĞİÖŞÜÂÎÛ"
+MONTHS = ["ocak", "şubat", "mart", "nisan", "mayıs", "haziran", "temmuz", "ağustos", "eylül", "ekim", "kasım", "aralık"]
+# Shared by the synthesis frontend and the turkish-v2 training text: 23.09.2026 / 23/09/2026 / 23-09-2026 and a minus
+# sign before a number ("-5 derece"; a hyphen after a word or digit is a range or a compound: 3-4, COVID-19).
+DATE = re.compile(r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{4})\b")
+MINUS = re.compile(r"(?<![\w\d])-(?=\d)")
+
+
+def spoken_date(match):
+    """DATE match -> "23 eylül 2026" (the year keeps its suffix: 2026'da); an impossible day or month stays."""
+    day, month = int(match.group(1)), int(match.group(2))
+    if not (1 <= day <= 31 and 1 <= month <= 12):
+        return match.group(0)
+    return f"{day} {MONTHS[month - 1]} {match.group(3)}"
 
 
 def abbreviation_rules(table):
@@ -214,9 +227,10 @@ def check_script(text):
 def normalize_turkish(text, version="turkish-v1"):
     """Turkish transcript -> model text: NFKC, numbers as words, script check, whitespace.
 
-    `turkish-v2` also expands SAFE_ABBREVIATIONS (T.C. -> te ce, A.Ş. -> anonim şirketi), softens "dört" before
-    a vowel suffix (4'e -> dörde) and reads ordinals with further suffixes (2'incisi -> ikincisi); everything else
-    is byte-identical to `turkish-v1`.
+    `turkish-v2` also expands SAFE_ABBREVIATIONS (T.C. -> te ce, A.Ş. -> anonim şirketi), reads dates, clock times
+    and minus signs as the synthesis frontend does (`dates_clocks_and_signs`: 14:00'te -> on dörtte, 15.07.2016 ->
+    on beş temmuz iki bin on altı, -5 -> eksi beş), softens "dört" before a vowel suffix (4'e -> dörde) and reads
+    ordinals with further suffixes (2'incisi -> ikincisi); everything else is byte-identical to `turkish-v1`.
     """
     if version not in {"turkish-v1", "turkish-v2"}:
         raise ValueError(f"Unknown Turkish normalization version: {version}")
@@ -226,6 +240,7 @@ def normalize_turkish(text, version="turkish-v1"):
     text = text.replace("‘", "'").replace("’", "'").replace("–", "-").replace("—", "-").replace("…", "...")
     if v2:
         text = expand_safe_abbreviations(text)
+        text = dates_clocks_and_signs(text)
     text = normalize_numbers(text, v2=v2)
     text = re.sub(r"\s+([.,;:!?])", r"\1", text)  # "kelime ." -> "kelime."
     text = re.sub(r"\s+", " ", text).strip()
@@ -317,6 +332,20 @@ def _clock(match):
     if hour > 24 or minute > 59:
         return match.group(0)
     return f"{match.group(1)}{hour}" + ("" if minute == 0 else f" {match.group(3)}")
+
+
+def dates_clocks_and_signs(text):
+    """turkish-v2 training text: dates, clock times and minus signs spoken the way the frontend writes them.
+
+    The model reads `frontend.speakable` output at inference, where "14:00'te" is "on dörtte" and "-5" is
+    "eksi beş"; turkish-v1 labels say "on dört sıfır sıfırte" and "-beş". Dates use the frontend's DATE rule
+    (15.07.2016 -> 15 temmuz 2016), clock times the `turkish-v2` metric rules (saat 3.30 -> saat 3 30,
+    11.30'da -> 11 30'da, 14:00'te -> 14'te, 09:05 -> 9 05) and a minus sign before a number becomes "eksi".
+    """
+    text = DATE.sub(spoken_date, text)
+    for rule in ("clock_saat", "clock_suffix", "clock_colon"):
+        text = _METRIC_RULES[rule].sub(_clock, text)
+    return MINUS.sub("eksi ", text)
 
 
 def _fold_marks(text):
