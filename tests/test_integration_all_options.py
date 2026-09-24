@@ -355,3 +355,34 @@ def test_model_guidance_composes_with_latent_negatives_not_the_text_hinge():
     expected = per_example_mse(prediction, target, mask).masked_fill(details["drop"] | ~usable, 0)
     assert torch.allclose(losses["negative_random"], expected, rtol=1e-5, atol=1e-6)
     assert torch.allclose(losses["latent_delta"], -0.2 * expected, rtol=1e-5, atol=1e-6)
+
+
+def test_decay_phase_loader_keeps_every_data_option(cache, tmp_path):
+    """#14 x #7/#10/#11: the WSD decay-cache loader is built like the main one (pair options, teacher
+    stores, padding, char CTC labels), normalized with the main statistics, silence frame included."""
+    import shutil
+
+    from dacvae_tts.config import Config
+    from dacvae_tts.data import LatentDataset, save_stats
+    from dacvae_tts.speed import TrainCollate
+    from dacvae_tts.training import decay_phase_loader
+
+    raw = write_silence(cache)
+    decay = tmp_path / "decay"
+    shutil.copytree(cache, decay)
+    save_stats(decay / "stats.pt", 10, torch.full((4,), 5.0).double(), torch.full((4,), 40.0).double())
+    cfg = Config(
+        ModelConfig(latent_dim=4, width=16, heads=2, depth=2, text_depth=1, text_layout="joined", duration="rule",
+                    ctc_layer=1, ctc_targets="chars"),
+        TrainConfig(steps=10, warmup=1, batch_size=4, workers=0, pairing="within", cross_prompt_prob=0.5,
+                    cross_prompt_max_seconds=0.5, tail_silence_prob=1.0, pad_multiple=8, text_pad_multiple=8,
+                    lr_schedule="wsd", decay_cache=str(decay)),
+    )
+    main = LatentDataset(cache, "train", pairing="within", layout="joined", tail_silence_prob=1.0)
+    sampler, loader = decay_phase_loader(str(decay), main, cfg, 0, 1, 0, torch.device("cpu"))
+    data = loader.dataset
+    assert torch.equal(data.mean, main.mean) and torch.equal(data.silence, (raw - main.mean) / main.std)
+    assert data.cross_prompt_prob == 0.5 and sampler.epoch_costs is not None
+    assert isinstance(loader.collate_fn, TrainCollate)
+    batch = next(iter(loader))
+    assert batch["valid"].size(1) % 8 == 0 and batch["tokens"].size(1) % 8 == 0 and "ctc_targets" in batch

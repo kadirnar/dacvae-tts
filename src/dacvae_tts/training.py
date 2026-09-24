@@ -22,6 +22,7 @@ from .codec import check_compatibility
 from .config import Config
 from .contracts import sanitize, target_mask
 from .data import BucketBatchSampler, LatentDataset, collate, move_batch
+from .data import load_silence as raw_silence
 from .diagnostics import ActivationProbe, gradient_contributions, gradient_groups, loss_buckets
 from .model import FlowTTS, flow_loss, flow_target, reduce_flow
 from .negatives import (
@@ -349,13 +350,10 @@ def time_sampling_at(step, train):
     return train.final_time_sampling if step >= first else train.time_sampling
 
 
-def decay_phase_loader(cache, reference, cfg, rank, world, frame_budget, device):
-    """Sampler and loader over the WSD decay cache, built like the main training loader.
-
-    Latents are normalized with the main cache's statistics, so the latent space does not shift at the
-    switch and the checkpoint's mean/std stay valid for inference; the codec metadata must match.
-    """
-    data = LatentDataset(
+def training_dataset(cache, cfg):
+    """The training split of `cache` with every data option of `cfg`: the pairing, the training-pair options
+    (#11) and the teacher stores (#10, relative store paths resolve against `cache`)."""
+    return LatentDataset(
         cache,
         "train",
         cfg.train.seed,
@@ -363,15 +361,18 @@ def decay_phase_loader(cache, reference, cfg, rank, world, frame_budget, device)
         pairing=cfg.train.pairing,
         layout=cfg.model.text_layout,
         prompt_fraction=(cfg.train.prompt_fraction_min, cfg.train.prompt_fraction_max),
+        **pair_options(cfg),
+        **teacher_sources(cfg.train, cache),
     )
-    if not data.meta.get("merged"):
-        raise ValueError("Run merge on the decay cache before training")
-    check_compatibility(data.meta, reference.meta)
-    if data.channels != reference.channels:
-        raise ValueError("The decay cache has a different latent width")
-    data.mean, data.std = reference.mean, reference.std
+
+
+def training_batches(data, cfg, rank, world, frame_budget, device):
+    """Sampler and loader of a training dataset: the throughput options of #7 (length padding, loader-side
+    negatives, padded sampler costs) and #11's exact per-epoch cross-prompt costs. With the defaults this is
+    the plain bucket sampler over `data.costs` and `collate`."""
+    items, train_collate, costs = training_loader(data, cfg.train)
     sampler = BucketBatchSampler(
-        data.costs,
+        costs,
         cfg.train.batch_size,
         rank,
         world,
@@ -379,11 +380,13 @@ def decay_phase_loader(cache, reference, cfg, rank, world, frame_budget, device)
         frame_budget,
         speaker_counts=data.group_end - data.group_start,
         speaker_balance=cfg.train.speaker_balance,
+        # Exact per-epoch lengths of cross prompts, rounded up like `costs` when pad_multiple > 1.
+        epoch_costs=training_epoch_costs(data, cfg.train),
     )
     loader = DataLoader(
-        data,
+        items,
         batch_sampler=sampler,
-        collate_fn=collate,
+        collate_fn=train_collate,
         **loader_options(
             cfg.train.workers,
             device,
@@ -394,6 +397,28 @@ def decay_phase_loader(cache, reference, cfg, rank, world, frame_budget, device)
         generator=torch.Generator().manual_seed(cfg.train.seed + rank),
     )
     return sampler, loader
+
+
+def decay_phase_loader(cache, reference, cfg, rank, world, frame_budget, device):
+    """Sampler and loader over the WSD decay cache, built exactly like the main training loader (the same
+    pair, teacher and throughput options; see `training_dataset` and `training_batches`).
+
+    Latents are normalized with the main cache's statistics, so the latent space does not shift at the
+    switch and the checkpoint's mean/std stay valid for inference; the codec metadata must match. The
+    encoded-silence frame of tail silence / quiet cuts (#11) is re-standardized with the same statistics.
+    Teacher stores given as relative paths are looked up in the decay cache, which needs its own
+    extraction (or absolute store paths covering its rows).
+    """
+    data = training_dataset(cache, cfg)
+    if not data.meta.get("merged"):
+        raise ValueError("Run merge on the decay cache before training")
+    check_compatibility(data.meta, reference.meta)
+    if data.channels != reference.channels:
+        raise ValueError("The decay cache has a different latent width")
+    data.mean, data.std = reference.mean, reference.std
+    if data.silence is not None:
+        data.silence = (raw_silence(cache, data.meta) - data.mean) / data.std
+    return training_batches(data, cfg, rank, world, frame_budget, device)
 
 
 def rng_state(device):
@@ -502,47 +527,13 @@ def train(args):
             layout=cfg.model.text_layout,
             prompt_fraction=(cfg.train.prompt_fraction_min, cfg.train.prompt_fraction_max),
         )
-        data = LatentDataset(
-            args.cache,
-            "train",
-            cfg.train.seed,
-            prompt_dropout=cfg.train.prompt_dropout,
-            **pairing,
-            **pair_options(cfg),
-            **teacher_sources(cfg.train, args.cache),
-        )
+        data = training_dataset(args.cache, cfg)
         if not data.meta.get("merged"):
             raise ValueError("Run merge on all prepared partitions before training")
         if cfg.model.latent_dim != data.channels:
             raise ValueError(f"Config latent_dim={cfg.model.latent_dim}, codec cache has {data.channels}")
         # Defaults: (data, collate, data.costs). Padding/loader negatives change collate and costs.
-        items, train_collate, costs = training_loader(data, cfg.train)
-        sampler = BucketBatchSampler(
-            costs,
-            cfg.train.batch_size,
-            rank,
-            world,
-            cfg.train.seed,
-            args.frame_budget,
-            speaker_counts=data.group_end - data.group_start,
-            speaker_balance=cfg.train.speaker_balance,
-            # Exact per-epoch lengths of cross prompts, rounded up like `costs` when pad_multiple > 1.
-            epoch_costs=training_epoch_costs(data, cfg.train),
-        )
-        loader_rng = torch.Generator().manual_seed(cfg.train.seed + rank)
-        loader = DataLoader(
-            items,
-            batch_sampler=sampler,
-            collate_fn=train_collate,
-            **loader_options(
-                cfg.train.workers,
-                device,
-                cfg.train.prefetch_factor,
-                cfg.train.worker_threads,
-                cfg.train.loader_start_method,
-            ),
-            generator=loader_rng,
-        )
+        sampler, loader = training_batches(data, cfg, rank, world, args.frame_budget, device)
         decay_loader = None
         if cfg.train.decay_cache:
             decay_loader = decay_phase_loader(
