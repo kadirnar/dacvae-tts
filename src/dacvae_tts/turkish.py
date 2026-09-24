@@ -125,14 +125,21 @@ def abbreviation_rules(table):
     longer expansions stay lower-case ("A.Ş." -> "anonim şirketi"). The full stop of an abbreviation that ends the
     text, or of a lower-case one before a capitalized word, also ends the sentence ("armut vs. Sonra" -> "armut
     vesaire. Sonra").
+
+    Abbreviations are often written without a space: the parts of a multi-word one may be joined ("Öğr.Gör." ->
+    "öğretim görevlisi") and a capital letter right after the full stop starts the next word, which gets a space
+    ("Prof.Dr. Ahmet" -> "Profesör Doktor Ahmet", not "ProfesörDr."). A lower-case letter there is a suffix, which
+    Turkish attaches to such abbreviations without an apostrophe ("16. yy.da" -> "yüzyılda"), so it stays attached.
     """
     rules = []
     for abbreviation, word in sorted(table.items(), key=lambda item: -len(item[0])):
-        a = re.escape(abbreviation)
+        a = r"\s*".join(re.escape(part) for part in abbreviation.split(" "))
         word = tr_title(word) if abbreviation[0].isupper() and " " not in word else word
         rules.append((rf"(?<![{LETTER}]){a}(?=\s*$)", word + "."))
         if abbreviation[0].islower():
             rules.append((rf"(?<![{LETTER}]){a}(?=\s+[{UPPER}])", word + "."))
+            rules.append((rf"(?<![{LETTER}]){a}(?=[{UPPER}])", word + ". "))
+        rules.append((rf"(?<![{LETTER}]){a}(?=[{UPPER}])", word + " "))
         rules.append((rf"(?<![{LETTER}]){a}", word))
     return rules
 

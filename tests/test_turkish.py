@@ -71,6 +71,8 @@ V1_PINS = {
     "Koç Holding A.Ş.": "Koç Holding A.Ş.",
     "Yılmaz Ltd. Şti.": "Yılmaz Ltd. Şti.",
     "Dr. Ahmet": "Dr. Ahmet",
+    "Prof.Dr. Ahmet": "Prof.Dr. Ahmet",
+    "Öğr.Gör. Ali": "Öğr.Gör. Ali",
     "3.30'a": "üç nokta otuza",
     "21.yüzyıl": "yirmi bir.yüzyıl",
     "e-posta": "e-posta",
@@ -126,6 +128,17 @@ def test_turkish_v1_outputs_are_pinned(raw, v1):
         ("Arş. Gör. Ali", "araştırma görevlisi Ali"),
         ("elma, armut vb. Sonra geldi", "elma, armut ve benzeri. Sonra geldi"),
         ("16. yy.", "on altıncı yüzyıl."),
+        # Written without a space: a capital after the full stop starts the next word, a lower-case letter is a
+        # suffix (Turkish attaches suffixes to such abbreviations without an apostrophe).
+        ("Prof.Dr. Ahmet", "Profesör Doktor Ahmet"),
+        ("Doç.Dr. Ayşe", "Doçent Doktor Ayşe"),
+        ("Yrd.Doç.Dr. Ali", "Yardımcı Doçent Doktor Ali"),
+        ("Öğr.Gör. Ali", "öğretim görevlisi Ali"),
+        ("Arş.Gör. Ali", "araştırma görevlisi Ali"),
+        ("Dr.Ahmet geldi", "Doktor Ahmet geldi"),
+        ("armut vs.Sonra", "armut vesaire. Sonra"),
+        ("16. yy.da", "on altıncı yüzyılda"),
+        ("elma vb.leri", "elma ve benzerileri"),
         # Abbreviations that could be an ordinary word before a full stop stay as they are.
         ("Ateşi yak.", "Ateşi yak."),
         ("Bir tel.", "Bir tel."),
@@ -228,6 +241,10 @@ def test_metric_v1_outputs_are_pinned(raw, v1):
         ("Yılmaz Ltd. Şti.", "yılmaz limited şirketi"),
         ("Dr. Ahmet", "doktor ahmet"),
         ("elma vb.", "elma ve benzeri"),
+        ("Prof.Dr. Ahmet", "profesör doktor ahmet"),
+        ("Doç.Dr.", "doçent doktor"),
+        ("Yrd.Doç.Dr.", "yardımcı doçent doktor"),
+        ("Öğr.Gör.", "öğretim görevlisi"),
         # (8) intra-word hyphens join
         ("e-posta", "eposta"),
         ("Wi-Fi", "wifi"),

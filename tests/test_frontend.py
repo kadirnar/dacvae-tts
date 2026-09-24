@@ -15,6 +15,7 @@ from dacvae_tts.frontend import locative, prepare_text, speakable, spell, split_
         ("Dolar 34,5 ₺ oldu. Fiyatı $199.", "Dolar otuz dört virgül beş lira oldu. Fiyatı yüz doksan dokuz dolar."),
         ("Hava 25°C, gece -3 derece.", "Hava yirmi beş derece, gece eksi üç derece."),
         ("Dr. Ahmet ve Prof. Ayşe geldi.", "Doktor Ahmet ve Profesör Ayşe geldi."),
+        ("Prof.Dr. Ahmet ve Öğr.Gör. Ayşe geldi.", "Profesör Doktor Ahmet ve öğretim görevlisi Ayşe geldi."),
         ("T.C. Sağlık Bakanlığı ve Koç Holding A.Ş. açıkladı.", "te ce Sağlık Bakanlığı ve Koç Holding anonim şirketi açıkladı."),
         ("Yılmaz Ltd. Şti. kuruldu.", "Yılmaz limited şirketi kuruldu."),
         ("elma, armut vs. Sonra geldi.", "elma, armut vesaire. Sonra geldi."),
