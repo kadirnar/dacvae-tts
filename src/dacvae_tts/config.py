@@ -26,6 +26,12 @@ class ModelConfig:
     duration: str = "head"
     ctc_layer: int = 0
     adaln_rank: int = 0  # 0: one D->9D modulation per block; r>0: shared modulation + rank-r per block
+    # Training-only teacher heads (alignment.py); absent from the module and its checkpoints when off.
+    repa_layer: int = 0  # speech-REPA: block predicting teacher SSL frames; 0 off, 10-11 with CTC at 8
+    repa_dim: int = 0  # width of the stored teacher frames (after the extraction PCA, e.g. 256)
+    tla_layers: object = ()  # TLA-SA: blocks aligned to the utterance speaker embedding; (), "all" or a list
+    tla_dim: int = 0  # width of the stored speaker embeddings (192 for SpeechBrain ECAPA)
+    tla_hidden: int = 256  # width of the per-block heads and of the time -> block-weight network
 
     def __post_init__(self):
         if min(self.latent_dim, self.width, self.depth, self.heads, self.patch_size) < 1:
@@ -58,6 +64,32 @@ class ModelConfig:
             raise ValueError("ctc_layer must be 0 (off) or the index of a generator block")
         if self.text_layout == "joined" and self.duration == "head":
             raise ValueError("The duration head needs separate transcripts; use duration: rule when joined")
+        self.tla_layers = teacher_blocks(self.tla_layers, self.depth)
+        if not 0 <= self.repa_layer <= self.depth or (self.repa_layer and self.repa_dim < 1):
+            raise ValueError("repa_layer must be 0 (off) or a generator block, with a positive repa_dim")
+        if self.repa_layer and self.repa_layer == self.ctc_layer:
+            # A-DMA (arXiv:2505.19595) ablation: CTC and speech alignment on one block is worse than either
+            # split (WER 2.69 vs 2.35 with CTC at 8, SSL at 12); text alignment wants the earlier block.
+            raise ValueError("repa_layer must differ from ctc_layer; align speech after the CTC block")
+        if self.tla_layers and (self.tla_dim < 1 or self.tla_hidden < 1):
+            raise ValueError("tla_layers need positive tla_dim and tla_hidden")
+
+
+def teacher_blocks(value, depth):
+    """TLA-SA block selection as a sorted tuple: () off, "all" every block, or explicit 1-based indices.
+
+    Normalized so that YAML lists, JSON lists and checkpointed tuples compare equal on resume/warm start.
+    """
+    if value in ("", None, "none"):
+        return ()
+    if value == "all":
+        return tuple(range(1, depth + 1))
+    if isinstance(value, str) or not all(isinstance(v, int) and not isinstance(v, bool) for v in value):
+        raise ValueError('tla_layers must be "all" or a list of block indices')
+    blocks = tuple(sorted(set(value)))
+    if blocks and not 1 <= blocks[0] <= blocks[-1] <= depth:
+        raise ValueError("tla_layers must index generator blocks 1..depth")
+    return blocks
 
 
 @dataclass
@@ -98,6 +130,15 @@ class TrainConfig:
     contrastive_weight: float = 0.0  # skip/repeat text negatives (RobustSpeechFlow-style hinge)
     contrastive_margin: float = 0.1  # required loss gap, relative to the positive loss
     wandb_project: str = ""  # set (or pass --wandb-project) to mirror the JSONL logs to Weights & Biases
+    # Teacher-feature auxiliary losses (alignment.py, scripts/extract_teacher_features.py); stores are
+    # sidecar directories, relative paths resolve against the cache directory.
+    teacher_features: str = ""  # speech-REPA frame store (e.g. teacher/mhubert147-l12-pca256)
+    repa_weight: float = 0.0  # A-DMA used 1.0; 0.5-1.0
+    repa_stop_step: int = 0  # HASTE (arXiv:2505.16792): align only during the first N updates; 0 = always
+    repa_frames: str = "all"  # all valid frames (prompt frames are real speech too) or target frames only
+    speaker_embeddings: str = ""  # TLA-SA utterance speaker-embedding store (e.g. teacher/ecapa-speechbrain)
+    tla_weight: float = 0.0  # TLA-SA used 0.5
+    tla_entropy: float = 0.01  # weight of the negative entropy of the time-dependent block weights
 
     def __post_init__(self):
         if self.worker_threads < 1 or self.prefetch_factor < 1:
@@ -139,6 +180,14 @@ class TrainConfig:
             raise ValueError("contrastive settings must be nonnegative")
         if self.batch_expansion < 1 or self.keep_every < 0 or self.ctc_weight < 0:
             raise ValueError("batch_expansion must be positive and keep_every nonnegative")
+        if min(self.repa_weight, self.repa_stop_step, self.tla_weight, self.tla_entropy) < 0:
+            raise ValueError("Teacher loss weights and repa_stop_step must be nonnegative")
+        if self.repa_frames not in {"all", "target"}:
+            raise ValueError("repa_frames must be all or target")
+        if (self.repa_weight and not self.teacher_features) or (
+            self.tla_weight and not self.speaker_embeddings
+        ):
+            raise ValueError("repa_weight needs teacher_features and tla_weight needs speaker_embeddings")
 
 
 @dataclass
@@ -153,6 +202,10 @@ class Config:
     def __post_init__(self):
         if self.train.pairing == "within" and self.model.text_layout != "joined":
             raise ValueError("Within-utterance prompts need model.text_layout: joined")
+        if (self.train.repa_weight and not self.model.repa_layer) or (
+            self.train.tla_weight and not self.model.tla_layers
+        ):
+            raise ValueError("repa_weight needs model.repa_layer and tla_weight needs model.tla_layers")
 
     @classmethod
     def from_dict(cls, obj):
