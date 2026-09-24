@@ -32,6 +32,7 @@ class ModelConfig:
     ffn_conv_kernel: int = 0  # odd k > 0: residual depthwise time conv on the FFN hidden units (5 suggested)
     attn_gate: str = "none"  # head: per-head 2*sigmoid output gate on generator self-/cross-attention
     ffn_activation: str = "gelu"  # swiglu: generator FFN as SwiGLU at equal parameters (hidden 2/3 of GELU's)
+    final_adaln: bool = False  # output LayerNorm shift/scale from the condition (rank adaln_rank, zero-init)
 
     def __post_init__(self):
         if min(self.latent_dim, self.width, self.depth, self.heads, self.patch_size) < 1:

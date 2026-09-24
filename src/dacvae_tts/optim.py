@@ -25,6 +25,8 @@ FUSED_ROWS = {
     ".ada_up.weight": 9,
     "ada_shared.1.weight": 9,
     ".ff.0.proj.weight": 2,  # SwiGLU gate | value
+    "final_ada.1.weight": 2,  # final adaLN shift | scale (full rank)
+    "final_ada.2.weight": 2,  # final adaLN shift | scale (rank-r up projection)
 }
 # Boundary layers (raw latents in, velocities / log-rate out) follow the AdamW convention.
 BOUNDARY = {

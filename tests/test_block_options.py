@@ -18,13 +18,15 @@ OPTIONS = {
     "ffn_conv": dict(ffn_conv_kernel=5),
     "attn_gate": dict(attn_gate="head"),
     "swiglu": dict(ffn_activation="swiglu"),
+    "final_adaln": dict(final_adaln=True),
 }
 # Every option explicitly disabled: must be exactly the previous model.
 OFF = dict(
-    long_skip=False, value_residual=False, ffn_conv_kernel=0, attn_gate="none", ffn_activation="gelu"
+    long_skip=False, value_residual=False, ffn_conv_kernel=0, attn_gate="none", ffn_activation="gelu",
+    final_adaln=False,
 )
 # Options whose new parameters start at zero (or identity): the model starts as the baseline function.
-ZERO_INIT = ["long_skip", "value_residual", "ffn_conv", "attn_gate"]
+ZERO_INIT = ["long_skip", "value_residual", "ffn_conv", "attn_gate", "final_adaln"]
 ALL = {key: value for option in OPTIONS.values() for key, value in option.items()}
 CASES = {**OPTIONS, "all": ALL, "ffn_conv_patch2": dict(ffn_conv_kernel=3, patch_size=2)}
 
@@ -162,6 +164,9 @@ def test_muon_partition_covers_the_new_parameters():
     assert {"blocks.0.self_attn.gate.weight", "blocks.1.cross_attn.gate.weight"} <= adamw  # [heads,D] heads
     assert muon["blocks.0.ff.0.proj.weight"] == 2 and muon["blocks.0.ff.1.weight"] == 1  # SwiGLU gate | value
     assert muon["blocks.1.self_attn.kv.weight"] == 2
+    assert muon["final_ada.0.weight"] == 1 and muon["final_ada.2.weight"] == 2  # rank-r down | shift, scale
+    full, _ = split(FlowTTS(ModelConfig(**NANO, final_adaln=True)))  # adaln_rank 0: one D -> 2D map
+    assert full["final_ada.1.weight"] == 2
     gelu, _ = split(FlowTTS(ModelConfig(**{**BASE, **ALL, "ffn_activation": "gelu"})))
     assert gelu["blocks.0.ff.0.weight"] == 1 and gelu["blocks.0.ff.2.weight"] == 1  # GELU: not a fused matrix
 
@@ -241,6 +246,22 @@ def test_swiglu_keeps_the_feed_forward_parameter_count():
     assert torch.allclose(swiglu.ff[0](x), torch.nn.functional.silu(gate) * value)
     with pytest.raises(ValueError):
         ModelConfig(**BASE, ffn_activation="relu")
+
+
+def test_final_adaln_modulates_the_output_norm_from_the_condition():
+    model = FlowTTS(ModelConfig(**BASE, final_adaln=True))
+    assert sum(p.numel() for p in new_parameters(model).values()) == (32 * 8 + 8) + (8 * 64 + 64)
+    full = FlowTTS(ModelConfig(**NANO, final_adaln=True))
+    assert sum(p.numel() for n, p in full.named_parameters() if n.startswith("final_ada")) == 32 * 64 + 64
+    model = perturbed(model).eval()
+    with torch.no_grad():
+        model.final_ada[-1].weight.zero_()
+        model.final_ada[-1].bias.copy_(torch.cat([torch.zeros(32), -torch.ones(32)]))  # shift 0, scale -1
+    batch = nano_batch(prompts=(3, 4))
+    velocity = model(batch["latents"], torch.tensor([0.3, 0.7]), **inputs(batch))
+    # 1 + scale = 0 removes the normalized features: only the output head's bias is left on every frame.
+    frames = int(batch["valid"].sum())
+    assert torch.allclose(velocity[batch["valid"]], model.output[1].bias.expand(frames, -1))
 
 
 def test_example_configs_change_one_model_option_of_the_w512_recipe():

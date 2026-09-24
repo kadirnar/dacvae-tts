@@ -285,6 +285,19 @@ class FlowTTS(nn.Module):
             self.skip = nn.Sequential(nn.LayerNorm(2 * d), nn.Linear(2 * d, d))
             nn.init.zeros_(self.skip[-1].weight)
             nn.init.zeros_(self.skip[-1].bias)
+        # Final adaLN (the DiT / F5 final layer): shift and scale of the output LayerNorm come from the
+        # condition, so the velocity head can adapt to flow time and voice. Rank-r like the blocks when
+        # adaln_rank > 0, else a full D -> 2D map; the last projection starts at zero (baseline at init).
+        self.final_ada = None
+        if cfg.final_adaln:
+            r = cfg.adaln_rank
+            self.final_ada = (
+                nn.Sequential(nn.Linear(d, r), nn.SiLU(), nn.Linear(r, 2 * d))
+                if r
+                else nn.Sequential(nn.SiLU(), nn.Linear(d, 2 * d))
+            )
+            nn.init.zeros_(self.final_ada[-1].weight)
+            nn.init.zeros_(self.final_ada[-1].bias)
         self.grad_checkpoint = False
 
     def reference_summary(self, prompt, prompt_mask):
@@ -416,7 +429,11 @@ class FlowTTS(nn.Module):
                 ctc_logits = self.ctc(h)
         if self.skip is not None:
             h = h + self.skip(torch.cat([first, h], -1))
-        output = self.output(h)
+        if self.final_ada is None:
+            output = self.output(h)
+        else:
+            shift, scale = self.final_ada(cond).unsqueeze(1).chunk(2, dim=-1)
+            output = self.output[1](self.output[0](h) * (1 + scale) + shift)
         expected_packs = (length + pad) // p
         if output.shape != (b, expected_packs, channels * p):
             raise ValueError("Velocity projection returned an unexpected packed length or width")
