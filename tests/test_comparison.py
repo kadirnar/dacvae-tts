@@ -8,7 +8,9 @@ import numpy as np
 import pytest
 
 from dacvae_tts.comparison import (
+    _jackknife_interval,
     cluster_bootstrap,
+    cluster_jackknife,
     compare_evaluations,
     detect_cluster,
     detect_key,
@@ -114,11 +116,51 @@ def test_verdict_is_direction_aware():
 
 def test_results_are_deterministic_under_a_seed():
     systems = {"a": freya_rows(), "b": shifted(freya_rows(), edits=1)}
-    one = compare_evaluations(systems, samples=300, seed=3, stratify=["length"])
-    two = compare_evaluations(copy.deepcopy(systems), samples=300, seed=3, stratify=["length"])
-    other = compare_evaluations(systems, samples=300, seed=4)
+    options = dict(samples=300, interval="percentile")
+    one = compare_evaluations(systems, seed=3, stratify=["length"], **options)
+    two = compare_evaluations(copy.deepcopy(systems), seed=3, stratify=["length"], **options)
+    other = compare_evaluations(systems, seed=4, **options)
     assert json.dumps(one) == json.dumps(two)
     assert one["systems"]["a"]["metrics"]["wer"]["ci"] != other["systems"]["a"]["metrics"]["wer"]["ci"]
+    # The default jackknife-t interval draws no random numbers: the seed does not matter.
+    jack = [compare_evaluations(systems, samples=300, seed=seed)["systems"]["a"]["metrics"]["wer"]["ci"] for seed in (3, 4)]
+    assert jack[0] == jack[1]
+
+
+def test_cluster_jackknife_matches_the_textbook_formula():
+    # Three clusters of edits/words: x 4/8, y 0/8, z 2/4 (corpus rate 6/20); leave-one-out rates 2/12, 6/12, 4/16.
+    num, den, clusters = [3, 1, 0, 2], [4, 4, 8, 4], ["x", "x", "y", "z"]
+    estimate, leave = cluster_jackknife(num, den, clusters)
+    assert estimate[0] == pytest.approx(0.3)
+    assert sorted(leave[:, 0]) == pytest.approx([2 / 12, 4 / 16, 6 / 12])
+    from scipy import stats
+
+    values = np.array([2 / 12, 6 / 12, 4 / 16])
+    error = np.sqrt(2 / 3 * np.square(values - values.mean()).sum())
+    low, high = _jackknife_interval(estimate, leave, 0.95)[0]
+    assert (low, high) == pytest.approx((0.3 - stats.t.ppf(0.975, 2) * error, 0.3 + stats.t.ppf(0.975, 2) * error))
+
+
+def test_jackknife_is_the_default_and_percentile_keeps_the_bootstrap():
+    systems = {"a": freya_rows(), "b": shifted(freya_rows(), edits=1)}
+    default = compare_evaluations(systems, samples=400, seed=1)
+    percentile = compare_evaluations(systems, samples=400, seed=1, interval="percentile")
+    assert default["config"]["interval"] == "jackknife-t" and percentile["config"]["interval"] == "percentile"
+    # The percentile option is the previous computation: the bootstrap quantiles of the same resamples.
+    rows = systems["a"]
+    num = np.array([r["word_edits"] for r in rows], float)
+    den = np.array([r["words"] for r in rows], float)
+    _, draws = cluster_bootstrap(num, den, [r["speaker"] for r in rows], 400, 1)
+    assert percentile["systems"]["a"]["metrics"]["wer"]["ci"] == pytest.approx(list(np.quantile(draws[:, 0], [0.025, 0.975])))
+    # Identical systems still give an exactly zero paired interval, and the jackknife interval is centred on the
+    # estimate (symmetric t interval) while being wider than the too-narrow percentile one on few clusters.
+    same = compare_evaluations({"a": rows, "b": copy.deepcopy(rows)})["comparisons"]["b"]["metrics"]["wer"]
+    assert same["ci"] == [0.0, 0.0] and same["verdict"] == "tie"
+    wer, pct = default["systems"]["a"]["metrics"]["wer"], percentile["systems"]["a"]["metrics"]["wer"]
+    assert (wer["ci"][0] + wer["ci"][1]) / 2 == pytest.approx(wer["value"])
+    assert wer["ci"][1] - wer["ci"][0] > pct["ci"][1] - pct["ci"][0]
+    with pytest.raises(ValueError, match="interval must be one of"):
+        compare_evaluations(systems, interval="bca")
 
 
 def test_cluster_bootstrap_resamples_whole_clusters():
@@ -325,12 +367,15 @@ def test_stratified_reports():
 def test_markdown_report_tables():
     rows = freya_rows()
     report = compare_evaluations(
-        {"base": rows, "worse": shifted(rows, edits=1, similarity=0.02)}, samples=500, utterance_ci=True
+        {"base": rows, "worse": shifted(rows, edits=1, similarity=0.02)}, samples=500, utterance_ci=True,
+        interval="percentile",
     )
     json.dumps(report, allow_nan=False)  # strict JSON: no NaN/inf, no numpy scalars
     text = markdown_report(report)
     lines = text.splitlines()
     assert "Bootstrap over `speaker` clusters: B = 500, seed 0, 95% percentile intervals" in lines[0]
+    default = markdown_report(compare_evaluations({"base": rows}, samples=50)).splitlines()[0]
+    assert "Delete-one-cluster jackknife over `speaker` clusters: 95% t intervals" in default
     header = next(line for line in lines if line.startswith("| system | n |"))
     columns = ("CER %", "WER %", "WER % (utt. mean)", "S/D/I %", "SIM", "DNSMOS OVRL", "clipped %", "RTF")
     assert all(f"| {column} |" in header for column in columns)

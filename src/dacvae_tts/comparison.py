@@ -10,6 +10,16 @@ speaker clusters -- 40-70 % wider depending on the cluster level -- and paired W
 points are not resolvable on that set. With so few clusters the percentile interval is itself approximate (it
 tends to be too narrow); more held-out voices, not more sentences per voice, is what tightens it.
 
+Intervals: the default is the delete-one-cluster jackknife standard error with Student t(G-1) quantiles
+("jackknife-t"), the few-cluster remedy of the cluster-robust inference literature (MacKinnon, Nielsen & Webb,
+arXiv:2301.04527). A simulation calibrated on that baseline (scripts/simulate_interval_coverage.py: 495 sentences
+with their real word counts, 10 voices, 500 replicates per scenario) measured, when the true paired difference is 0,
+false win/loss rates of 10-13 % with the cluster percentile bootstrap against the nominal 5 % and 4-6 % with the
+jackknife-t; paired-difference coverage 87-90 % vs 93-96 %, single-system WER coverage 87-89 % vs 91-93 %. The
+utterance-level bootstrap covers a single system's WER only 64-86 % of the time and a paired difference 85 % when the
+effect differs between voices. `interval="percentile"` keeps the cluster percentile bootstrap (the previous default,
+bit-identical).
+
 Pairing: both systems of a comparison are resampled with the *same* clusters in every draw, so voice and
 sentence difficulty cancel in the difference and the paired interval is much tighter than two independent
 ones. A difference is a win/loss only when its interval excludes 0 (direction-aware per metric), else a tie.
@@ -35,6 +45,8 @@ from .metrics import row_identity, summarize
 
 METRICS = ("wer", "cer", "dnsmos_ovrl", "speaker_similarity")  # checkpoint-promotion gate of `compare`
 DEFAULT_SAMPLES = 5000
+INTERVALS = ("jackknife-t", "percentile")
+DEFAULT_INTERVAL = "jackknife-t"
 
 
 class Metric(NamedTuple):
@@ -161,6 +173,54 @@ def _interval(draws, level):
     return out
 
 
+def cluster_jackknife(numerators, denominators, clusters):
+    """Delete-one-cluster jackknife of ratio statistics sum(numerator) / sum(denominator).
+
+    Inputs as `cluster_bootstrap`. Returns (estimate [S], leave-one-cluster-out estimates [G, S]); a leave-one-out
+    value whose remaining denominator is 0 is NaN. Paired comparisons take differences of columns, like the draws.
+    """
+    numerators = np.asarray(numerators, dtype=np.float64)
+    denominators = np.asarray(denominators, dtype=np.float64)
+    if numerators.ndim == 1:
+        numerators, denominators = numerators[:, None], denominators[:, None]
+    if numerators.shape != denominators.shape or numerators.shape[0] != len(clusters) or not len(clusters):
+        raise ValueError("Jackknife needs one numerator/denominator row and one cluster label per item")
+    codes = {}
+    index = np.array([codes.setdefault(_hashable(c), len(codes)) for c in clusters])
+    num = np.zeros((len(codes), numerators.shape[1]))
+    den = np.zeros_like(num)
+    np.add.at(num, index, numerators)
+    np.add.at(den, index, denominators)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        estimate = num.sum(0) / den.sum(0)
+        leave = (num.sum(0) - num) / (den.sum(0) - den)
+    return estimate, leave
+
+
+def _jackknife_interval(estimate, leave, level):
+    """estimate +- t(G-1) x jackknife standard error per column; NaN where a leave-one-out value is undefined."""
+    from scipy import stats
+
+    count = leave.shape[0]
+    if count < 2:
+        return np.full((leave.shape[1], 2), np.nan)
+    error = np.sqrt((count - 1) / count * np.square(leave - leave.mean(0)).sum(0))
+    half = stats.t.ppf(1 - (1 - level) / 2, count - 1) * error
+    return np.stack([estimate - half, estimate + half], 1)
+
+
+def _intervals(num, den, clusters, samples, seed, level, method, split=None):
+    """(estimate [S], intervals [S', 2]) by `method`; `split` = k gives the intervals of columns k: minus :k."""
+    if method == "percentile":
+        estimate, draws = cluster_bootstrap(num, den, clusters, samples, seed)
+        values = draws if split is None else draws[:, split:] - draws[:, :split]
+        return estimate, _interval(values, level)
+    estimate, leave = cluster_jackknife(num, den, clusters)
+    if split is None:
+        return estimate, _jackknife_interval(estimate, leave, level)
+    return estimate, _jackknife_interval(estimate[split:] - estimate[:split], leave[:, split:] - leave[:, :split], level)
+
+
 def verdict(low, high, better):
     """win/loss when the paired interval excludes 0 in the metric's good/bad direction, tie when it has 0."""
     if low is None or high is None or not (math.isfinite(low) and math.isfinite(high)):
@@ -283,7 +343,7 @@ def _index(label, groups, key, cluster, seed_field):
     return {"items": items, "failed": failed, "rows": total, "replicates": max(map(len, items.values()))}
 
 
-def _summary(items, ids, names, fields, samples, seed, level, utterance_ci):
+def _summary(items, ids, names, fields, samples, seed, level, utterance_ci, method=DEFAULT_INTERVAL):
     columns = {name: _column(items, ids, name, fields[name]) for name in names}
     present = [name for name in names if columns[name][1].any()]
     clusters = [item[1] for item in ids]
@@ -292,10 +352,10 @@ def _summary(items, ids, names, fields, samples, seed, level, utterance_ci):
         return result
     num = np.stack([columns[name][0] for name in present], 1)
     den = np.stack([columns[name][1] for name in present], 1)
-    estimate, draws = cluster_bootstrap(num, den, clusters, samples, seed)
-    interval = _interval(draws, level) if result["clusters"] > 1 else None
+    estimate, interval = _intervals(num, den, clusters, samples, seed, level, method)
+    interval = interval if result["clusters"] > 1 else None
     if utterance_ci:
-        utterance = _interval(cluster_bootstrap(num, den, range(len(ids)), samples, seed)[1], level)
+        utterance = _intervals(num, den, range(len(ids)), samples, seed, level, method)[1]
     for j, name in enumerate(present):
         entry = {"value": _clean(estimate[j]), "n": int((den[:, j] > 0).sum())}
         entry["ci"] = None if interval is None else [_clean(v) for v in interval[j]]
@@ -305,7 +365,7 @@ def _summary(items, ids, names, fields, samples, seed, level, utterance_ci):
     return result
 
 
-def _paired(base, other, ids, names, fields, samples, seed, level, utterance_ci):
+def _paired(base, other, ids, names, fields, samples, seed, level, utterance_ci, method=DEFAULT_INTERVAL):
     """Paired differences other - base over the given common items, resampled with identical clusters."""
     clusters = [item[1] for item in ids]
     present, columns = [], []
@@ -322,11 +382,10 @@ def _paired(base, other, ids, names, fields, samples, seed, level, utterance_ci)
     k = len(present)
     num = np.stack([c[0] for c in columns] + [c[2] for c in columns], 1)
     den = np.stack([c[1] for c in columns] + [c[3] for c in columns], 1)
-    estimate, draws = cluster_bootstrap(num, den, clusters, samples, seed)
-    interval = _interval(draws[:, k:] - draws[:, :k], level) if result["clusters"] > 1 else None
+    estimate, interval = _intervals(num, den, clusters, samples, seed, level, method, split=k)
+    interval = interval if result["clusters"] > 1 else None
     if utterance_ci:
-        utterance = cluster_bootstrap(num, den, range(len(ids)), samples, seed)[1]
-        utterance = _interval(utterance[:, k:] - utterance[:, :k], level)
+        utterance = _intervals(num, den, range(len(ids)), samples, seed, level, method, split=k)[1]
     for j, name in enumerate(present):
         low, high = (None, None) if interval is None else map(_clean, interval[j])
         entry = {
@@ -419,6 +478,7 @@ def compare_evaluations(
     level=0.95,
     utterance_ci=False,
     allow_scorer_mismatch=False,
+    interval=DEFAULT_INTERVAL,
 ):
     """Per-system summaries with cluster-bootstrap intervals plus paired differences against a baseline.
 
@@ -429,6 +489,8 @@ def compare_evaluations(
     cluster: "auto" (speaker, then prompt IDs), a field name, or None/"none" for an utterance-level bootstrap.
     metrics: restricts the paired and stratum tables (default: headline metrics / CER+WER).
     stratify: fields for per-stratum reports; "length" buckets reference word counts into 1-5, 6-9 and 10+.
+    interval: "jackknife-t" (default; delete-one-cluster jackknife with t(G-1) quantiles, calibrated for few
+    clusters) or "percentile" (cluster percentile bootstrap, the previous default; see the module docstring).
     Systems whose rows record different scorers are refused (`check_scorers`) unless `allow_scorer_mismatch`.
     Returns a JSON-serializable report; `markdown_report` renders it.
     """
@@ -436,6 +498,8 @@ def compare_evaluations(
         raise ValueError("No systems to compare")
     if not 0 < level < 1:
         raise ValueError("Confidence level must be in (0, 1)")
+    if interval not in INTERVALS:
+        raise ValueError(f"interval must be one of {INTERVALS}")
     groups = {label: _replicate_groups(rows) for label, rows in systems.items()}
     scored = [row for gs in groups.values() for g in gs for row in g if "error" not in row]
     if not scored:
@@ -455,10 +519,10 @@ def compare_evaluations(
     baseline = baseline if baseline is not None else next(iter(runs))
     if baseline not in runs:
         raise ValueError(f"Baseline {baseline!r} is not one of {list(runs)}")
-    options = (samples, seed, level, utterance_ci)
+    options = (samples, seed, level, utterance_ci, interval)
     notes = []
     if cluster is None:
-        notes.append("Utterance-level bootstrap: intervals ignore the correlation within a voice.")
+        notes.append("Utterance-level intervals: they ignore the correlation within a voice.")
     aliases = {n: fields[n][0] for n, spec in METRIC_SPECS.items() if spec.kind == "mean" and spec.fields[1:]}
     report = {
         "config": {
@@ -469,6 +533,7 @@ def compare_evaluations(
             "bootstrap_samples": samples,
             "seed": seed,
             "level": level,
+            "interval": interval,
             "aliases": aliases,
         },
         "systems": {},
@@ -482,10 +547,15 @@ def compare_evaluations(
             "rows": run["rows"], "failed": run["failed"], "replicates": run["replicates"], **summary
         }
     few = min(s["clusters"] for s in report["systems"].values())
-    if cluster is not None and few < 20:
+    if cluster is not None and few < 20 and interval == "percentile":
         notes.append(
-            f"Only {few} `{cluster}` clusters: percentile intervals from few clusters are approximate (they "
-            "tend to be too narrow); read differences near an interval edge as ties."
+            f"Only {few} `{cluster}` clusters: percentile intervals from few clusters are too narrow (paired "
+            "false win/loss rate 10-13 % at nominal 5 % in simulation); prefer interval jackknife-t."
+        )
+    elif cluster is not None and few < 20:
+        notes.append(
+            f"Only {few} `{cluster}` clusters: jackknife-t intervals (t with {few - 1} degrees of freedom) are wide "
+            "by design; more held-out voices, not more sentences per voice, narrow them."
         )
     notes.extend(check_scorers(runs, allow_scorer_mismatch))
     for field in ("asr_backend", "cases_sha256"):
@@ -645,9 +715,12 @@ def markdown_report(report):
     config = report["config"]
     level = f"{config['level']:.0%}"
     unit = f"`{config['cluster']}` clusters" if config["cluster"] else "utterances (no clustering)"
+    if config.get("interval", "percentile") == "percentile":
+        method = f"Bootstrap over {unit}: B = {config['bootstrap_samples']}, seed {config['seed']}, {level} percentile"
+    else:
+        method = f"Delete-one-cluster jackknife over {unit}: {level} t"
     lines = [
-        f"Bootstrap over {unit}: B = {config['bootstrap_samples']}, seed {config['seed']}, {level} "
-        f"percentile intervals; utterances paired on ({', '.join(config['key'])}). A difference is a "
+        f"{method} intervals; utterances paired on ({', '.join(config['key'])}). A difference is a "
         "win/loss only when its paired interval excludes 0, otherwise a tie.",
         "",
         "### Systems",
@@ -665,13 +738,15 @@ def markdown_report(report):
     return "\n".join(lines) + "\n"
 
 
-def paired_comparison(before, after, samples=2000, seed=42):
+def paired_comparison(before, after, samples=2000, seed=42, interval=DEFAULT_INTERVAL):
     """Strict before/after gate for checkpoint promotion on frozen `make-cases` evaluations.
 
     Unlike `compare_evaluations`, every row must carry all four finite gate metrics, the utterance/reference/
     seed keys, texts, evaluator identity and frozen case digest must match exactly, and failures abort.
-    Intervals come from the same vectorized speaker-clustered paired bootstrap.
+    Intervals are speaker-clustered and paired, by `interval` as in `compare_evaluations`.
     """
+    if interval not in INTERVALS:
+        raise ValueError(f"interval must be one of {INTERVALS}")
 
     def indexed(rows):
         index = {}
@@ -708,17 +783,16 @@ def paired_comparison(before, after, samples=2000, seed=42):
         for name in METRICS
     ]
     num, den = np.stack([c[0] for c in columns], 1), np.stack([c[1] for c in columns], 1)
-    _, draws = cluster_bootstrap(num, den, speakers, samples, seed)
-    changes = draws[:, len(METRICS) :] - draws[:, : len(METRICS)]
+    _, bounds = _intervals(num, den, speakers, samples, seed, 0.95, interval, split=len(METRICS))
     a, b = summarize(before), summarize(after)
     result = {
         "before": a,
         "after": b,
         "speakers": len(set(speakers)),
         "bootstrap_samples": samples,
+        "interval": interval,
         "changes": {
-            key: {"delta": b[key] - a[key], "ci95": np.quantile(changes[:, i], [0.025, 0.975]).tolist()}
-            for i, key in enumerate(METRICS)
+            key: {"delta": b[key] - a[key], "ci95": bounds[i].tolist()} for i, key in enumerate(METRICS)
         },
     }
     # Conservative automatic gate; listening and speed checks remain separate requirements.
@@ -731,7 +805,8 @@ def paired_comparison(before, after, samples=2000, seed=42):
 
 
 def compare(args):
-    result = paired_comparison(list(jsonl(args.before)), list(jsonl(args.after)), args.bootstrap, args.seed)
+    result = paired_comparison(list(jsonl(args.before)), list(jsonl(args.after)), args.bootstrap, args.seed,
+                               getattr(args, "interval", DEFAULT_INTERVAL))
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2))

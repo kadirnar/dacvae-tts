@@ -253,6 +253,8 @@ def main():
     p.add_argument("--output", required=True)
     p.add_argument("--bootstrap", type=positive_int, default=5000)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--interval", choices=("jackknife-t", "percentile"), default="jackknife-t",
+                   help="Paired interval: speaker jackknife with t(G-1) quantiles, or the percentile bootstrap")
 
     p = sub.add_parser("rank-pairs", help="Select non-regressing metric-ranked training pairs")
     p.add_argument("--scores", required=True)

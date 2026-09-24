@@ -1,4 +1,4 @@
-r"""Markdown comparison of evaluation runs: speaker-clustered bootstrap intervals and paired differences.
+r"""Markdown comparison of evaluation runs: speaker-clustered intervals and paired differences.
 
 Inputs are per-utterance result JSONL files: eval_sentences.py `results.jsonl` (Freya-TR-Eval), monitor.py
 `RUN/monitor/step-N/results.jsonl`, `dacvae-tts evaluate` or `run-eval` outputs. Give each run as LABEL=PATH
@@ -14,8 +14,9 @@ replicates, averaged per utterance. The first run is the baseline unless --basel
 
 Per system: n, CER, corpus and per-utterance-mean WER with intervals, S/D/I rates, SIM/SIM-o, DNSMOS OVRL,
 UTMOS, clipped-sample fraction and RTF whenever present (missing metrics are skipped, never imputed). Paired
-table: difference vs the baseline with the interval from identical resampled clusters and a win/loss/tie
-verdict (tie when the interval contains 0). Why speaker clusters: sentences of one voice are correlated; on
+table: difference vs the baseline with its paired speaker-clustered interval and a win/loss/tie verdict (tie
+when the interval contains 0). Intervals default to the delete-one-speaker jackknife with t(G-1) quantiles;
+`--interval percentile` gives the cluster percentile bootstrap, which is too narrow with ~10 voices. Why speaker clusters: sentences of one voice are correlated; on
 the 495 Freya sentences (10 held-out speakers) clustering widens the WER interval by 40-70 % and differences
 below ~0.7 WER points are unresolvable -- see dacvae_tts.comparison for the evidence and the method.
 """
@@ -25,7 +26,14 @@ import json
 import sys
 from pathlib import Path
 
-from dacvae_tts.comparison import DEFAULT_SAMPLES, METRIC_SPECS, compare_evaluations, markdown_report
+from dacvae_tts.comparison import (
+    DEFAULT_INTERVAL,
+    DEFAULT_SAMPLES,
+    INTERVALS,
+    METRIC_SPECS,
+    compare_evaluations,
+    markdown_report,
+)
 from dacvae_tts.data import jsonl
 
 
@@ -80,7 +88,12 @@ def main(argv=None):
         help="Add a per-stratum table for a row field (e.g. register); 'length' buckets reference word "
              "counts into 1-5, 6-9, 10+. Repeatable",
     )
-    parser.add_argument("--bootstrap", type=int, default=DEFAULT_SAMPLES, help="Resamples (%(default)s)")
+    parser.add_argument(
+        "--interval", choices=INTERVALS, default=DEFAULT_INTERVAL,
+        help="jackknife-t: delete-one-cluster jackknife with t(G-1) quantiles (default; calibrated for few voices), "
+             "percentile: cluster percentile bootstrap (too narrow with ~10 voices, see dacvae_tts.comparison)",
+    )
+    parser.add_argument("--bootstrap", type=int, default=DEFAULT_SAMPLES, help="Resamples of --interval percentile")
     parser.add_argument("--seed", type=int, default=0, help="Bootstrap RNG seed (results are deterministic)")
     parser.add_argument("--level", type=float, default=0.95, help="Interval coverage (default %(default)s)")
     parser.add_argument(
@@ -119,6 +132,7 @@ def main(argv=None):
             level=args.level,
             utterance_ci=args.utterance_ci,
             allow_scorer_mismatch=args.allow_scorer_mismatch,
+            interval=args.interval,
         )
     except ValueError as error:
         raise SystemExit(f"compare_evals: {error}") from error
