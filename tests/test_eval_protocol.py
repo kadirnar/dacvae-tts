@@ -174,6 +174,12 @@ def test_protocol_v2_bundle_and_validation():
     assert protocol_from_args(parse("--protocol-v2", dnsmos="x.onnx")).prompt_dnsmos
     options = protocol_from_args(parse("--band-limit-8k", "--sim-o", "--sim-o-backend", "s3prl"))
     assert options.band_limit_8k and options.sim_o and options.sim_o_backend == "s3prl" and not options.utmos
+    # Any active protocol decodes deterministically; --no-asr-deterministic opts out, and alone changes nothing.
+    assert options.deterministic_asr and options.asr_deterministic is None
+    assert protocol_from_args(parse("--asr-deterministic")).deterministic_asr
+    assert not protocol_from_args(parse("--band-limit-8k", "--no-asr-deterministic")).deterministic_asr
+    assert not protocol_from_args(parse("--protocol-v2", "--no-asr-deterministic")).deterministic_asr
+    assert protocol_from_args(parse("--no-asr-deterministic")) is None
     with pytest.raises(ValueError, match="DNSMOS"):
         protocol_from_args(parse("--prompt-dnsmos"))
     with pytest.raises(ValueError, match="sim-o"):
@@ -255,7 +261,9 @@ def test_scorer_reports_sim_o_and_sim_r_separately(tmp_path):
 def test_scorer_asr_input_and_decoding():
     audio = torch.from_numpy(speech_like())
     plain = ProtocolScorer(ProtocolOptions(signal_stats=True))
-    assert plain.asr_audio(audio)[0] is audio and plain.whisper_kwargs() == eval_protocol.WHISPER_V1
+    assert plain.asr_audio(audio)[0] is audio and plain.whisper_kwargs() == eval_protocol.WHISPER_DETERMINISTIC
+    sampling = ProtocolScorer(ProtocolOptions(signal_stats=True, asr_deterministic=False))
+    assert sampling.whisper_kwargs() == eval_protocol.WHISPER_V1
     scorer = ProtocolScorer(ProtocolOptions(asr_deterministic=True, asr_trim_silence=True, band_limit_8k=True))
     trimmed, info = scorer.asr_audio(audio)
     assert len(trimmed) < len(audio) and 0.8 < info["asr_trimmed_seconds"] < 1.0
@@ -339,6 +347,23 @@ def test_evaluator_with_protocol(fake_whisper, tmp_path, monkeypatch):
     assert result["wer"] > 0 and result["wer_filtered"] == 0 and result["hallucination"]  # raw WER kept
     assert result["utmos"] == 3.9 and "sim_o" in result and "sim_r" not in result
     assert result["asr_trimmed_seconds"] > 0.8
+
+
+def test_any_protocol_decodes_deterministically(fake_whisper, tmp_path):
+    """--band-limit-8k or --sim-o alone used to keep the sampling fallback (only --asr-deterministic/--protocol-v2
+    pinned temperature 0); without a protocol the v1 decoding is unchanged."""
+    path = write(tmp_path / "gen.wav", speech_like())
+    for options in (ProtocolOptions(band_limit_8k=True), ProtocolOptions(signal_stats=True)):
+        evaluator = metrics.Evaluator("large-v3", None, None, "cpu", language="tr", protocol=options)
+        evaluator.score(path, "Bir iki üç.")
+        assert fake_whisper.calls[-1][1]["temperature"] == 0.0 and fake_whisper.calls[-1][1]["without_timestamps"]
+        assert evaluator.row_identity["decoding"] == eval_protocol.WHISPER_DETERMINISTIC
+    evaluator = metrics.Evaluator("large-v3", None, None, "cpu", language="tr",
+                                  protocol=ProtocolOptions(band_limit_8k=True, asr_deterministic=False))
+    evaluator.score(path, "Bir iki üç.")
+    assert "temperature" not in fake_whisper.calls[-1][1]
+    metrics.Evaluator("large-v3", None, None, "cpu", language="tr").score(path, "Bir iki üç.")
+    assert fake_whisper.calls[-1][1] == dict(language="tr", **eval_protocol.WHISPER_V1)
 
 
 def test_cli_evaluate_with_protocol(fake_whisper, tmp_path, monkeypatch):

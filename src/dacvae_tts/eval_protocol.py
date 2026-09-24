@@ -12,9 +12,11 @@ Why each part exists:
   integrated loudness (LUFS) and the -50 dB bandwidth (highest frequency of the average power spectrum within
   50 dB of its peak; a codec/vocoder that loses the top octave shows up here before listeners complain).
 - Whisper: faster-whisper falls back from temperature 0 to sampling (0.2 ... 1.0) on clips whose greedy result
-  looks degenerate, so the same audio can score differently. `asr_deterministic` pins temperature=0,
-  condition_on_previous_text=False, without_timestamps=True, beam 5, and records library versions and the model
-  snapshot in the evaluator identity.
+  looks degenerate, so the same audio can score differently. Deterministic decoding (temperature=0,
+  condition_on_previous_text=False, without_timestamps=True, beam 5) is used whenever a protocol is active, e.g.
+  `--sim-o` or `--band-limit-8k` alone; `--no-asr-deterministic` keeps the v1 decoding with its sampling fallback
+  (to reproduce a protocol run made before this default). Library versions and the model snapshot go to the
+  evaluator identity.
 - Whisper-large-v3 hallucinates fixed strings on (near-)silence (arXiv 2501.11378); in Turkish subtitles-style
   phrases such as "Altyazı M.K.". `flag_hallucinations` marks such phrases (only occurrences beyond those in the
   reference text) and reports `wer_filtered`/`cer_filtered` NEXT TO the raw `wer`/`cer`, which are never replaced.
@@ -24,9 +26,11 @@ Why each part exists:
   so WER is comparable with Freya-TR-Eval tables.
 
 Everything is opt-in: `protocol_from_args` returns None unless a v2 flag is given, and an `Evaluator` without a
-protocol keeps its decoding, row keys and evaluator identity exactly as before. Heavy models are imported lazily.
+protocol keeps its decoding (WHISPER_V1, with the sampling fallback) and row keys exactly as before, so v1 numbers
+stay reproducible. Heavy models are imported lazily.
 """
 
+import argparse
 import importlib.metadata
 import math
 from dataclasses import asdict, dataclass, fields
@@ -67,9 +71,13 @@ MEAN_KEYS = (
 
 @dataclass(frozen=True)
 class ProtocolOptions:
-    """Switches of evaluation protocol v2; every field defaults to the v1 behavior (off)."""
+    """Switches of evaluation protocol v2; every field defaults to the v1 behavior (off).
 
-    asr_deterministic: bool = False
+    `asr_deterministic` is None ("default") unless set: an active protocol then decodes deterministically
+    (`deterministic_asr`); True alone activates the protocol, False keeps the v1 decoding in an active protocol.
+    """
+
+    asr_deterministic: bool | None = None
     asr_trim_silence: bool = False
     band_limit_8k: bool = False
     flag_hallucinations: bool = False
@@ -92,8 +100,13 @@ class ProtocolOptions:
     def enabled(self):
         return any(getattr(self, f.name) is True for f in fields(self))
 
+    @property
+    def deterministic_asr(self):
+        """Whisper decoding of an active protocol is deterministic unless asr_deterministic=False."""
+        return self.enabled and self.asr_deterministic is not False
 
-_SWITCHES = tuple(f.name for f in fields(ProtocolOptions) if f.type is bool)
+
+_SWITCHES = tuple(f.name for f in fields(ProtocolOptions) if f.type is bool)  # on/off flags (not asr_deterministic)
 # `--utmos` optionally names its model (the spelling of scripts/eval_sentences.py's former own flag, #13);
 # UTMOS22-strong scores go to the `utmos` field and UTMOSv2 scores to `utmosv2`, whichever flag asked for them.
 UTMOS_CHOICES = ("utmos22", "utmosv2")
@@ -126,8 +139,10 @@ def add_protocol_args(parser):
         help="Shorthand for --asr-deterministic --flag-hallucinations --signal-stats --sim-o --sim-speechbrain "
              "--utmos, plus --prompt-dnsmos when a DNSMOS model is given",
     )
-    group.add_argument("--asr-deterministic", action="store_true",
-                       help="faster-whisper with temperature=0 (no sampling fallback), without_timestamps, beam 5")
+    group.add_argument("--asr-deterministic", action=argparse.BooleanOptionalAction, default=None,
+                       help="faster-whisper with temperature=0 (no sampling fallback), without_timestamps, beam 5; "
+                            "the default whenever any protocol flag is given. --no-asr-deterministic keeps the v1 "
+                            "decoding (sampling fallback) in a protocol run")
     group.add_argument("--asr-trim-silence", action="store_true", help="Cut trailing silence before ASR only")
     group.add_argument("--band-limit-8k", action="store_true",
                        help="FreyaTTS protocol: resample to 8 kHz and back to 16 kHz before ASR only")
@@ -163,10 +178,15 @@ def protocol_from_args(args):
         switches["utmos"] = utmos == "utmos22"
         switches["utmosv2"] = switches["utmosv2"] or utmos == "utmosv2"
     chosen = {name: True for name, on in switches.items() if on}
+    deterministic = getattr(args, "asr_deterministic", None)
+    if deterministic:
+        chosen["asr_deterministic"] = True
     if chosen.get("prompt_dnsmos") and not has_dnsmos:
         raise ValueError("--prompt-dnsmos needs a DNSMOS model (--dnsmos / --dnsmos-model)")
     extra = dict(sim_o_backend=getattr(args, "sim_o_backend", None) or "transformers",
                  sim_o_checkpoint=getattr(args, "sim_o_checkpoint", None))
+    if deterministic is False:  # --no-asr-deterministic: v1 decoding inside an active protocol
+        extra["asr_deterministic"] = False
     if getattr(args, "protocol_v2", False):
         return protocol_v2(**{"prompt_dnsmos": has_dnsmos, **chosen}, **extra)
     if not chosen:
@@ -487,7 +507,7 @@ class ProtocolScorer:
                 self.identity[name] = getattr(model, "identity", type(model).__name__)
 
     def whisper_kwargs(self):
-        return dict(WHISPER_DETERMINISTIC if self.options.asr_deterministic else WHISPER_V1)
+        return dict(WHISPER_DETERMINISTIC if self.options.deterministic_asr else WHISPER_V1)
 
     def asr_audio(self, audio, sample_rate=SAMPLE_RATE):
         """The waveform given to ASR (trim, then band limit) and row fields describing what was done."""
