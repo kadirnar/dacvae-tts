@@ -63,7 +63,11 @@ def main():
                         pending.clear()
                 else:
                     log(f"done {arm}")
-        while pending and max(trainers(), sum(training_active(arm) for arm in ARMS)) < args.parallel:
+        # An exclusive post-training job occupies the GPU for its whole life, including while it waits for the
+        # evaluation lock before its trainer exists (GRPO once collided with the next arm that way).
+        exclusive = any(arm in POSTTRAIN for arm in running)
+        while (pending and not exclusive
+               and max(trainers(), sum(training_active(arm) for arm in ARMS)) < args.parallel):
             ready = [arm for arm in pending if all((cache / need).exists() for need in ARMS[arm][3])
                      and not training_active(arm) and (arm not in FINETUNE or Path(FINETUNE[arm]["init"]).exists())
                      and (arm not in POSTTRAIN or Path(POSTTRAIN[arm]["init"]).exists())]
