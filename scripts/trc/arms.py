@@ -76,3 +76,6 @@ for _name in ROUND2:
     _issue, _config, _overrides, _needs = ARMS[_name]
     _own = [o for o in _overrides if o not in EXECUTION]
     ARMS[f"x-{_name}"] = (f"{_issue}, on base+cross", BASE, EXECUTION + CROSS + _own, _needs)
+
+# Full-length model candidates (60k updates, the whole LR schedule): the answer to "is it better than run C?".
+ARMS["full-cross"] = ("model candidate: run C recipe + cross prompts, 60k", BASE, EXECUTION + CROSS, [])

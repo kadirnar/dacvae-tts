@@ -20,6 +20,12 @@ from arms import ARMS  # noqa: E402
 from run_arm import PY, REPO, log, setting  # noqa: E402
 
 
+def trainers():
+    """Training processes on this machine (any launcher): the GPU is saturated by one."""
+    found = subprocess.run(["pgrep", "-f", "-u -m dacvae_tts train"], capture_output=True, text=True)
+    return len(found.stdout.split())
+
+
 def training_active(arm):
     """An arm occupies a training slot while its run_arm.py lives (any queue) and its final snapshot is missing;
     its evaluations may then overlap the next arm's training."""
@@ -56,7 +62,7 @@ def main():
                         pending.clear()
                 else:
                     log(f"done {arm}")
-        while pending and sum(training_active(arm) for arm in ARMS) < args.parallel:
+        while pending and max(trainers(), sum(training_active(arm) for arm in ARMS)) < args.parallel:
             ready = [arm for arm in pending if all((cache / need).exists() for need in ARMS[arm][3])
                      and not training_active(arm)]
             if not ready:
@@ -72,7 +78,9 @@ def main():
             if overrides:
                 command += ["--set", *overrides]
             stream = open(out / f"queue-{arm}.log", "a")
-            running[arm] = subprocess.Popen(command, cwd=REPO, stdout=stream, stderr=subprocess.STDOUT, env=os.environ)
+            # "full-*" arms train the whole 60k schedule (the model candidates), the others stop at AB_STOP.
+            env = {**os.environ, **({"AB_STOP": os.environ.get("AB_STEPS", "60000")} if arm.startswith("full-") else {})}
+            running[arm] = subprocess.Popen(command, cwd=REPO, stdout=stream, stderr=subprocess.STDOUT, env=env)
             started[arm] = time.time()
             log(f"start {arm} ({issue})")
             time.sleep(90)  # stagger compilation and loader start-up
