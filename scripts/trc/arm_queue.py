@@ -22,7 +22,8 @@ from run_arm import PY, REPO, log, setting  # noqa: E402
 
 def trainers():
     """Training processes on this machine (any launcher): the GPU is saturated by one."""
-    found = subprocess.run(["pgrep", "-f", "-u -m dacvae_tts train"], capture_output=True, text=True)
+    # The pattern must not start with "-": pgrep would read it as its own option.
+    found = subprocess.run(["pgrep", "-f", "python -u -m dacvae_tts train"], capture_output=True, text=True)
     return len(found.stdout.split())
 
 
