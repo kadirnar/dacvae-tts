@@ -1,7 +1,8 @@
 """Run A/B arms (scripts/trc/arms.py) through scripts/trc/run_arm.py, `--parallel` at a time on one GPU.
 
-The generator is overhead bound (small matrices, many kernels), so two arms sharing a GPU finish more updates per
-hour than one; arms that share a comparison still share the GPU model, cache, frame budget and schedule. Finished
+`--parallel` counts training slots: an arm frees its slot when its final snapshot exists, so its final evaluations
+overlap the next arm's training (one compiled arm already saturates an RTX 5090: two at once ran at 0.93x the
+sequential throughput). Arms that share a comparison share the GPU model, cache, frame budget and schedule. Finished
 arms (OUT/<arm>/done) are skipped; an arm whose stores are missing waits until the end of the queue and is reported.
 
   python scripts/trc/arm_queue.py base-s42 base-eager base-s43 --parallel 2
@@ -17,6 +18,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from arms import ARMS  # noqa: E402
 from run_arm import PY, REPO, log, setting  # noqa: E402
+
+
+def training_active(arm):
+    """An arm occupies a training slot while its run_arm.py lives (any queue) and its final snapshot is missing;
+    its evaluations may then overlap the next arm's training."""
+    final = Path(setting("RUNS")) / f"trc-{arm}" / f"step-{int(setting('AB_STOP')):07d}.pt"
+    if final.exists():
+        return False
+    found = subprocess.run(["pgrep", "-f", f"scripts/trc/run_arm.py --arm {arm} --config"], capture_output=True)
+    return found.returncode == 0
 
 
 def main():
@@ -40,8 +51,9 @@ def main():
                     log(f"FAILED {arm} ({process.returncode})")
                 else:
                     log(f"done {arm}")
-        while pending and len(running) < args.parallel:
-            ready = [arm for arm in pending if all((cache / need).exists() for need in ARMS[arm][3])]
+        while pending and sum(training_active(arm) for arm in ARMS) < args.parallel:
+            ready = [arm for arm in pending if all((cache / need).exists() for need in ARMS[arm][3])
+                     and not training_active(arm)]
             if not ready:
                 break
             arm = ready[0]
