@@ -49,7 +49,7 @@ LUFS), turkish-v2 metric. Sampling seeds 42 and 1000 pooled. Paired speaker-clus
 | arm | WER % | CER % | SIM-o | DNSMOS | verdict |
 |---|---:|---:|---:|---:|---|
 | run C recipe, training seeds 42 / 43 | 30.1 / 24.9 | 22.1 / 15.0 | 0.516 / 0.544 | 2.93 / 2.88 | base |
-| run C recipe, run C's eager execution | 20.1 | 13.1 | 0.553 | 2.97 | within the seed spread (#7) |
+| run C recipe, run C's eager execution | 20.1 | 13.1 | 0.553 | 2.97 | 4.8 below the better compiled seed: the size of the seed spread itself, unresolved with one eager seed; equal-frames check shows parity (#7) |
 | **+ cross-utterance prompts (#11)**, seeds 42 / 43 | **12.3 / 16.9** | **8.3 / 9.7** | 0.540 / 0.534 | 2.96 / 2.94 | **adopted** |
 | run C at 20k (old data, reference) | 15.2 | 10.4 | 0.541 | 2.95 | |
 
