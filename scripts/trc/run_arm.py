@@ -102,18 +102,20 @@ run.finish()
     subprocess.run([PY, "-c", code], cwd=REPO, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def push(arm, run, step, out, title, notes):
+def push(arm, run, step, out, title, notes, slim=False):
+    """Returns True once the snapshot is on the Hub."""
     if os.environ.get("NO_PUSH"):
-        return
+        return False
     command = [PY, "scripts/trc/push_snapshot.py", "--run", str(run), "--repo", f"{setting('HF_ORG')}/dacvae-tts-trc-{arm}",
-               "--step", str(step), "--title", title, "--notes", notes]
+               "--step", str(step), "--title", title, "--notes", notes, *(["--slim"] if slim else [])]
     if out is not None and (out / "summary.json").exists():
         command += ["--eval", str(out)]
     for attempt in range(3):
         if subprocess.run(command, cwd=REPO).returncode == 0:
-            return
+            return True
         time.sleep(30)
     log(f"push failed for {arm} step {step}; continuing")
+    return False
 
 
 def main():
@@ -170,7 +172,9 @@ def main():
             out = None
         if out is not None:
             wandb_log(args.arm, step, out, is_final)
-        push(args.arm, run, step, out, title, notes)
+        pushed = push(args.arm, run, step, out, title, notes, slim=not is_final)
+        if pushed and not is_final:
+            snapshot.unlink()  # on the Hub (weights + EMA); local disk keeps the final snapshot only
         if is_final:
             # A second sampling seed: one 495-sentence generation cannot resolve < ~1 WER point (run C: seed 42 vs
             # 1000 differed by +0.9, a tie); compare_evals.py pools LABEL=dir,dir-s1000 as replicates.
@@ -180,6 +184,8 @@ def main():
                 log(f"{args.arm}: seed-1000 evaluation failed ({error.returncode})")
     if trainer is not None:
         trainer.wait()
+    if final.exists() and (run / "last.pt").exists():
+        (run / "last.pt").unlink()  # the final snapshot is the same state
     (results / "done").touch()
     log(f"{args.arm}: done")
 

@@ -70,6 +70,8 @@ def main():
     parser.add_argument("--eval", help="eval_sentences.py output directory of this step")
     parser.add_argument("--audio", type=int, default=24, help="Generated sentences to upload for listening")
     parser.add_argument("--no-checkpoint", action="store_true")
+    parser.add_argument("--slim", action="store_true",
+                        help="Upload the weights without optimizer/RNG state (~1/3 of the size; loadable, --init-from works)")
     parser.add_argument("--title", default="")
     parser.add_argument("--notes", default="")
     parser.add_argument("--public", action="store_true")
@@ -88,9 +90,17 @@ def main():
             if not checkpoint.exists():
                 raise FileNotFoundError(checkpoint)
             (staging / "checkpoints").mkdir()
-            os.link(checkpoint, staging / "checkpoints" / f"{name}.pt") if checkpoint.stat().st_dev == staging.stat().st_dev \
-                else shutil.copy2(checkpoint, staging / "checkpoints" / f"{name}.pt")
-            entry["checkpoint"] = True
+            target = staging / "checkpoints" / f"{name}.pt"
+            if args.slim:
+                import torch
+
+                saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
+                torch.save({k: v for k, v in saved.items() if k not in ("optimizer", "rng")}, target)
+            elif checkpoint.stat().st_dev == staging.stat().st_dev:
+                os.link(checkpoint, target)
+            else:
+                shutil.copy2(checkpoint, target)
+            entry["checkpoint"] = "slim" if args.slim else "full"
         if args.eval and Path(args.eval, "summary.json").exists():
             source = Path(args.eval)
             target = staging / "eval" / name
