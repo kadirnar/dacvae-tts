@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from arms import ARMS, FINETUNE  # noqa: E402
+from arms import ARMS, FINETUNE, POSTTRAIN  # noqa: E402
 from run_arm import PY, REPO, log, setting  # noqa: E402
 
 
@@ -24,7 +24,8 @@ def trainers():
     """Training processes on this machine (any launcher): the GPU is saturated by one."""
     # The pattern must not start with "-": pgrep would read it as its own option.
     # Anchored at the start of the command line: a shell whose text merely mentions the command must not count.
-    found = subprocess.run(["pgrep", "-f", "^[^ ]*python[^ ]* -u -m dacvae_tts train"], capture_output=True, text=True)
+    found = subprocess.run(["pgrep", "-f", "^[^ ]*python[^ ]* (-u -m dacvae_tts train|[^ ]*dacvae-tts post-train)"],
+                           capture_output=True, text=True)
     return len(found.stdout.split())
 
 
@@ -64,7 +65,8 @@ def main():
                     log(f"done {arm}")
         while pending and max(trainers(), sum(training_active(arm) for arm in ARMS)) < args.parallel:
             ready = [arm for arm in pending if all((cache / need).exists() for need in ARMS[arm][3])
-                     and not training_active(arm) and (arm not in FINETUNE or Path(FINETUNE[arm]["init"]).exists())]
+                     and not training_active(arm) and (arm not in FINETUNE or Path(FINETUNE[arm]["init"]).exists())
+                     and (arm not in POSTTRAIN or Path(POSTTRAIN[arm]["init"]).exists())]
             if not ready:
                 break
             arm = ready[0]
@@ -77,6 +79,8 @@ def main():
                                   f"stopped at {setting('AB_STOP')}; cache {cache.name} of tr-combined."]
             if overrides:
                 command += ["--set", *overrides]
+            if arm in POSTTRAIN:  # an exclusive post-training job with its own script (training, evaluation, push)
+                command = ["bash", POSTTRAIN[arm]["script"]]
             stream = open(out / f"queue-{arm}.log", "a")
             # "full-*" arms train the whole 60k schedule (the model candidates), the others stop at AB_STOP.
             env = {**os.environ, **({"AB_STOP": os.environ.get("AB_STEPS", "60000")} if arm.startswith("full-") else {})}
