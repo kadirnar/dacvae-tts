@@ -581,7 +581,8 @@ class Synthesizer:
             )
             voice = self._measure(
                 lambda: self.model.reference_summary(batch["prompt"], batch["prompt_mask"], batch.get("speaker"),
-                                                     batch.get("context"), batch.get("context_mask")),
+                                                     batch.get("context"), batch.get("context_mask"),
+                                                     self.quality_input(batch["prompt"].size(0))),
                 stages,
                 "reference_summary_seconds",
             )

@@ -92,3 +92,39 @@ def test_config_pairs_the_model_flag_with_a_store():
     config = Config(ModelConfig(**SMALL, quality_condition=True, quality_target=[3.5, 4.0, 3.2]),
                     TrainConfig(pairing="within", quality_scores="quality/dnsmos.json"))
     assert Config.from_dict(config.to_dict()).to_dict() == config.to_dict()  # resume compares these
+
+
+def test_synthesizer_generate_asks_for_the_quality_target():
+    """Synthesizer.generate builds its own condition cache: the requested quality must be in it (review finding)."""
+    from types import SimpleNamespace
+
+    from dacvae_tts.inference import Synthesizer
+
+    torch.manual_seed(2)
+    model = FlowTTS(ModelConfig(**SMALL, quality_condition=True, quality_target=(3.9, 4.2, 3.6))).eval()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(0, 0.3)
+    tts = Synthesizer.__new__(Synthesizer)
+    tts.model, tts.device, tts.precision, tts.profile = model, torch.device("cpu"), "fp32", False
+    tts.quality_target = None
+    captured = {}
+
+    def finish(target, prompt, **options):
+        captured["target"] = target.clone()
+        return torch.zeros(10), {}
+
+    tts._finish = finish
+    tts.codec = SimpleNamespace(sample_rate=2500, hop_length=100, latent_dim=4)
+    batch = inputs(batch=1)
+    batch = {k: v for k, v in batch.items() if k not in ("x", "time")}
+    try:
+        tts.generate(dict(batch), steps=3, guidance=2.0, seed=0)
+    except Exception:  # metadata after decoding needs a real codec; the latents are captured before that
+        pass
+    core = {k: batch[k] for k in ("prompt", "prompt_mask", "valid", "tokens", "segments")}
+    mask = batch["valid"][0] & ~batch["prompt_mask"][0]
+    wanted = sample(model, **core, steps=3, guidance=2.0, seed=0, quality=quality_features([[3.9, 4.2, 3.6]]))
+    unknown = sample(model, **core, steps=3, guidance=2.0, seed=0, quality=torch.zeros(1, 3))
+    assert torch.allclose(captured["target"], wanted[0, mask], atol=1e-5)
+    assert not torch.allclose(captured["target"], unknown[0, mask], atol=1e-3)

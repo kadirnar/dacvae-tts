@@ -104,9 +104,10 @@ class Objective(nn.Module):
         if "negative_tokens" in batch:  # drawn by the loader workers (train.loader_negatives)
             return batch["negative_tokens"], batch["negative_segments"], batch["negative_usable"]
         tokens, segments = batch["tokens"].cpu(), batch["segments"].cpu()
+        starts = batch["target_start"].tolist() if "target_start" in batch else [0] * len(tokens)
         rows, usable = [], []
-        for row_tokens, row_segments in zip(tokens, segments):
-            corrupted = corrupt_transcript(row_tokens, row_segments, self.rng)
+        for row_tokens, row_segments, start in zip(tokens, segments, starts):
+            corrupted = corrupt_transcript(row_tokens, row_segments, self.rng, start)
             usable.append(corrupted is not None)
             rows.append(corrupted if corrupted is not None else (row_tokens, row_segments))
         width = max(len(t) for t, _ in rows)
