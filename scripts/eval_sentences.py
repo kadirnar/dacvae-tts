@@ -245,7 +245,7 @@ def score_hf(rows, out, args, protocol=None, originals=None):
     from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
     from dacvae_tts.codec import read_audio
-    from dacvae_tts.metrics import DNSMOS, error_counts
+    from dacvae_tts.metrics import error_counts, make_dnsmos
 
     device = args.device
     name = args.asr_model if "/" in args.asr_model else f"openai/whisper-{args.asr_model}"
@@ -257,7 +257,7 @@ def score_hf(rows, out, args, protocol=None, originals=None):
 
     evaluator.extractor = AutoFeatureExtractor.from_pretrained(args.speaker_model)
     evaluator.speaker = AutoModelForAudioXVector.from_pretrained(args.speaker_model).to(device).eval()
-    dnsmos = DNSMOS(args.dnsmos) if args.dnsmos else None
+    dnsmos = make_dnsmos(args.dnsmos) if args.dnsmos else None
     scorer = ProtocolScorer(protocol, device, dnsmos) if protocol is not None else None
     normalization = args.metric_normalization or default_metric_normalization(args.language)
     identity = row_identity({  # the same compact identity the faster-whisper rows carry
@@ -459,13 +459,13 @@ def main():
         sentences = []
     rule, selector, selection_bias = parse_select_by(args.select_by), None, None
     if args.candidates > 1 and sentences:
-        from dacvae_tts.metrics import DNSMOS
+        from dacvae_tts.metrics import make_dnsmos
 
         needs = {METRIC_FAMILY[m] for m in rule.metrics}
         selector = CandidateScorer(
             rule,
             transcriber=HFWhisper(args.selector, args.device, args.language) if "asr" in needs else None,
-            dnsmos=DNSMOS(args.dnsmos) if "dnsmos" in needs and args.dnsmos else None,
+            dnsmos=make_dnsmos(args.dnsmos) if "dnsmos" in needs and args.dnsmos else None,
             utmos=load_utmos(args.select_utmos, args.device) if "utmos" in needs else None,
             speaker=speaker_embedder(args.select_speaker_model, args.device) if "speaker" in needs else None,
         )

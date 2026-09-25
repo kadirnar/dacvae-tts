@@ -166,6 +166,16 @@ class DNSMOS:
         return dict(zip(("dnsmos_sig", "dnsmos_bak", "dnsmos_ovrl"), map(float, scores)))
 
 
+def make_dnsmos(model_path):
+    """The DNSMOS scorer of the evaluation tools: onnxruntime on the CPU (the official runtime) by default, or the
+    PyTorch port on the device named by DACVAE_DNSMOS_DEVICE (e.g. cuda). The two agree within 1e-5 MOS on the raw
+    windows (TorchDNSMOS); one-thread CPU sessions cost ~1 s per clip on a busy machine, the GPU a few ms."""
+    import os
+
+    device = os.environ.get("DACVAE_DNSMOS_DEVICE", "cpu")
+    return DNSMOS(model_path) if device == "cpu" else TorchDNSMOS(model_path, device)
+
+
 DNSMOS_CALIBRATION = (
     (-0.08397278, 1.22083953, 0.0052439),
     (-0.13166888, 1.60915514, -0.39604546),
@@ -281,7 +291,7 @@ class Evaluator:
 
         compute_type = "float16" if device == "cuda" else "int8"
         self.asr = WhisperModel(asr_model, device=device, compute_type=compute_type)
-        self.dnsmos = DNSMOS(dnsmos_model) if dnsmos_model else None
+        self.dnsmos = make_dnsmos(dnsmos_model) if dnsmos_model else None
         self.device = torch.device(device)
         self.speaker_name = speaker_model
         self.asr_name = asr_model
