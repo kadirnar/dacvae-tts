@@ -24,7 +24,7 @@ import json
 import sys
 from pathlib import Path
 
-from dacvae_tts.teacher import CacheAudio
+from dacvae_tts.teacher import CacheAudio, ParquetAudio
 from dacvae_tts.tempo import DEFAULT_TEMPOS, build_tempo_variants, merge_tempo_parts, tempo_key
 
 
@@ -48,7 +48,13 @@ def build(args):
     def encode(waveform):
         return codec.encode(torch.from_numpy(waveform)).cpu().numpy()
 
-    audio = CacheAudio(args.cache, args.audio_source, codec.decode)
+    if args.audio_source == "parquet":  # the original audio from the Hub dataset: no decode round trip
+        import os
+
+        audio = ParquetAudio(args.cache, args.parquet_repo, args.parquet_dir or Path(args.output) / "parquet",
+                             token=os.environ.get("HF_TOKEN"))
+    else:
+        audio = CacheAudio(args.cache, args.audio_source, codec.decode)
     return build_tempo_variants(args.cache, args.output, encode, audio, [tempo_key(t) for t in args.tempos],
                                 args.splits, args.shard_index, args.num_shards, progress=not args.quiet)
 
@@ -62,7 +68,9 @@ def main(argv=None):
     b.add_argument("--tempos", nargs="+", default=[t / 1000 for t in DEFAULT_TEMPOS],
                    help="Tempo factors (x0.8 slower .. x1.25 faster); 1.0 is the re-encoded round trip")
     b.add_argument("--splits", nargs="+", default=["train"])
-    b.add_argument("--audio-source", choices=["auto", "original", "decode"], default="auto")
+    b.add_argument("--audio-source", choices=["auto", "original", "decode", "parquet"], default="auto")
+    b.add_argument("--parquet-repo", help="--audio-source parquet: the HF dataset the cache was prepared from")
+    b.add_argument("--parquet-dir", help="--audio-source parquet: download directory (one shard at a time)")
     b.add_argument("--codec", help="DACVAE checkpoint (default: the cache's)")
     b.add_argument("--device", default="cuda")
     b.add_argument("--shard-index", type=int, default=0)
