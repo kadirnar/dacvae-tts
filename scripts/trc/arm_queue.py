@@ -23,14 +23,15 @@ from run_arm import PY, REPO, log, setting  # noqa: E402
 def trainers():
     """Training processes on this machine (any launcher): the GPU is saturated by one."""
     # The pattern must not start with "-": pgrep would read it as its own option.
-    found = subprocess.run(["pgrep", "-f", "python -u -m dacvae_tts train"], capture_output=True, text=True)
+    # Anchored at the start of the command line: a shell whose text merely mentions the command must not count.
+    found = subprocess.run(["pgrep", "-f", "^[^ ]*python[^ ]* -u -m dacvae_tts train"], capture_output=True, text=True)
     return len(found.stdout.split())
 
 
 def training_active(arm):
     """An arm occupies a training slot while a trainer with its config lives (whoever launched it); its evaluations
     then overlap the next arm's training (one compiled arm already saturates an RTX 5090)."""
-    found = subprocess.run(["pgrep", "-f", f"python -u -m dacvae_tts train --config .*/trc-{arm}.yaml "],
+    found = subprocess.run(["pgrep", "-f", f"^[^ ]*python[^ ]* -u -m dacvae_tts train --config .*/trc-{arm}.yaml "],
                            capture_output=True)
     return found.returncode == 0
 
