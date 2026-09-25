@@ -111,6 +111,10 @@ Results and decisions: [docs/turkish-experiments-2026-09-22.md](docs/turkish-exp
 
 ## More
 
+- [docs/tr-combined-experiments-2026-09-25.md](docs/tr-combined-experiments-2026-09-25.md): GPU evidence for the roadmap
+  issues on Codyfederer/tr-combined and the new Turkish model (WER 5.10 → 2.94 vs run C at equal inference settings);
+  the tooling is in `scripts/trc/`.
+
 - [docs/reference.md](docs/reference.md): the detailed reference (all commands, flags, Tiny/Small
   baselines, DDP, post-training, evaluation protocols, limits).
 - [docs/research-report-2026-09-24.md](docs/research-report-2026-09-24.md): block-by-block architecture,
