@@ -10,6 +10,7 @@ compared at equal loudness (#13). The copy keeps cases.json, results.jsonl and t
 """
 
 import argparse
+import json
 import shutil
 from pathlib import Path
 
@@ -34,6 +35,12 @@ def main():
             audio, rate = sf.read(path, dtype="float32")
             sf.write(output / path.name, normalize_loudness(audio, rate, args.lufs), rate, subtype="FLOAT")
             count += 1
+        elif path.name == "results.jsonl":
+            # --rescore reuses each row's `audio` path: point it at the normalized copy, not the source WAV.
+            rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+            for row in rows:
+                row["audio"] = str(output / Path(row["audio"]).name)
+            (output / path.name).write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n")
         else:
             shutil.copy2(path, output / path.name)
     print(f"{count} sentence WAVs normalized to {args.lufs} LUFS -> {output}")
