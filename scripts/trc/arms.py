@@ -64,3 +64,15 @@ ARMS = {
 }
 ARMS = {name: (issue, config, (EXECUTION + overrides) if config == BASE else overrides, needs)
         for name, (issue, config, overrides, needs) in ARMS.items()}
+
+# Round 1c: after pairs-cross won by a wide margin (20k WER 12.0 vs 30.3 for the plain recipe), every further option is
+# tested on top of it: "x-<arm>" = BASE + EXECUTION + CROSS + the arm's own change, against pairs-cross (seed 42) and
+# x-s43 (its seed-43 twin, the noise floor of the new base).
+ROUND2 = ("latent-negatives", "quality-cond", "no-negatives", "pairs-tail", "pairs-char-ctc", "char-units", "long-skip",
+          "value-residual", "ffn-conv", "attn-gate", "swiglu", "final-adaln", "cond-text-pool", "regularized",
+          "speaker-context", "repa", "tla", "repa-tla", "speaker-condition")
+ARMS["x-s43"] = ("noise floor of base+cross", BASE, EXECUTION + CROSS + ["train.seed=43"], [])
+for _name in ROUND2:
+    _issue, _config, _overrides, _needs = ARMS[_name]
+    _own = [o for o in _overrides if o not in EXECUTION]
+    ARMS[f"x-{_name}"] = (f"{_issue}, on base+cross", BASE, EXECUTION + CROSS + _own, _needs)
