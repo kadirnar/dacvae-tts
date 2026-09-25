@@ -18,4 +18,7 @@ fi
 uv pip install --python .venv/bin/python "torch==${torch_version}" "torchaudio==${torch_version}" \
   --index-url "https://download.pytorch.org/whl/${cuda}"
 uv pip install --python .venv/bin/python -e ".${extras}"
+# GPU DNSMOS (metrics.TorchDNSMOS): the ONNX model converted to PyTorch. --no-deps: onnx2torch's own requirements
+# would replace the CUDA build of torch/torchvision installed above.
+uv pip install --python .venv/bin/python --no-deps "onnx>=1.16" "onnx2torch>=1.5"
 .venv/bin/dacvae-tts inspect --config configs/nano.yaml >/dev/null && echo "ok: source .venv/bin/activate"
