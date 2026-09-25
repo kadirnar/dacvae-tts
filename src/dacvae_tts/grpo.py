@@ -649,12 +649,14 @@ class SimilarityTerm:
 
 class DNSMOSTerm:
     def __init__(self, path):
-        from .metrics import DNSMOS
+        from .metrics import make_dnsmos
 
-        self.model = DNSMOS(path)
+        self.model = make_dnsmos(path)  # DACVAE_DNSMOS_DEVICE=cuda: the batched GPU port (TorchDNSMOS)
 
     def __call__(self, group):
         audios = group.audio()
+        if hasattr(self.model, "score_many"):  # GPU: one batched pass over the group's windows
+            return [score["dnsmos_ovrl"] for score in self.model.score_many(audios)]
         # Single-threaded ONNX sessions: score the clips of a group in parallel threads.
         with ThreadPoolExecutor(max_workers=min(8, len(audios))) as pool:
             return [score["dnsmos_ovrl"] for score in pool.map(self.model, audios)]
