@@ -27,7 +27,8 @@ COMMON=(--prompt-set /workspace/data/eval/cv-tr-prompts/prompts.json --sentences
   --guidance 5.0 --steps 32 --asr-backend faster-whisper --asr-device cuda --dnsmos /workspace/models/sig_bak_ovr.onnx
   --protocol-v2 --metric-normalization turkish-v2 --freya-metric)
 for seed in 42 1000; do
-  dir=$OUT/step-$(printf %07d "$STEPS")$([[ $seed == 1000 ]] && echo -s1000)
+  dir=$OUT/step-$(printf %07d "$STEPS")
+  if [[ $seed == 1000 ]]; then dir=$dir-s1000; fi  # not `$([[ ]] && echo)`: its status 1 ends the script under set -e
   [[ -f $dir/summary.json ]] && continue
   mkdir -p "$dir"
   .venv/bin/python scripts/trc/eval_slot.py -- .venv/bin/python scripts/eval_sentences.py --checkpoint "$FINAL" \
