@@ -9,9 +9,12 @@ single-variable configs in configs/experiments/ (#8-#11, #14 and the second-roun
 BASE = "configs/nano_tr_w512_fast.yaml"
 EAGER = "configs/nano_tr_w512.yaml"
 # Execution on a 32 GB RTX 5090 (#7 benchmark, outputs/trc/RESULTS.md): compiled blocks, selective checkpointing and
-# symbolic lengths: 0.141 s/update and 7.4 GB (4 compiled graphs), so two arms and an evaluation share the GPU; run C's
-# eager execution with full checkpointing takes 0.273 s. Only the execution differs, not the objective.
-EXECUTION = ["train.grad_checkpoint=selective", "train.compile_dynamic=auto"]
+# symbolic lengths (0.14 s/update, ~8 GB, 4 compiled graphs; run C's eager execution with full checkpointing: 0.27 s).
+# No length padding: with symbolic lengths it bounds nothing, and on tr-combined's short clips pad_multiple 64 spent
+# 20% of every frame budget on padding (13.8k vs 17.3k target frames per update; at equal frames seen the padded and
+# eager runs had the same WER/CER, so the loss was data per update, not numerics). Only the execution differs.
+EXECUTION = ["train.grad_checkpoint=selective", "train.compile_dynamic=auto", "train.pad_multiple=1",
+             "train.text_pad_multiple=1"]
 
 LATENT_NEGATIVES = [
     "train.contrastive_mode=latent_delta", "train.contrastive_random_weight=0.2", "train.contrastive_aug_weight=0.2",
