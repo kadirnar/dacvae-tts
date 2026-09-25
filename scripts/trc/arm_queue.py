@@ -28,12 +28,10 @@ def trainers():
 
 
 def training_active(arm):
-    """An arm occupies a training slot while its run_arm.py lives (any queue) and its final snapshot is missing;
-    its evaluations may then overlap the next arm's training."""
-    final = Path(setting("RUNS")) / f"trc-{arm}" / f"step-{int(setting('AB_STOP')):07d}.pt"
-    if final.exists():
-        return False
-    found = subprocess.run(["pgrep", "-f", f"scripts/trc/run_arm.py --arm {arm} --config"], capture_output=True)
+    """An arm occupies a training slot while a trainer with its config lives (whoever launched it); its evaluations
+    then overlap the next arm's training (one compiled arm already saturates an RTX 5090)."""
+    found = subprocess.run(["pgrep", "-f", f"python -u -m dacvae_tts train --config .*/trc-{arm}.yaml "],
+                           capture_output=True)
     return found.returncode == 0
 
 
