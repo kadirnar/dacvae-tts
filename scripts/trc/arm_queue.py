@@ -41,7 +41,7 @@ def main():
         sys.exit(f"unknown arms: {unknown}; known: {sorted(ARMS)}")
     out, cache = Path(setting("OUT")), Path(setting("CACHE"))
     pending = [arm for arm in args.arms if not (out / arm / "done").exists()]
-    running, failed = {}, []
+    running, failed, started, streak = {}, [], {}, 0
     while pending or running:
         for arm, process in list(running.items()):
             if process.poll() is not None:
@@ -49,6 +49,11 @@ def main():
                 if process.returncode:
                     failed.append(arm)
                     log(f"FAILED {arm} ({process.returncode})")
+                    quick = time.time() - started[arm] < 900
+                    streak = streak + 1 if quick else 0
+                    if streak >= 2:  # two arms died within 15 minutes of starting: a shared cause, stop
+                        log(f"stopping: {failed[-2:]} failed right after starting; see their trc-*.log")
+                        pending.clear()
                 else:
                     log(f"done {arm}")
         while pending and sum(training_active(arm) for arm in ARMS) < args.parallel:
@@ -68,6 +73,7 @@ def main():
                 command += ["--set", *overrides]
             stream = open(out / f"queue-{arm}.log", "a")
             running[arm] = subprocess.Popen(command, cwd=REPO, stdout=stream, stderr=subprocess.STDOUT, env=os.environ)
+            started[arm] = time.time()
             log(f"start {arm} ({issue})")
             time.sleep(90)  # stagger compilation and loader start-up
         if pending and not running and not any(all((cache / n).exists() for n in ARMS[a][3]) for a in pending):
