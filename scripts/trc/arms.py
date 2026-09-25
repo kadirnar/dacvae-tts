@@ -94,3 +94,7 @@ ARMS["ft-w0"] = ("#14 control: same fine-tune, w=0 (sampled at g=5)", "/workspac
 # Post-training jobs run through the queue as exclusive jobs (their own script; ready once their input exists).
 POSTTRAIN = {"grpo": dict(script="scripts/trc/run_grpo.sh", init="/workspace/runs/trc-full-cross/step-0060000.pt")}
 ARMS["grpo"] = ("#16 Flow-GRPO from full-cross 60k", "", [], [])
+
+# Second training seed of the best x-arm (character units beat both base seeds at 20k): the strict test of #4's rule.
+ARMS["x-char-units-s43"] = ("round 2 char units, training seed 43", BASE,
+                            EXECUTION + CROSS + ["model.text_units=chars", "train.seed=43"], [])
