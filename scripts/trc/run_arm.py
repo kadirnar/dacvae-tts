@@ -12,6 +12,7 @@ metric. Everything is idempotent: a finished step is skipped, an interrupted run
 """
 
 import argparse
+import fcntl
 import os
 import subprocess
 import sys
@@ -75,7 +76,11 @@ def evaluate(checkpoint, out, limit, gpu, seed=42):
     if limit:
         command += ["--limit", str(limit)]
     out.mkdir(parents=True, exist_ok=True)
-    with open(out.parent / f"{out.name}.log", "a") as stream:
+    # One evaluation at a time on the GPU: two training arms plus two evaluations (~7 GB each) exceed 32 GB, and the
+    # arms reach their snapshots together.
+    lock = Path(setting("OUT")) / ".evaluation.lock"
+    with open(lock, "w") as held, open(out.parent / f"{out.name}.log", "a") as stream:
+        fcntl.flock(held, fcntl.LOCK_EX)
         subprocess.run(command, check=True, cwd=REPO, stdout=stream, stderr=subprocess.STDOUT,
                        env={**os.environ, "CUDA_VISIBLE_DEVICES": gpu})
 
