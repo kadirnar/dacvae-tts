@@ -8,6 +8,10 @@ single-variable configs in configs/experiments/ (#8-#11, #14 and the second-roun
 
 BASE = "configs/nano_tr_w512_fast.yaml"
 EAGER = "configs/nano_tr_w512.yaml"
+# Execution on a 32 GB RTX 5090 (#7 benchmark, outputs/trc/RESULTS.md): compiled blocks, selective checkpointing and
+# symbolic lengths: 0.141 s/update and 7.4 GB (4 compiled graphs), so two arms and an evaluation share the GPU; run C's
+# eager execution with full checkpointing takes 0.273 s. Only the execution differs, not the objective.
+EXECUTION = ["train.grad_checkpoint=selective", "train.compile_dynamic=auto"]
 
 LATENT_NEGATIVES = [
     "train.contrastive_mode=latent_delta", "train.contrastive_random_weight=0.2", "train.contrastive_aug_weight=0.2",
@@ -22,7 +26,7 @@ REPA = ["model.repa_layer=10", "model.repa_dim=256", "train.teacher_features=tea
 TLA = ["model.tla_layers=all", "model.tla_dim=192", "model.tla_hidden=256",
        "train.speaker_embeddings=teacher/ecapa-speechbrain", "train.tla_weight=0.5", "train.tla_entropy=0.01"]
 
-# name: (issue, config, overrides, files the arm needs next to the cache)
+# name: (issue, config, overrides, files the arm needs next to the cache); BASE arms get EXECUTION prepended.
 ARMS = {
     "base-s42": ("#7 baseline", BASE, [], []),
     "base-eager": ("#7", EAGER, [], []),
@@ -54,3 +58,5 @@ ARMS = {
     "tempo-prompts": ("round 2", BASE, ["train.tempo_prompt_prob=0.3", "train.tempo_variants=tempo/wsola-v1"],
                       ["tempo/wsola-v1"]),
 }
+ARMS = {name: (issue, config, (EXECUTION + overrides) if config == BASE else overrides, needs)
+        for name, (issue, config, overrides, needs) in ARMS.items()}
