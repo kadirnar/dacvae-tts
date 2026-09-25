@@ -30,7 +30,7 @@ def acquire(slots):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--slots", type=int, default=int(os.environ.get("EVAL_SLOTS", "2")))
+    parser.add_argument("--slots", type=int, default=int(os.environ.get("EVAL_SLOTS", "1")))
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command

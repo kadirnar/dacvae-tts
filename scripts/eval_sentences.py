@@ -447,6 +447,9 @@ def main():
                    **{name: getattr(args, name) for name in (*WINDOW_OPTIONS, *OUTPUT_OPTIONS)})
     if previous is not None:  # rescore: reuse the synthesis rows of the previous pass
         rows = [{k: v for k, v in r.items() if k in {"id", "text", "speaker", "prompt", "prompt_uid", "audio", "audio_seconds", "rtf", "error", "selected_factor"}} for r in previous]
+        for row in rows:  # a scoring failure (e.g. CUDA OOM next to other jobs) is rescored; a synthesis failure stays
+            if str(row.get("error", "")).startswith("score: ") and Path(row["audio"]).exists():
+                del row["error"]
         sentences = []
     elif tts is None:  # rescore an interrupted pass: rebuild the rows from the WAVs and their JSON sidecars
         for index, sentence in enumerate(sentences):

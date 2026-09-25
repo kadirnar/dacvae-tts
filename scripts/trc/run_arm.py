@@ -12,6 +12,7 @@ metric. Everything is idempotent: a finished step is skipped, an interrupted run
 """
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -75,10 +76,28 @@ def evaluate(checkpoint, out, limit, gpu, seed=42):
     if limit:
         command += ["--limit", str(limit)]
     out.mkdir(parents=True, exist_ok=True)
-    # At most EVAL_SLOTS (2) evaluations at once on the GPU next to the training run (~6 GB each, ~9 GB training).
+    # At most EVAL_SLOTS evaluations at once on the GPU next to the training run (~6 GB each, ~9 GB training).
     with open(out.parent / f"{out.name}.log", "a") as stream:
         subprocess.run([PY, "scripts/trc/eval_slot.py", "--", *command], check=True, cwd=REPO, stdout=stream,
                        stderr=subprocess.STDOUT, env={**os.environ, "CUDA_VISIBLE_DEVICES": gpu})
+        # Rows that failed in scoring (CUDA OOM next to other jobs) would silently bias the summary: rescore them.
+        for attempt in range(3):
+            if not scoring_errors(out):
+                break
+            log(f"{out}: {scoring_errors(out)} rows failed in scoring; rescoring (attempt {attempt + 1})")
+            subprocess.run([PY, "scripts/trc/eval_slot.py", "--", *command, "--rescore"], check=True, cwd=REPO,
+                           stdout=stream, stderr=subprocess.STDOUT, env={**os.environ, "CUDA_VISIBLE_DEVICES": gpu})
+        if scoring_errors(out):
+            raise subprocess.CalledProcessError(1, command, f"{scoring_errors(out)} rows still failed in scoring")
+
+
+def scoring_errors(out):
+    """Rows of OUT/results.jsonl whose scoring failed (their summary would average the other rows only)."""
+    path = out / "results.jsonl"
+    if not path.exists():
+        return 0
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    return sum(str(r.get("error", "")).startswith("score: ") for r in rows)
 
 
 def wandb_log(arm, step, out, final):
