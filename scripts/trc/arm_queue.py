@@ -29,6 +29,12 @@ def trainers():
     return len(found.stdout.split())
 
 
+def exclusive_alive():
+    """A post-training job (its script) is alive, whoever started it."""
+    return any(subprocess.run(["pgrep", "-f", f"^bash {job['script']}"], capture_output=True).returncode == 0
+               for job in POSTTRAIN.values())
+
+
 def training_active(arm):
     """An arm occupies a training slot while a trainer with its config lives (whoever launched it); its evaluations
     then overlap the next arm's training (one compiled arm already saturates an RTX 5090)."""
@@ -64,9 +70,9 @@ def main():
                 else:
                     log(f"done {arm}")
         # An exclusive post-training job occupies the GPU for its whole life, including while it waits for the
-        # evaluation lock before its trainer exists (GRPO once collided with the next arm that way).
-        exclusive = any(arm in POSTTRAIN for arm in running)
-        while (pending and not exclusive
+        # evaluation lock before its trainer exists (GRPO collided twice with the next arm that way). Checked on every
+        # launch and by process, so a restarted queue also sees a job an earlier queue started.
+        while (pending and not exclusive_alive()
                and max(trainers(), sum(training_active(arm) for arm in ARMS)) < args.parallel):
             ready = [arm for arm in pending if all((cache / need).exists() for need in ARMS[arm][3])
                      and not training_active(arm) and (arm not in FINETUNE or Path(FINETUNE[arm]["init"]).exists())
