@@ -152,6 +152,10 @@ def main():
                           f"{setting('FRAME_BUDGET')}, {setting('AB_STEPS')}-update schedule stopped at {stop}."
     for step in steps:
         snapshot = run / f"step-{step:07d}.pt"
+        if not snapshot.exists() and trainer is None:
+            # A restarted arm: pushed snapshots were deleted locally; their evaluations and pushes are done.
+            log(f"{args.arm}: step {step} snapshot not on disk (already pushed); skipping")
+            continue
         while not snapshot.exists():
             if trainer is not None and trainer.poll() is not None:
                 if not snapshot.exists():
