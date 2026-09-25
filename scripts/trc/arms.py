@@ -48,6 +48,9 @@ ARMS = {
     "speaker-condition": ("round 2", BASE, ["model.speaker_condition_dim=192",
                                             "train.speaker_condition=teacher/ecapa-speechbrain"],
                           ["teacher/ecapa-speechbrain"]),
+    "quality-cond": ("new: quality condition", BASE, ["model.quality_condition=true",
+                                                     "train.quality_scores=quality/dnsmos.json"],
+                     ["quality/dnsmos.json"]),
     "tempo-prompts": ("round 2", BASE, ["train.tempo_prompt_prob=0.3", "train.tempo_variants=tempo/wsola-v1"],
                       ["tempo/wsola-v1"]),
 }

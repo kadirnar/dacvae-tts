@@ -62,7 +62,7 @@ def derive(base, output, overrides):
     return output
 
 
-def evaluate(checkpoint, out, limit, gpu):
+def evaluate(checkpoint, out, limit, gpu, seed=42):
     if (out / "summary.json").exists():
         return
     command = [
@@ -70,7 +70,7 @@ def evaluate(checkpoint, out, limit, gpu):
         "--sentences", setting("FREYA"), "--output", str(out), "--guidance", setting("GUIDANCE"),
         "--steps", setting("SAMPLE_STEPS"), "--asr-backend", os.environ.get("ASR_BACKEND", "faster-whisper"),
         "--asr-device", "cuda", "--dnsmos", setting("DNSMOS"), "--protocol-v2", "--metric-normalization", "turkish-v2",
-        "--freya-metric",
+        "--freya-metric", "--seed", str(seed),
     ]
     if limit:
         command += ["--limit", str(limit)]
@@ -166,6 +166,13 @@ def main():
         if out is not None:
             wandb_log(args.arm, step, out, is_final)
         push(args.arm, run, step, out, title, notes)
+        if is_final:
+            # A second sampling seed: one 495-sentence generation cannot resolve < ~1 WER point (run C: seed 42 vs
+            # 1000 differed by +0.9, a tie); compare_evals.py pools LABEL=dir,dir-s1000 as replicates.
+            try:
+                evaluate(snapshot, results / f"step-{step:07d}-s1000", 0, args.gpu, seed=1000)
+            except subprocess.CalledProcessError as error:
+                log(f"{args.arm}: seed-1000 evaluation failed ({error.returncode})")
     if trainer is not None:
         trainer.wait()
     (results / "done").touch()
