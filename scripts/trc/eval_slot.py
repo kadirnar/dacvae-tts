@@ -1,6 +1,7 @@
 """Run a command while holding one of N evaluation slots (a flock semaphore shared by every launcher).
 
-Two evaluations (~6 GB each) and a training run (~9 GB) fit a 32 GB GPU; the slots keep a third from starting.
+One slot (the default) is the shared `.evaluation.lock`: two evaluations next to a training run ran CTranslate2 out of
+CUDA memory on a 32 GB GPU (the caching allocators of both processes keep what they reserved).
 
   python scripts/trc/eval_slot.py [--slots 2] -- .venv/bin/python scripts/eval_sentences.py ...
 """
@@ -17,6 +18,10 @@ LOCKS = Path(os.environ.get("EVAL_LOCKS", "/workspace/outputs/trc"))
 
 
 def acquire(slots):
+    if slots == 1:  # the lock every earlier launcher (run_arm, the inference scripts) takes: all evaluations serialize
+        handle = open(LOCKS / ".evaluation.lock", "w")
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        return handle
     while True:
         for index in range(slots):
             handle = open(LOCKS / f".evaluation-slot-{index}.lock", "w")
