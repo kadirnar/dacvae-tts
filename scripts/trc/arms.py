@@ -79,3 +79,14 @@ for _name in ROUND2:
 
 # Full-length model candidates (60k updates, the whole LR schedule): the answer to "is it better than run C?".
 ARMS["full-cross"] = ("model candidate: run C recipe + cross prompts, 60k", BASE, EXECUTION + CROSS, [])
+
+# #14 (c) model-guidance fine-tune of the full-length model: 8k updates from full-cross 60k (LR 2e-4, EMA 0.9995 without
+# warm-up, no text hinge, which model guidance cannot combine with). The w=0 control is the same fine-tune without
+# guidance, sampled with CFG 5, so extra updates cannot pass for a model-guidance gain. Configs: derive_config.py of
+# configs/experiments/tr_w512_model_guidance_ft.yaml + EXECUTION + CROSS (runs/configs/mg-ft-w*.yaml).
+FINETUNE = {
+    "ft-mg-w07": dict(init="/workspace/runs/trc-full-cross/step-0060000.pt", guidance="1.0", steps="8000"),
+    "ft-w0": dict(init="/workspace/runs/trc-full-cross/step-0060000.pt", guidance="5.0", steps="8000"),
+}
+ARMS["ft-mg-w07"] = ("#14 model guidance w=0.7 (sampled at g=1)", "/workspace/runs/configs/mg-ft-w0.7.yaml", [], [])
+ARMS["ft-w0"] = ("#14 control: same fine-tune, w=0 (sampled at g=5)", "/workspace/runs/configs/mg-ft-w0.0.yaml", [], [])

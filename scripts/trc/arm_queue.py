@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from arms import ARMS  # noqa: E402
+from arms import ARMS, FINETUNE  # noqa: E402
 from run_arm import PY, REPO, log, setting  # noqa: E402
 
 
@@ -64,7 +64,7 @@ def main():
                     log(f"done {arm}")
         while pending and max(trainers(), sum(training_active(arm) for arm in ARMS)) < args.parallel:
             ready = [arm for arm in pending if all((cache / need).exists() for need in ARMS[arm][3])
-                     and not training_active(arm)]
+                     and not training_active(arm) and (arm not in FINETUNE or Path(FINETUNE[arm]["init"]).exists())]
             if not ready:
                 break
             arm = ready[0]
@@ -80,6 +80,10 @@ def main():
             stream = open(out / f"queue-{arm}.log", "a")
             # "full-*" arms train the whole 60k schedule (the model candidates), the others stop at AB_STOP.
             env = {**os.environ, **({"AB_STOP": os.environ.get("AB_STEPS", "60000")} if arm.startswith("full-") else {})}
+            if arm in FINETUNE:  # warm-started fine-tune: its own schedule length, guidance and initial weights
+                fine = FINETUNE[arm]
+                env.update(AB_STEPS=fine["steps"], AB_STOP=fine["steps"], GUIDANCE=fine["guidance"])
+                command += ["--init-from", fine["init"]]
             running[arm] = subprocess.Popen(command, cwd=REPO, stdout=stream, stderr=subprocess.STDOUT, env=env)
             started[arm] = time.time()
             log(f"start {arm} ({issue})")
