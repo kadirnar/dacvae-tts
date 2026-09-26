@@ -90,7 +90,8 @@ class Field(nn.Module):
         super().__init__()
         self.conditioned, self.null, self.calls = conditioned, null, 0
 
-    def conditions(self, prompt, mask, tokens, segments):
+    def conditions(self, prompt, mask, tokens, segments, speaker=None, context=None, context_mask=None,
+                   quality=None):
         return (torch.ones(tokens.shape + (4,)), tokens.ne(0), torch.zeros(prompt.size(0), 4))
 
     def forward(self, x, t, prompt, prompt_mask, valid, tokens, segments, cached=None):

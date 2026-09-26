@@ -62,6 +62,15 @@ class ModelConfig:
     speaker_context_layers: int = 3
     speaker_context_heads: int = 4
     speaker_context_patch: int = 4  # latent frames per context token (25 fps -> 6.25 tokens/s)
+    # Quality condition: the target utterance's DNSMOS P.835 [SIG, BAK, OVRL], centred at 3 and scaled by 1/0.5, enters
+    # the voice condition through a zero-init, bias-free Linear (3 x width). Found-data corpora mix clean and noisy
+    # recordings; labelling the recording quality lets the model learn from all of them and still be asked for clean
+    # speech (QA-MDT, arXiv:2405.15863: a quality token on a quality-imbalanced corpus, p-MOS 3.80 -> 4.05, FAD
+    # 5.76 -> 5.20; Lyth & King, arXiv:2402.01912: SNR/reverberation labels give high-fidelity TTS from found data).
+    # Training reads a per-utterance score store (train.quality_scores); inference asks for `quality_target`. The
+    # guidance null branch drops it with the voice, so CFG also steers toward the requested quality.
+    quality_condition: bool = False
+    quality_target: tuple = (3.6, 4.1, 3.3)  # SIG, BAK, OVRL requested at inference (about the corpus's top decile)
     # Training-only teacher heads (alignment.py); absent from the module and its checkpoints when off.
     repa_layer: int = 0  # speech-REPA: block predicting teacher SSL frames; 0 off, 10-11 with CTC at 8
     repa_dim: int = 0  # width of the stored teacher frames (after the extraction PCA, e.g. 256)
@@ -136,6 +145,9 @@ class ModelConfig:
             raise ValueError("dropout must lie in [0,1)")
         if self.speaker_condition_dim < 0:
             raise ValueError("speaker_condition_dim must be 0 (off) or the embedding width")
+        self.quality_target = tuple(float(v) for v in self.quality_target)  # YAML lists vs tuples on resume
+        if len(self.quality_target) != 3 or not all(1 <= v <= 5 for v in self.quality_target):
+            raise ValueError("quality_target must be three DNSMOS values [SIG, BAK, OVRL] in [1, 5]")
         if self.speaker_context not in {"none", "vector"}:
             raise ValueError("speaker_context must be none or vector")
         if self.speaker_context != "none" and (
@@ -171,6 +183,9 @@ class TrainConfig:
     learning_rate: float = 3e-4
     warmup: int = 5000
     weight_decay: float = 0.01
+    # `all` decays every parameter (every model trained so far); `matrices` leaves vectors, scalars and embedding
+    # tables undecayed (optim.decay_exempt: norm gains, biases, gates, value-residual weights)
+    weight_decay_scope: str = "all"
     optimizer: str = "muon"
     muon_momentum: float = 0.95
     ema_decay: float = 0.999
@@ -273,6 +288,11 @@ class TrainConfig:
     speaker_context_max_seconds: float = 30.0
     speaker_context_max_utterances: int = 8
     tla_entropy: float = 0.01  # weight of the negative entropy of the time-dependent block weights
+    # Quality condition (model.quality_condition): JSON {uid: [SIG, BAK, OVRL]} (relative paths resolve against the
+    # cache, e.g. quality/dnsmos.json from scripts/trc/quality_store.py). Rows without scores and a `quality_dropout`
+    # share of the others get the zero vector ("unknown quality", MOS 3), so unlabelled inference still works.
+    quality_scores: str = ""
+    quality_dropout: float = 0.1
     # Schedule and regularization options (issue #14); every default reproduces the original recipe exactly.
     # wsd: warmup, constant LR, then a decay over the last `decay_fraction` of the updates. A 20% 1-sqrt
     # cooldown matches cosine and any stable-phase checkpoint can branch into a cooldown (Hägele et al.,
@@ -324,6 +344,8 @@ class TrainConfig:
             raise ValueError("Training counts/intervals must be positive")
         if self.precision not in {"fp32", "bf16"}:
             raise ValueError("precision must be fp32 or bf16")
+        if self.weight_decay_scope not in {"all", "matrices"}:
+            raise ValueError("train.weight_decay_scope must be all or matrices")
         if self.optimizer not in {"muon", "adamw"} or not 0 <= self.muon_momentum < 1:
             raise ValueError("optimizer must be muon or adamw, with Muon momentum in [0,1)")
         if self.workers < 0 or self.warmup < 0 or not 0 <= self.ema_decay < 1:
@@ -404,6 +426,8 @@ class TrainConfig:
             0 < self.speaker_context_min_seconds <= self.speaker_context_max_seconds
         ):
             raise ValueError("speaker_context_prob in [0,1], positive max_utterances, 0 < min_seconds <= max_seconds")
+        if not 0 <= self.quality_dropout <= 1:
+            raise ValueError("quality_dropout must lie in [0,1]")
         if self.speaker_context_prob and self.pairing != "within":
             raise ValueError("speaker_context_prob draws contexts for within pairing")
         if self.speaker_condition_source not in {"other", "same"} or not -1 <= self.speaker_condition_min_cosine <= 1:
@@ -470,6 +494,8 @@ class Config:
             raise ValueError("repa_weight needs model.repa_layer and tla_weight needs model.tla_layers")
         if (self.model.speaker_context != "none") != bool(self.train.speaker_context_prob):
             raise ValueError("model.speaker_context and train.speaker_context_prob > 0 go together")
+        if self.model.quality_condition != bool(self.train.quality_scores):
+            raise ValueError("model.quality_condition and train.quality_scores (a score store) go together")
         if bool(self.model.speaker_condition_dim) != bool(self.train.speaker_condition):
             raise ValueError("model.speaker_condition_dim and train.speaker_condition (a speaker store) go together")
         if self.train.model_guidance_weight and not self.model.cond_dropout:

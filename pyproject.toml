@@ -23,6 +23,7 @@ dependencies = [
     "onnxruntime>=1.19",
     "transformers>=4.46,<5",
     "wandb>=0.18",
+    "protobuf<7",  # wandb <= 0.25 ships protobuf v3-v6 bindings only; onnx would otherwise pull 7.x
 ]
 
 [project.optional-dependencies]

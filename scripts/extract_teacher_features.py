@@ -160,6 +160,15 @@ class LazyDecoder:
 
 
 def audio_source(args):
+    if args.audio_source == "parquet":  # the original audio, re-read from the Hub dataset (no DACVAE decode)
+        import os
+
+        from dacvae_tts.teacher import ParquetAudio
+
+        if not args.parquet_repo:
+            raise ValueError("--audio-source parquet needs --parquet-repo")
+        return ParquetAudio(args.cache, args.parquet_repo, args.parquet_dir or Path(args.output) / "parquet",
+                            token=os.environ.get("HF_TOKEN"))
     return CacheAudio(args.cache, args.audio_source, LazyDecoder(args.cache, args.codec, args.device))
 
 
@@ -243,7 +252,9 @@ def parser():
         command.add_argument("--output", required=True, help="Store directory, e.g. CACHE/teacher/NAME")
         command.add_argument("--splits", type=lambda s: tuple(s.split(",")), default=("train",))
         command.add_argument("--device", default="cpu")
-        command.add_argument("--audio-source", choices=("auto", "original", "decode"), default="auto")
+        command.add_argument("--audio-source", choices=("auto", "original", "decode", "parquet"), default="auto")
+        command.add_argument("--parquet-repo", help="--audio-source parquet: the HF dataset the cache was prepared from")
+        command.add_argument("--parquet-dir", help="--audio-source parquet: download directory (one shard at a time)")
         command.add_argument("--codec", default=None, help="DACVAE checkpoint; default: the cache's")
         command.add_argument("--quiet", action="store_true")
         return command

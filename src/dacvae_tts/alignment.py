@@ -143,7 +143,10 @@ def teacher_terms(model, batch, hidden, time, drop, repa=True, tla=True, repa_fr
         states = [hidden[layer] for layer in model.cfg.tla_layers]
         embeddings, weights = model.tla(states, packed, time)
         alignment, negentropy = weighted_alignment(embeddings, speaker, weights)
-        terms["tla"], terms["tla_entropy"] = alignment.masked_fill(drop, 0), negentropy.masked_fill(drop, 0)
+        # Rows without prompt frames (prompt dropout) know nothing about the speaker: aligning them to it would push
+        # the features toward a voice the model cannot infer. CFG-dropped rows likewise.
+        skip = drop | ~prompt_mask.any(1)
+        terms["tla"], terms["tla_entropy"] = alignment.masked_fill(skip, 0), negentropy.masked_fill(skip, 0)
     idle = [
         module
         for module, used in ((model.repa, "repa" in terms), (model.tla, "tla" in terms))

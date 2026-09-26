@@ -58,6 +58,9 @@ VARIANTS = {
         LOADER, compile="blocks", grad_checkpoint="selective", compile_dynamic="auto"
     ),
     "blocks_every2": dict(LOADER, compile="blocks", grad_checkpoint=2),
+    # No recomputation at all: fits a 32 GB GPU at frame budget 6000 (RTX 5090).
+    "blocks_no_checkpoint": dict(LOADER, compile="blocks", grad_checkpoint=False),
+    "blocks_no_checkpoint_auto": dict(LOADER, compile="blocks", grad_checkpoint=False, compile_dynamic="auto"),
 }
 
 

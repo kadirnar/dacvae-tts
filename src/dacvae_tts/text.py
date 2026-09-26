@@ -114,14 +114,16 @@ def to_units(tokens, segments, units="bytes"):
     return torch.tensor(out_tokens, dtype=torch.int64), torch.tensor(out_segments, dtype=torch.int64)
 
 
-def corrupt_transcript(tokens, segments, rng):
+def corrupt_transcript(tokens, segments, rng, start=0):
     """Return (tokens, segments) with one target word skipped or repeated, or None if impossible.
 
     Skip/repeat negatives (RobustSpeechFlow, arXiv:2605.22083) give the model a transcript that is
-    wrong by exactly one word; it must then prefer the true transcript on the same audio.
+    wrong by exactly one word; it must then prefer the true transcript on the same audio. `start`: the
+    first token that may change (a cross prompt's transcript precedes the target in the joined layout and
+    its audio is given, so a negative there teaches nothing about the words to generate).
     """
     tokens, segments = tokens.tolist(), segments.tolist()
-    target = [i for i, (t, s) in enumerate(zip(tokens, segments)) if s == 1 and t >= BYTE_OFFSET]
+    target = [i for i, (t, s) in enumerate(zip(tokens, segments)) if i >= start and s == 1 and t >= BYTE_OFFSET]
     if not target:
         return None
     words, current = [], []

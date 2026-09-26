@@ -17,6 +17,7 @@ slices them exactly like the latents (`pair_teacher`) and `collate_teacher` lays
 [reference | target] order as `collate`.
 """
 
+import io
 import json
 import math
 import os
@@ -334,6 +335,83 @@ class CacheAudio:
         waveform = self.decoder(self.latents(shard, offset, frames))
         self.counts["decoded"] += 1
         return np.asarray(waveform, dtype=np.float32)[:samples]
+
+
+class ParquetAudio:
+    """Original audio of cache rows prepared from a sharded Hugging Face Parquet dataset, re-read from the Hub.
+
+    A drop-in for `CacheAudio` (`sample_rate`, `counts`, `__call__(row)`) that needs no DACVAE decode: rows whose uid
+    is "<prefix><file>:<row>" (scripts/prepare_hf_shards.py, stream_encode_score.sh) are loaded exactly as `prepare`
+    loaded them (codec.read_audio: resampling to the cache rate and its loudness normalization), i.e. the waveform the
+    latents were encoded from. Cache rows arrive in id order, which is partition (shard) order and row order within a
+    shard, so the source keeps one shard on disk, decodes each 100-row group in a thread pool on first use,
+    prefetches the next shard and deletes the previous one. Decoding one row at a time through DACVAE was ~8
+    rows/s next to a training run; this reads the audio the codec saw, not its reconstruction.
+    """
+
+    def __init__(self, cache, repo, local_dir, prefix="data/", token=None, threads=8):
+        from concurrent.futures import ThreadPoolExecutor
+
+        self.cache = Path(cache).resolve()
+        self.meta = json.loads((self.cache / "metadata.json").read_text())
+        self.sample_rate, self.loudness = int(self.meta["sample_rate"]), self.meta.get("loudness_lufs")
+        self.repo, self.local, self.prefix, self.token = repo, Path(local_dir), prefix, token
+        self.local.mkdir(parents=True, exist_ok=True)
+        self.counts = {"original": 0, "decoded": 0}
+        self.pool = ThreadPoolExecutor(threads)
+        self.current, self.file, self.offsets, self.group, self.cached = None, None, None, None, {}
+        self.prefetched = {}
+
+    def _download(self, name):
+        from huggingface_hub import hf_hub_download
+
+        return Path(hf_hub_download(self.repo, name, repo_type="dataset", local_dir=self.local, token=self.token))
+
+    def _open(self, name):
+        import pyarrow.parquet as pq
+
+        future = self.prefetched.pop(name, None)
+        path = future.result() if future is not None else self._download(name)
+        if self.current is not None and self.current != name:
+            (self.local / self.current).unlink(missing_ok=True)
+        self.current, self.file = name, pq.ParquetFile(path)
+        sizes = [self.file.metadata.row_group(g).num_rows for g in range(self.file.num_row_groups)]
+        self.offsets, self.group, self.cached = np.cumsum([0, *sizes]), None, {}
+        index, total = self._shard_number(name)
+        if index is not None and index + 1 < total:  # the next shard downloads while this one is read
+            following = name.replace(f"{index:05d}-of", f"{index + 1:05d}-of")
+            self.prefetched[following] = self.pool.submit(self._download, following)
+
+    @staticmethod
+    def _shard_number(name):
+        import re
+
+        match = re.search(r"(\d{5})-of-(\d{5})", name)
+        return (int(match.group(1)), int(match.group(2))) if match else (None, None)
+
+    def _load_group(self, group):
+        from .codec import read_audio
+
+        rows = self.file.read_row_group(group, columns=["audio"]).column("audio").to_pylist()
+        read = lambda item: read_audio(io.BytesIO(item["bytes"]), self.sample_rate, self.loudness).numpy()  # noqa: E731
+        self.group, self.cached = group, dict(enumerate(self.pool.map(read, rows), int(self.offsets[group])))
+
+    def __call__(self, row):
+        uid, _, _, _, samples, _ = row
+        file, _, index = uid.rpartition(":")
+        if not file.startswith(self.prefix) or not index.isdigit():
+            raise ValueError(f"{uid} is not a '<prefix><file>:<row>' uid of a Parquet-prepared cache")
+        name, index = file[len(self.prefix):], int(index)
+        if name != self.current:
+            self._open(name)
+        group = int(np.searchsorted(self.offsets, index, side="right") - 1)
+        if group != self.group:
+            self._load_group(group)
+        audio = self.cached[index]
+        if samples and abs(len(audio) - samples) > 1:
+            raise ValueError(f"{uid}: re-read audio has {len(audio)} samples, the cache {samples}")
+        self.counts["original"] += 1
+        return audio
 
 
 class FeatureWriter:

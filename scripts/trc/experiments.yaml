@@ -1,0 +1,305 @@
+# Registry of the tr-combined experiments: what each run asks, the evidence behind it, its baseline and the verdict.
+# scripts/trc/experiment_log.py adds the measured numbers (paired against the baseline, both sampling seeds pooled),
+# the quick-set trajectory and training statistics, and writes EXPERIMENTS.md plus <run>/RESULT.md and <run>/logs/ in
+# the experiments repo. Verdicts are set by hand once a run's final evaluation exists ("pending" until then).
+# Protocol: Freya-TR-Eval 495 sentences x 48 leak-free Common Voice voices, one sample per sentence, guidance 5,
+# 32 steps, prompt-rate duration rule, Whisper large-v3, turkish-v2; A/B arms stop at 20k of the 60k schedule.
+
+base-s42:
+  issue: "#7"
+  question: "Baseline. Run C's recipe with the #7 speed options (compiled blocks, selective checkpointing, pad 8) on tr-combined."
+  baseline: null
+  verdict: reference
+  conclusion: "WER 30.1 at 20k. Its seed-43 twin reached 24.9, so the training-seed spread at 20k is ~5 WER points; an option counts only when it beats both seeds."
+base-s43:
+  issue: "#4"
+  question: "Noise floor. The same recipe with training seed 43."
+  baseline: base-s42
+  verdict: reference
+  conclusion: "5 WER points better than seed 42 with nothing changed. This spread is the bar for every 20k A/B."
+base-eager:
+  issue: "#7"
+  question: "Does the compiled execution change the result? Run C's exact eager execution."
+  baseline: base-s42
+  verdict: tie
+  conclusion: "4.8 WER below the better compiled seed, the size of the seed spread itself; at equal frames seen the runs match (parity)."
+base-s42-pad64:
+  issue: "#7"
+  question: "First baseline, with lengths padded to multiples of 64."
+  baseline: base-s42
+  verdict: rejected
+  conclusion: "20 % of every batch was padding with tr-combined's short clips (13.8k vs 17.3k target frames per update). Replaced by pad 8."
+pairs-cross:
+  issue: "#11"
+  question: "Cross-utterance prompts. The prompt comes from other clips of the same speaker (40 %, up to 3 clips / 12 s) instead of the start of the target clip."
+  evidence: "VoiceStar (arXiv 2505.19462). tr-combined's within-utterance prompts are 0.4-2.2 s while inference prompts are 3.5-12 s."
+  baseline: base-s42
+  verdict: adopted
+  conclusion: "WER 30.1 -> 12.3 (seed 43: 24.9 -> 16.9), better on every metric. The base of all later arms."
+x-s43:
+  issue: "#4"
+  question: "Noise floor of the new base (base + cross prompts, training seed 43)."
+  baseline: pairs-cross
+  verdict: reference
+  conclusion: "16.9 vs 12.3 WER; the seed spread stays ~5 points."
+x-latent-negatives:
+  issue: "#8"
+  question: "Latent negatives (contrastive flow matching against shifted/corrupted latents, lambda 0.2/0.2)."
+  evidence: "RobustSpeechFlow (arXiv 2605.22083); Delta-FM (arXiv 2506.05350)."
+  baseline: pairs-cross
+  verdict: rejected
+  conclusion: "Collapse (WER 62, SIM-o 0.14). Without a cap the per-frame optimum is F+ + 1/3(F+ - F_rand) + 1/3(F+ - F_aug), a target pushed away from real speech."
+x-no-negatives:
+  issue: "#8"
+  question: "Are run C's existing text negatives (contrastive loss) useful? Turned off."
+  baseline: pairs-cross
+  verdict: tie
+  conclusion: "WER +1.6 and CER +1.7 against the same seed, inside the ~5-point training-seed spread: not resolved. The text negatives stay (no evidence to remove them); removing them would save ~20 % update time."
+x-pairs-tail:
+  issue: "#11"
+  question: "Tail silence, long prompts / short targets and quiet prompt cuts."
+  evidence: "Robustness to end-of-utterance fillers and to short targets."
+  baseline: pairs-cross
+  verdict: tie
+  conclusion: "WER 13.3 vs 12.3, inside the seed spread; no measurable effect."
+x-pairs-char-ctc:
+  issue: "#11"
+  question: "Character targets for the alignment CTC head."
+  baseline: pairs-cross
+  verdict: tie
+  conclusion: "WER 13.6 vs 12.3, inside the seed spread."
+x-char-units:
+  issue: round 2
+  question: "Character units. One text token per Turkish letter instead of the BPE-like units."
+  evidence: "Turkish orthography is close to phonemic; a character vocabulary is the future-work item of the roadmap."
+  baseline: pairs-cross
+  verdict: adopted
+  conclusion: "WER -1.1 / CER -0.8 and SIM-o +0.011 against the same seed; the seed-43 repeat agrees (x-char-units-s43). Small but consistent, and 30 % faster inference."
+x-char-units-s43:
+  issue: round 2
+  question: "Character units, training seed 43 (the strict test of the rule from #4)."
+  baseline: x-s43
+  verdict: adopted
+  conclusion: "WER -0.9 (tie), SIM-o +0.013 (win), UTMOS -0.05 against the seed-43 base. Same direction as seed 42."
+x-quality-cond:
+  issue: new
+  question: "Quality condition. The target clip's DNSMOS [SIG, BAK, OVRL] enters the voice condition (zero-init); inference requests high quality."
+  evidence: "QA-MDT (arXiv 2405.15863); Lyth & King (arXiv 2402.01912)."
+  baseline: pairs-cross
+  verdict: adopted
+  conclusion: "WER neutral. Requesting 4.0/4.5/3.8 raises DNSMOS by +0.135 and UTMOS by +0.19 on the same checkpoint. A quality control, not a WER option."
+x-repa:
+  issue: "#10"
+  question: "Speech-REPA. Align block 10 with mHuBERT-147 layer 12 (PCA 256), weight 1.0."
+  evidence: "A-DMA (arXiv 2505.19595): ~2x faster alignment; BareWave (arXiv 2606.09048): WavLM REPA WER 3.32 -> 2.86."
+  baseline: pairs-cross
+  verdict: adopted
+  conclusion: "The largest single win. WER 12.3 -> 5.6, alignment ~4x earlier (quick WER 13.6 at 5k vs ~98), SIM-o +0.045; DNSMOS -0.08 and UTMOS -0.24 (recovered in full-v2 by the quality condition)."
+x-tla:
+  issue: "#10"
+  question: "TLA-SA. Per-layer speaker alignment of token features to frozen ECAPA embeddings, weight 0.5 (trained before the audit fix that masks prompt-free rows)."
+  evidence: "TLA-SA (arXiv 2511.09995)."
+  baseline: pairs-cross
+  verdict: rejected
+  conclusion: "WER 24.7 vs 12.3, SIM-o 0.455 vs 0.540, slower alignment at every snapshot. Outside the seed spread."
+x-swiglu:
+  issue: "#9"
+  question: "SwiGLU feed-forward (equal parameters)."
+  evidence: "Positive in T5 / LightningDiT, neutral in the 140M SR-DiT."
+  baseline: pairs-cross
+  verdict: tie
+  conclusion: "No gain. WER +5.2 against the same seed, but level with the seed-43 base (17.5 vs 16.9) on every metric; the audit found the code correct (Shazeer form, equal parameters). Not adopted; retested on the v2 recipe (y-swiglu)."
+x-attn-gate:
+  issue: "#9"
+  question: "Head-wise sigmoid gate on the attention output."
+  evidence: "Gated attention (arXiv 2505.06708), LLMs only; no TTS ablation."
+  baseline: pairs-cross
+  verdict: tie
+  conclusion: "No gain. WER +4.4 against the same seed, but level with the seed-43 base (16.7 vs 16.9) on every metric, although it starts as exactly the base function (zero-init gate): a zero-init change alone moves the base+cross 20k WER by ~5 points. Not adopted; retested on the v2 recipe (y-attn-gate)."
+x-long-skip:
+  issue: "#9"
+  question: "Input -> output long skip (concat + LayerNorm + Linear)."
+  evidence: "DiTTo-TTS: WER 3.30 -> 2.93; counter-evidence F5 4.17 -> 5.17."
+  baseline: pairs-cross
+  verdict: tie
+  conclusion: "WER +0.7 [-0.6, 2.0], CER, SIM-o and DNSMOS ties; UTMOS -0.04. No gain on base+cross; retested on the v2 recipe (y-long-skip)."
+x-value-residual:
+  issue: "#9"
+  question: "Value residual (v_l <- l1 v_l + l2 v_1)."
+  evidence: "ResFormer (arXiv 2410.17897); SR-DiT FID 4.02 -> 3.64."
+  baseline: pairs-cross
+  verdict: not run
+  conclusion: "Not run on base+cross: after the audit the option moved to the v2 recipe as y-value-residual."
+x-ffn-conv:
+  issue: "#9"
+  question: "Depthwise convolution (k=5) inside the feed-forward."
+  evidence: "ZipVoice (removing its conv modules takes WER 1.69 -> 9.79), U-DiT, SANA."
+  baseline: pairs-cross
+  verdict: not run
+  conclusion: "Not run on base+cross: after the audit the option moved to the v2 recipe as y-ffn-conv."
+x-final-adaln:
+  issue: "#9"
+  question: "Final adaLN before the output projection."
+  evidence: "Standard in DiT and F5-TTS."
+  baseline: pairs-cross
+  verdict: not run
+  conclusion: "Not run on base+cross: after the audit the option moved to the v2 recipe as y-final-adaln."
+x-cond-text-pool:
+  issue: "#9"
+  question: "Pooled target text added to the condition."
+  evidence: "DiTTo-TTS: pooled text WER 3.00 -> 2.93."
+  baseline: pairs-cross
+  verdict: not run
+  conclusion: "Not run on base+cross: after the audit the option moved to the v2 recipe as y-cond-text-pool."
+x-regularized:
+  issue: "#14"
+  question: "Dropout 0.1 and weight decay 0.05."
+  baseline: pairs-cross
+  verdict: not run
+  conclusion: "Not run on base+cross: after the audit the option moved to the v2 recipe as y-regularized (with weight decay on matrices only)."
+x-speaker-context:
+  issue: round 2
+  question: "Multi-clip speaker context vector (50 % of updates)."
+  baseline: pairs-cross
+  verdict: not run
+  conclusion: "Not run: deferred after the audit (the single-prompt evaluation has no extra clips, so it cannot show a context gain)."
+x-repa-tla:
+  issue: "#10"
+  question: "Speech-REPA and TLA-SA together. Does TLA-SA hurt less once REPA supplies the alignment?"
+  baseline: x-repa
+  verdict: not run
+  conclusion: "Not run: deferred after the audit (TLA-SA alone lost clearly; the v2 recipe already has REPA)."
+x-speaker-condition:
+  issue: round 2
+  question: "Frozen ECAPA speaker embedding -> adaLN."
+  baseline: pairs-cross
+  verdict: not run
+  conclusion: "Not run on base+cross: after the audit the option moved to the v2 recipe as y-speaker-condition."
+full-cross:
+  issue: model
+  question: "First full-length model. Run C's recipe + cross prompts, 60k updates."
+  baseline: run-c-reference
+  verdict: adopted
+  conclusion: "Beats run C on every metric (refit duration predictor, seeds pooled; WER 5.10 -> 2.94)."
+full-v2:
+  issue: model
+  question: "Second full-length model. Cross prompts + quality condition + speech-REPA + character units, 60k updates."
+  baseline: full-cross
+  verdict: adopted
+  conclusion: "The current best model. With the refit duration predictor, WER 0.93 / CER 0.36 vs run C 5.10 / 2.93 and full-cross 2.94 / 1.66; DNSMOS 3.13, SIM-o 0.556, UTMOS tie."
+full-v3:
+  issue: model
+  question: "Third full-length model: the v2 recipe + value residual at width 640 / 10 heads (104M parameters vs 67M), 60k updates."
+  evidence: "Value residual: the round-3 winner (DNSMOS/UTMOS above both v2 seeds). Width: DiTTo-TTS scaling; no overfitting at 67M."
+  baseline: full-v2
+  verdict: not run
+  conclusion: "Not run: the owner stopped training on 26 September before it started. The recipe is defined in scripts/trc/arms.py (full-v3) for a later run."
+ft-w0:
+  issue: "#14"
+  question: "Control fine-tune. 8k more updates of full-cross without model guidance, sampled with CFG 5."
+  baseline: full-cross
+  verdict: tie
+  conclusion: "WER 6.58 vs 6.46, a tie; extra updates alone change nothing."
+ft-mg-w07:
+  issue: "#14"
+  question: "Model-guidance fine-tune (w = 0.7), sampled without CFG (half the network evaluations)."
+  evidence: "Model guidance (arXiv 2504.20334)."
+  baseline: full-cross
+  verdict: rejected
+  conclusion: "WER 9.0 vs 6.5 and SIM-o -0.02 (clipping / 5, DNSMOS +0.05). Not worth half the NFE at this size."
+grpo:
+  issue: "#16"
+  question: "Flow-GRPO, 600 updates, composite reward (CER 1.0 + SIM 0.5 + DNSMOS 0.4 + UTMOS 0.4) from full-cross 60k."
+  evidence: "FlowTTS-GRPO (arXiv 2606.23190)."
+  baseline: full-cross
+  verdict: tie
+  conclusion: "No measurable effect at this budget (WER 6.83 vs 6.46, SIM-o +0.005)."
+run-c-reference:
+  issue: "#3"
+  dirs: [inference-runc/base, inference-runc/seed1000]
+  question: "Run C (VoiceHub/dacvae-tts-tr-w512, trained on Vyvo/tr-dataset-12) re-measured under the leak-free protocol."
+  baseline: null
+  verdict: reference
+  conclusion: "WER 7.54 / CER 4.89 / SIM-o 0.535 with the prompt-rate rule (the published 4.3 used podcast prompts whose voices occur in training)."
+
+# Round 3: A/Bs on the full-v2 recipe (REPA aligns within ~5k updates; see scripts/trc/arms.py). Baseline: y-base.
+y-base:
+  issue: round 3
+  question: "The full-v2 recipe (cross prompts + quality condition + speech-REPA + character units) at 20k updates: full-v2's own 20k snapshot, evaluated in full."
+  dirs: [y-base/step-0020000, y-base/step-0020000-s1000]
+  baseline: pairs-cross
+  verdict: reference
+y-s43:
+  issue: round 3
+  question: "Noise floor of the v2 recipe: training seed 43. Is the 20k seed spread smaller once REPA aligns early?"
+  baseline: y-base
+  verdict: reference
+  conclusion: "Yes: the training-seed spread fell from 4.6 WER points (base+cross 12.3 vs 16.9) to 0.7 (4.32 vs 3.64); CER 0.7, SIM-o 0.016, DNSMOS 0.001, UTMOS 0.02. The paired interval calls the WER, CER and SIM-o differences significant although only the seed changed: it does not cover training variance. Rule for the y-* arms: an option counts when it beats both y-base and y-s43."
+y-long-skip:
+  issue: "#9"
+  question: "Input -> output long skip (concat + LayerNorm + Linear), on the v2 recipe."
+  evidence: "DiTTo-TTS: WER 3.30 -> 2.93; counter-evidence F5 4.17 -> 5.17."
+  baseline: y-base
+  verdict: tie
+  conclusion: "No gain beyond the seed spread. WER 3.99 lies between the two base seeds (4.32 / 3.64); CER, SIM-o (0.589 vs 0.587 / 0.571), DNSMOS and UTMOS within them. +0.53M parameters; not adopted."
+y-value-residual:
+  issue: "#9"
+  question: "Value residual (v_l <- l1 v_l + l2 v_1), on the v2 recipe."
+  evidence: "ResFormer (arXiv 2410.17897); SR-DiT FID 4.02 -> 3.64."
+  baseline: y-base
+  verdict: adopted
+  conclusion: "A small quality gain beyond both base seeds at no cost (+24 parameters, +2 % step time): DNSMOS 3.138 vs 3.111 / 3.112 (+0.026; seed spread 0.001) and UTMOS 2.533 vs 2.486 / 2.506 (+0.03-0.05; seed spread 0.02). WER 3.94, CER 2.29 and SIM-o 0.582 lie within the seed spread (neutral). Candidate for full-v3; the margin rests on two base seeds."
+y-ffn-conv:
+  issue: "#9"
+  question: "Depthwise convolution (k=5) inside the feed-forward, on the v2 recipe."
+  evidence: "ZipVoice (removing its conv modules takes WER 1.69 -> 9.79), U-DiT, SANA."
+  baseline: y-base
+  verdict: rejected
+  conclusion: "A trade-off, not a gain. SIM-o 0.598 is above both base seeds (0.587 / 0.571) but DNSMOS (3.090 vs 3.111 / 3.112) and UTMOS (2.415 vs 2.486 / 2.506) fall below both, beyond the seed spread; WER 4.04 and CER 2.74 lie within it. Costs +22 % step time (0.188 vs 0.154 s/update). Not adopted."
+y-final-adaln:
+  issue: "#9"
+  question: "Final adaLN before the output projection, on the v2 recipe."
+  evidence: "Standard in DiT and F5-TTS."
+  baseline: y-base
+  verdict: tie
+  conclusion: "No clear gain. WER 4.04, SIM-o 0.588 and UTMOS 2.495 lie within the base seeds; CER 2.27 matches the better seed (2.30); DNSMOS 3.128 is +0.016 above both, but both intervals touch 0. +0.10M parameters, no time cost. Not adopted on this evidence."
+y-cond-text-pool:
+  issue: "#9"
+  question: "Pooled transcript added to the condition, on the v2 recipe (in the joined layout the pool covers prompt and target text)."
+  evidence: "DiTTo-TTS: pooled text WER 3.00 -> 2.93."
+  baseline: y-base
+  verdict: tie
+  conclusion: "No gain. WER 4.53 and CER 3.07 sit slightly above both base seeds (4.32 / 3.64; within the spread of y-base); SIM-o 0.590, DNSMOS 3.112 and UTMOS 2.499 match y-base. +0.26M parameters; not adopted."
+y-swiglu:
+  issue: "#9"
+  question: "SwiGLU feed-forward (equal parameters), retested on the v2 recipe."
+  evidence: "Positive in T5 / LightningDiT, neutral in the 140M SR-DiT."
+  baseline: y-base
+  verdict: tie
+  conclusion: "No gain on the v2 recipe either. WER 4.13, CER 2.78 and UTMOS 2.509 lie within the base seeds; SIM-o 0.569 matches the lower seed; DNSMOS 3.092 is 0.02 below both. Not adopted."
+y-attn-gate:
+  issue: "#9"
+  question: "Head-wise sigmoid gate on the attention output, retested on the v2 recipe."
+  evidence: "Gated attention (arXiv 2505.06708), LLMs only."
+  baseline: y-base
+  verdict: not run
+  conclusion: "Not run: the owner stopped training on 26 September as this arm started."
+y-speaker-condition:
+  issue: round 2
+  question: "Frozen ECAPA speaker embedding -> adaLN, on the v2 recipe (after the audit fix: inference embeds the same audio as the store)."
+  baseline: y-base
+  verdict: rejected
+  conclusion: "A trade-off against quality. SIM-o 0.599 is above both base seeds (0.587 / 0.571) and WER 3.66 matches the better seed, but DNSMOS (3.039 vs 3.111 / 3.112) and UTMOS (2.295 vs 2.486 / 2.506, -0.2) fall far below both. Likely the embedding also carries the prompt's recording conditions (the Common Voice prompts are noisier than the training speech), which the output then copies. Not adopted."
+y-decay-matrices:
+  issue: audit
+  question: "Weight decay on matrices only (norm gains, biases, gates and embeddings undecayed), on the v2 recipe."
+  evidence: "Standard practice (AdamW exclusions in GPT/DiT training); the audit found decay on every parameter."
+  baseline: y-base
+  verdict: tie
+  conclusion: "Neutral at weight decay 0.01. CER 2.11 is below both base seeds (2.98 / 2.30) by less than their spread; WER 3.77, SIM-o 0.581 and DNSMOS 3.122 lie within the seeds; UTMOS 2.480 slightly below both. The unusual decay of norm gains and biases was not costing quality at this strength; the option matters for stronger decay (y-regularized)."
+y-regularized:
+  issue: "#14"
+  question: "Dropout 0.1 and weight decay 0.05 on matrices, on the v2 recipe. Caveat: the text-hinge negative pass draws its own dropout masks."
+  baseline: y-base
+  verdict: rejected
+  conclusion: "Worse on quality beyond both base seeds: DNSMOS 3.043 vs 3.111 / 3.112 and UTMOS 2.397 vs 2.486 / 2.506; WER 4.58 and CER 3.05 at or above both; validation flow 0.6867 vs 0.6810 / 0.6833. Nothing to regularize: full-v2's validation flow keeps falling to 60k (0.691 at 10k, 0.681 at 20k, 0.670 at 60k), so there is no overfitting for dropout to fix at this data size."

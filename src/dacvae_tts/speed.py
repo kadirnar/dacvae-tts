@@ -109,7 +109,7 @@ def _raise_limit(config, names, value):
             return
 
 
-def compile_blocks(model, dynamic="batch", recompile_limit=64):
+def compile_blocks(model, dynamic="batch", recompile_limit=256):
     """Regional compilation (`train.compile: blocks`): compile the per-block step once, reuse it.
 
     Compiling the whole generator traced every block again for each new batch shape (more than 15
@@ -131,6 +131,13 @@ def compile_blocks(model, dynamic="batch", recompile_limit=64):
     _raise_limit(config, ("recompile_limit", "cache_size_limit"), recompile_limit)
     accumulated = ("accumulated_recompile_limit", "accumulated_cache_size_limit")
     _raise_limit(config, accumulated, 16 * recompile_limit)
+    if any(isinstance(m, torch.nn.Dropout) or getattr(m, "output_dropout", 0) for m in model.modules()):
+        # Dropout inside a checkpointed compiled block with a symbolic batch fails in Inductor's partitioner
+        # ("Node add_N was invalid, but is output"), which sent dropout runs to eager for the whole run. Eager RNG
+        # for the random ops compiles, and the recomputed masks match (gradients equal eager within ~1e-5).
+        import torch._inductor.config as inductor_config
+
+        inductor_config.fallback_random = True
     eager = model.block_runner
     compiled = torch.compile(eager, dynamic=None)
 
@@ -202,9 +209,9 @@ class PaddedEpochCosts:
 
 
 def training_epoch_costs(dataset, train):
-    """The sampler's per-epoch cost function: None unless cross prompts or stretched prompts vary the lengths per
-    epoch."""
-    if not getattr(train, "cross_prompt_prob", 0) and not getattr(train, "tempo_prompt_prob", 0):
+    """The sampler's per-epoch cost function: None unless cross prompts, stretched prompts or tail silence vary the
+    lengths per epoch."""
+    if not any(getattr(train, key, 0) for key in ("cross_prompt_prob", "tempo_prompt_prob", "tail_silence_prob")):
         return None
     if train.pad_multiple <= 1:
         return dataset.epoch_costs
@@ -239,12 +246,14 @@ def pad_lengths(batch, frame_multiple=1, text_multiple=1):
     return result
 
 
-def corrupt_rows(tokens, segments, rngs):
+def corrupt_rows(tokens, segments, rngs, starts=None):
     """`Objective.negatives` with one random generator per row: corrupted transcripts [B,S'] and a
-    boolean [B] mask of the rows that could be corrupted (the others keep their true transcript)."""
+    boolean [B] mask of the rows that could be corrupted (the others keep their true transcript).
+    `starts` [B]: first token a negative may change (collate's `target_start` of cross-prompt rows)."""
     rows, usable = [], []
-    for row_tokens, row_segments, rng in zip(tokens, segments, rngs):
-        corrupted = corrupt_transcript(row_tokens, row_segments, rng)
+    starts = [0] * len(tokens) if starts is None else [int(v) for v in starts]
+    for row_tokens, row_segments, rng, start in zip(tokens, segments, rngs, starts):
+        corrupted = corrupt_transcript(row_tokens, row_segments, rng, start)
         usable.append(corrupted is not None)
         rows.append(corrupted if corrupted is not None else (row_tokens, row_segments))
     width = max(len(t) for t, _ in rows)
@@ -291,7 +300,7 @@ class TrainCollate:
         batch = collate(items)
         if self.negatives:
             rngs = [random.Random(item["negative_seed"]) for item in items]
-            tokens, segments, usable = corrupt_rows(batch["tokens"], batch["segments"], rngs)
+            tokens, segments, usable = corrupt_rows(batch["tokens"], batch["segments"], rngs, batch.get("target_start"))
             batch.update(negative_tokens=tokens, negative_segments=segments, negative_usable=usable)
         return pad_lengths(batch, self.frame_multiple, self.text_multiple)
 

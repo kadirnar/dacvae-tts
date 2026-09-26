@@ -115,6 +115,24 @@ def load_silence(directory, meta):
 # of another, and every stream stays clear of the original seed range seed + epoch * rows + index.
 CROSS_STREAM, TAIL_STREAM, LONG_STREAM, TEMPO_STREAM, SPEAKER_STREAM = 1 << 48, 2 << 48, 3 << 48, 4 << 48, 5 << 48
 CONTEXT_STREAM = 6 << 48
+QUALITY_STREAM = 7 << 48
+QUALITY_FEATURES = 3  # DNSMOS SIG, BAK, OVRL (model.QUALITY_FEATURES)
+
+
+def load_quality_scores(path, db_path, split, ids):
+    """[len(ids), 3] raw DNSMOS of the split's rows (in `ids` order) from a JSON {uid: [SIG, BAK, OVRL]}; NaN where a
+    row has no score. The model sees (score - 3) / 0.5 with NaN -> 0 (model.quality_features)."""
+    scores = json.loads(Path(path).read_text())
+    position = {int(rowid): i for i, rowid in enumerate(ids)}
+    table = np.full((len(ids), QUALITY_FEATURES), np.nan, dtype=np.float32)
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as db:
+        for rowid, uid in db.execute("SELECT id, uid FROM samples WHERE split=?", (split,)):
+            value = scores.get(uid)
+            if value is not None and int(rowid) in position:
+                if len(value) != QUALITY_FEATURES:
+                    raise ValueError(f"{path}: {uid} needs [SIG, BAK, OVRL], got {value}")
+                table[position[int(rowid)]] = value
+    return table
 QUIET_CUT_SECONDS = 0.3
 
 
@@ -138,6 +156,8 @@ class LatentDataset(Dataset):
         speaker_condition=None,
         speaker_condition_source="other",
         speaker_condition_min_cosine=0.0,
+        quality_scores=None,
+        quality_dropout=0.1,
         **pair_options,
     ):
         if pairing not in {"cross", "within"} or layout not in {"segments", "joined"}:
@@ -204,6 +224,10 @@ class LatentDataset(Dataset):
             self.speaker_store = TeacherStore(speaker_condition, "speaker")
             self.speaker_store.check(self.db_path, split, self.meta["sample_rate"] / self.meta["hop_length"])
         self.speaker_source, self.speaker_min_cosine = speaker_condition_source, speaker_condition_min_cosine
+        # Quality condition (model.quality_condition): the target row's DNSMOS, dropped to "unknown" with quality_dropout.
+        self.quality, self.quality_dropout = None, quality_dropout
+        if quality_scores:
+            self.quality = load_quality_scores(quality_scores, self.db_path, split, self.ids)
         # Tempo-variant latents of the rows (tempo.py, scripts/build_tempo_variants.py) for prompt tempo perturbation.
         self.tempo_store = TempoStore(tempo_variants) if tempo_variants else None
         self.split = split
@@ -504,10 +528,22 @@ class LatentDataset(Dataset):
                 total += int(lengths[other])
         return tuple(chosen)
 
+    def tail_plan(self, epoch, index):
+        """Frames of encoded silence appended to this row's target in `epoch` (0 for most rows): the one draw both
+        `finish_item` and `epoch_costs` use."""
+        if not self.tail_silence_prob:
+            return 0
+        rng = random.Random(self.seed + epoch * len(self) + index + TAIL_STREAM)
+        return rng.randint(1, self.tail_silence_frames) if rng.random() < self.tail_silence_prob else 0
+
     def epoch_costs(self, epoch):
-        """Prompt+target frames of every row in `epoch` (plus the tail-silence maximum): exact for cross prompts, and
-        for stretched within prompts bounded by the planned cut plus the quiet-cut window."""
-        costs = self.lengths + self.tail_silence_frames
+        """Prompt+target frames of every row in `epoch`: exact for tail silence and cross prompts, and for stretched
+        within prompts bounded by the planned cut plus the quiet-cut window. (Charging every row the tail-silence
+        maximum cost ~14% of the batch at tail_silence_prob 0.3, where ~2.6% of the frames are silence.)"""
+        costs = self.lengths.copy()
+        if self.tail_silence_prob:
+            costs += np.fromiter((self.tail_plan(epoch, i) for i in range(len(self))), dtype=costs.dtype,
+                                 count=len(self))
         crossed = set()
         if self.cross_prompt_prob:
             for index in np.flatnonzero(self.group_end - self.group_start >= 2):
@@ -551,6 +587,7 @@ class LatentDataset(Dataset):
             "speaker": target["speaker"],
             "text_normalization": self.meta.get("text_normalization", "unicode-v1"),
             "layout": self.layout,
+            "cross_prompt": True,  # collate marks where the target transcript starts (target-only text negatives)
             **pair_teacher(refs, target),  # teacher frames of the references back to back, like the latents
             **({"prompt_tempo": tempo / 1000} if tempo is not None else {}),
         }
@@ -608,6 +645,12 @@ class LatentDataset(Dataset):
         all are off."""
         if self.speaker_store is not None:
             item = {**item, "speaker_condition": self.speaker_vector(epoch, index, item)}
+        if self.quality is not None:
+            # The target's recording quality; its own stream, so switching the condition moves no other draw.
+            dropped = random.Random(self.seed + epoch * len(self) + index + QUALITY_STREAM).random() < self.quality_dropout
+            scores = torch.from_numpy(self.quality[index])
+            features = torch.zeros(QUALITY_FEATURES) if dropped else torch.nan_to_num((scores - 3.0) / 0.5, nan=0.0)
+            item = {**item, "quality": features}
         if self.context_prob:
             rows = self.context_plan(epoch, index)
             context = [self.row(r)["latents"] for r in rows]
@@ -619,8 +662,7 @@ class LatentDataset(Dataset):
             item = {**item, "text_units": self.text_units}
         if not self.tail_silence_prob:
             return item
-        rng = random.Random(self.seed + epoch * len(self) + index + TAIL_STREAM)
-        frames = rng.randint(1, self.tail_silence_frames) if rng.random() < self.tail_silence_prob else 0
+        frames = self.tail_plan(epoch, index)
         pad = self.silence.expand(frames, -1)
         item = {**item, "target": torch.cat([item["target"], pad]), "tail_silence": frames}
         if "teacher_target" in item:
@@ -641,10 +683,23 @@ def stretch_teacher(item):
     return {**item, "teacher_reference": zeros, "teacher_prompt_invalid": True}
 
 
+def item_tokens(item, layout):
+    """Model tokens and segments of one item: cached token ids, else cached UTF-8 bytes, else the raw texts."""
+    if item.get("token_ids") is not None and (
+        item.get("reference_token_ids") is not None or item.get("reference_text", "") == ""
+    ):
+        tok, seg = assemble(item.get("reference_token_ids"), item["token_ids"], layout)
+    elif item.get("text_bytes") is not None and item.get("reference_text_bytes") is not None:
+        tok, seg = tokenize_bytes(item["reference_text_bytes"], item["text_bytes"], layout)
+    else:
+        tok, seg = tokenize(item["reference_text"], item["text"], item.get("text_normalization", "unicode-v1"), layout)
+    return to_units(tok, seg, item.get("text_units", "bytes"))
+
+
 def collate(items):
     if not items:
         raise ValueError("Cannot collate an empty batch")
-    latents, prompts, masks, tokens, segments, lengths = [], [], [], [], [], []
+    latents, prompts, masks, tokens, segments, lengths, starts = [], [], [], [], [], [], []
     for item in items:
         ref, target = item["reference"], item["target"]
         layout = item.get("layout", "segments")
@@ -661,17 +716,14 @@ def collate(items):
             raise ValueError("Reference and target latents must be finite")
         z = torch.cat([ref, target])
         mask = torch.arange(len(z)) < len(ref)
-        if item.get("token_ids") is not None and (
-            item.get("reference_token_ids") is not None or item.get("reference_text", "") == ""
-        ):
-            tok, seg = assemble(item.get("reference_token_ids"), item["token_ids"], layout)
-        elif item.get("text_bytes") is not None and item.get("reference_text_bytes") is not None:
-            tok, seg = tokenize_bytes(item["reference_text_bytes"], item["text_bytes"], layout)
+        tok, seg = item_tokens(item, layout)
+        if item.get("cross_prompt") and layout == "joined":
+            # A cross prompt's transcript comes first in the joined stream: the target starts after it (text negatives).
+            alone = item_tokens({**item, "reference_token_ids": None, "reference_text": "",
+                                 "reference_text_bytes": b""}, layout)[0]
+            starts.append(len(tok) - len(alone) + 1)
         else:
-            tok, seg = tokenize(
-                item["reference_text"], item["text"], item.get("text_normalization", "unicode-v1"), layout
-            )
-        tok, seg = to_units(tok, seg, item.get("text_units", "bytes"))
+            starts.append(0)
         latents.append(z)
         prompts.append(z * mask[:, None])
         masks.append(mask)
@@ -687,6 +739,8 @@ def collate(items):
         "segments": pad_sequence(segments, batch_first=True),
         **collate_teacher(items),
     }
+    if any(starts):
+        batch["target_start"] = torch.tensor(starts)
     carried = [("context" in item) for item in items]
     if any(carried):
         # Speaker contexts of different lengths (empty ones too), padded with a mask; at least one frame wide.
@@ -701,6 +755,11 @@ def collate(items):
         if not all(present):
             raise ValueError("Either every item or none carries a speaker_condition")
         batch["speaker_condition"] = torch.stack([item["speaker_condition"] for item in items]).float()
+    has_quality = [("quality" in item) for item in items]
+    if any(has_quality):
+        if not all(has_quality):
+            raise ValueError("Either every item or none carries a quality condition")
+        batch["quality"] = torch.stack([item["quality"] for item in items]).float()
     units = {item.get("text_units", "bytes") for item in items}
     if len(units) > 1:
         raise ValueError("A batch cannot mix text units")

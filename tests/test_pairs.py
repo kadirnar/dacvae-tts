@@ -287,7 +287,9 @@ def test_tail_silence_appends_the_silence_frame(tmp_path):
     cache = build_cache(tmp_path / "c", silence=True)
     base = LatentDataset(cache, **WITHIN)
     data = LatentDataset(cache, **WITHIN, tail_silence_prob=1.0, tail_silence_max_seconds=0.4)  # 10 frames
-    assert (data.costs == base.costs + 10).all() and (data.epoch_costs(0) == data.costs).all()
+    assert (data.costs == base.costs + 10).all()  # the static costs keep the maximum as an upper bound
+    drawn = np.array([data.tail_plan(0, i) for i in range(len(data))])
+    assert (data.epoch_costs(0) == base.costs + drawn).all() and (drawn >= 1).all()  # exact per epoch
     silence = (SILENCE - data.mean) / data.std
     seen = set()
     for epoch in range(4):

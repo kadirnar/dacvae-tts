@@ -38,6 +38,7 @@ BOUNDARY = {
     "duration.2.weight",
     "ctc.weight",
     "speaker_condition.weight",  # frozen speaker embedding in (zero-init): an input boundary like `input`
+    "quality_condition.weight",  # 3 DNSMOS scores in (zero-init): an input boundary, a 3-row map Muon cannot shape
     "speaker_context.input.weight",  # raw context latents in
 }
 # Per-head attention gate logits [heads, D] are a small zero-init output head, not a hidden map: Muon would
@@ -109,7 +110,9 @@ class Muon(torch.optim.Optimizer):
         steps=5,
         betas=(0.9, 0.95),
         eps=1e-8,
+        undecayed=(),
     ):
+        """`undecayed`: AdamW parameters (a subset of `others`) kept in a third group without weight decay."""
         if len(matrices) != len(parts) or any(p.ndim != 2 for p in matrices):
             raise ValueError("Muon parameters must be matrices with one part count each")
         if lr < 0 or weight_decay < 0 or not 0 <= momentum < 1 or steps < 1:
@@ -117,8 +120,13 @@ class Muon(torch.optim.Optimizer):
         groups = []
         if matrices:
             groups.append(dict(params=matrices, muon=True, parts=list(parts), momentum=momentum))
-        if others:
-            groups.append(dict(params=others, muon=False, betas=tuple(betas), eps=eps))
+        exempt = {id(p) for p in undecayed}
+        decayed = [p for p in others if id(p) not in exempt]
+        if decayed:
+            groups.append(dict(params=decayed, muon=False, betas=tuple(betas), eps=eps))
+        if exempt:
+            groups.append(dict(params=[p for p in others if id(p) in exempt], muon=False, betas=tuple(betas), eps=eps,
+                               weight_decay=0.0))
         if not groups:
             raise ValueError("No trainable parameters")
         super().__init__(groups, dict(lr=lr, weight_decay=weight_decay, nesterov=nesterov, steps=steps))
@@ -187,13 +195,30 @@ class Muon(torch.optim.Optimizer):
         torch._foreach_addcdiv_(parameters, first, denominators, step_sizes)
 
 
-def build_optimizer(model, name, lr, weight_decay, momentum=0.95, fused=False):
-    """`muon` (default recipe) or the previous plain `adamw`, selected by configuration."""
+def decay_exempt(model):
+    """ids of the parameters `weight_decay_scope: matrices` leaves undecayed: vectors and scalars (norm gains, biases,
+    gates, mixing weights) and embedding tables. Decaying them shrinks the scales that the matrices are learned
+    against (LayerNorm gains by 1 - 0.51 over 20k updates at weight decay 0.05)."""
+    exempt = {id(p) for module in model.modules() if isinstance(module, nn.Embedding) for p in module.parameters()}
+    return exempt | {id(p) for p in model.parameters() if p.ndim < 2}
+
+
+def build_optimizer(model, name, lr, weight_decay, momentum=0.95, fused=False, decay_scope="all"):
+    """`muon` (default recipe) or the previous plain `adamw`, selected by configuration. `decay_scope`: `all` decays
+    every parameter (the recipe of every trained model so far), `matrices` only the matrices (decay_exempt)."""
+    if decay_scope not in ("all", "matrices"):
+        raise ValueError("decay_scope must be all or matrices")
+    exempt = decay_exempt(model) if decay_scope == "matrices" else set()
     if name == "adamw":
+        parameters = [p for p in model.parameters() if p.requires_grad]
+        groups = [dict(params=[p for p in parameters if id(p) not in exempt])]
+        if exempt:
+            groups.append(dict(params=[p for p in parameters if id(p) in exempt], weight_decay=0.0))
         return torch.optim.AdamW(
-            model.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95), fused=fused
+            groups, lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95), fused=fused
         )
     if name != "muon":
         raise ValueError("optimizer must be muon or adamw")
     matrices, parts, others = partition(model)
-    return Muon(matrices, parts, others, lr=lr, weight_decay=weight_decay, momentum=momentum)
+    return Muon(matrices, parts, others, lr=lr, weight_decay=weight_decay, momentum=momentum,
+                undecayed=[p for p in others if id(p) in exempt])

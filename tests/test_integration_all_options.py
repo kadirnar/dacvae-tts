@@ -456,6 +456,7 @@ MODEL_OFF = dict(
     final_adaln=False, cond_text_pool=False, ctc_targets="bytes", repa_layer=0, repa_dim=0, tla_layers=(),
     tla_dim=0, tla_hidden=256, dropout=0.0, text_units="bytes", speaker_condition_dim=0, speaker_context="none",
     speaker_context_width=256, speaker_context_layers=3, speaker_context_heads=4, speaker_context_patch=4,
+    quality_condition=False, quality_target=(3.6, 4.1, 3.3),
 )
 # Every training option added by the branches, explicitly off (#7, #8, #11, #10, #14).
 TRAIN_OFF = dict(
@@ -471,7 +472,8 @@ TRAIN_OFF = dict(
     ema_decays=[], ema_warmup=True, model_guidance_weight=0.0, tempo_prompt_prob=0.0, tempo_variants="",
     tempo_prompt_factors=(), tempo_prompt_pairs="all", speaker_condition="", speaker_condition_source="other",
     speaker_condition_min_cosine=0.0, speaker_context_prob=0.0, speaker_context_min_seconds=3.0,
-    speaker_context_max_seconds=30.0, speaker_context_max_utterances=8,
+    speaker_context_max_seconds=30.0, speaker_context_max_utterances=8, quality_scores="", quality_dropout=0.1,
+    weight_decay_scope="all",
 )
 
 

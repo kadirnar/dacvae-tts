@@ -245,7 +245,7 @@ def score_hf(rows, out, args, protocol=None, originals=None):
     from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
     from dacvae_tts.codec import read_audio
-    from dacvae_tts.metrics import DNSMOS, error_counts
+    from dacvae_tts.metrics import error_counts, make_dnsmos
 
     device = args.device
     name = args.asr_model if "/" in args.asr_model else f"openai/whisper-{args.asr_model}"
@@ -257,7 +257,7 @@ def score_hf(rows, out, args, protocol=None, originals=None):
 
     evaluator.extractor = AutoFeatureExtractor.from_pretrained(args.speaker_model)
     evaluator.speaker = AutoModelForAudioXVector.from_pretrained(args.speaker_model).to(device).eval()
-    dnsmos = DNSMOS(args.dnsmos) if args.dnsmos else None
+    dnsmos = make_dnsmos(args.dnsmos) if args.dnsmos else None
     scorer = ProtocolScorer(protocol, device, dnsmos) if protocol is not None else None
     normalization = args.metric_normalization or default_metric_normalization(args.language)
     identity = row_identity({  # the same compact identity the faster-whisper rows carry
@@ -364,6 +364,8 @@ def main():
     parser.add_argument(
         "--select-speaker-model", default="microsoft/unispeech-sat-base-plus-sv",
         help="Speaker model of --select-by sim; must differ from the SIM judge --speaker-model (arXiv 2607.08256)")
+    parser.add_argument("--quality-target", type=lambda v: tuple(float(x) for x in v.split(",")),
+                        help="SIG,BAK,OVRL requested from a quality-conditioned model (default: its quality_target)")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--language", default="tr")
     parser.add_argument(
@@ -420,6 +422,8 @@ def main():
         check_rescore_prompts(out, cases, previous or ())
     (out / "cases.json").write_text(json.dumps(cases, indent=1, ensure_ascii=False))  # input of export_case_audio.py
     tts = None if reuse else Synthesizer(args.checkpoint, device=args.device)
+    if tts is not None and args.quality_target is not None:
+        tts.quality_target = args.quality_target
     if tts is not None:
         tts.articulation_options = args.articulation_options  # None: the defaults of duration.articulation_seconds
         if args.duration_model:
@@ -443,6 +447,9 @@ def main():
                    **{name: getattr(args, name) for name in (*WINDOW_OPTIONS, *OUTPUT_OPTIONS)})
     if previous is not None:  # rescore: reuse the synthesis rows of the previous pass
         rows = [{k: v for k, v in r.items() if k in {"id", "text", "speaker", "prompt", "prompt_uid", "audio", "audio_seconds", "rtf", "error", "selected_factor"}} for r in previous]
+        for row in rows:  # a scoring failure (e.g. CUDA OOM next to other jobs) is rescored; a synthesis failure stays
+            if str(row.get("error", "")).startswith("score: ") and Path(row["audio"]).exists():
+                del row["error"]
         sentences = []
     elif tts is None:  # rescore an interrupted pass: rebuild the rows from the WAVs and their JSON sidecars
         for index, sentence in enumerate(sentences):
@@ -455,13 +462,13 @@ def main():
         sentences = []
     rule, selector, selection_bias = parse_select_by(args.select_by), None, None
     if args.candidates > 1 and sentences:
-        from dacvae_tts.metrics import DNSMOS
+        from dacvae_tts.metrics import make_dnsmos
 
         needs = {METRIC_FAMILY[m] for m in rule.metrics}
         selector = CandidateScorer(
             rule,
             transcriber=HFWhisper(args.selector, args.device, args.language) if "asr" in needs else None,
-            dnsmos=DNSMOS(args.dnsmos) if "dnsmos" in needs and args.dnsmos else None,
+            dnsmos=make_dnsmos(args.dnsmos) if "dnsmos" in needs and args.dnsmos else None,
             utmos=load_utmos(args.select_utmos, args.device) if "utmos" in needs else None,
             speaker=speaker_embedder(args.select_speaker_model, args.device) if "speaker" in needs else None,
         )

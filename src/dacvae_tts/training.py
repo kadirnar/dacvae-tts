@@ -104,9 +104,10 @@ class Objective(nn.Module):
         if "negative_tokens" in batch:  # drawn by the loader workers (train.loader_negatives)
             return batch["negative_tokens"], batch["negative_segments"], batch["negative_usable"]
         tokens, segments = batch["tokens"].cpu(), batch["segments"].cpu()
+        starts = batch["target_start"].tolist() if "target_start" in batch else [0] * len(tokens)
         rows, usable = [], []
-        for row_tokens, row_segments in zip(tokens, segments):
-            corrupted = corrupt_transcript(row_tokens, row_segments, self.rng)
+        for row_tokens, row_segments, start in zip(tokens, segments, starts):
+            corrupted = corrupt_transcript(row_tokens, row_segments, self.rng, start)
             usable.append(corrupted is not None)
             rows.append(corrupted if corrupted is not None else (row_tokens, row_segments))
         width = max(len(t) for t, _ in rows)
@@ -573,14 +574,19 @@ def warm_start(module, state):
 
 
 def speaker_sources(cfg, cache):
-    """LatentDataset keywords of the speaker-embedding condition (model.speaker_condition_dim); empty if off."""
-    if not cfg.model.speaker_condition_dim:
-        return {}
+    """LatentDataset keywords of the voice conditions read from stores: the speaker embedding
+    (model.speaker_condition_dim) and the recording quality (model.quality_condition); empty if both are off."""
     from .teacher import resolve_store
 
-    return {"speaker_condition": resolve_store(cfg.train.speaker_condition, cache),
-            "speaker_condition_source": cfg.train.speaker_condition_source,
-            "speaker_condition_min_cosine": cfg.train.speaker_condition_min_cosine}
+    sources = {}
+    if cfg.model.speaker_condition_dim:
+        sources.update(speaker_condition=resolve_store(cfg.train.speaker_condition, cache),
+                       speaker_condition_source=cfg.train.speaker_condition_source,
+                       speaker_condition_min_cosine=cfg.train.speaker_condition_min_cosine)
+    if cfg.model.quality_condition:
+        sources.update(quality_scores=resolve_store(cfg.train.quality_scores, cache),
+                       quality_dropout=cfg.train.quality_dropout)
+    return sources
 
 
 def speaker_metadata(data):
@@ -675,6 +681,7 @@ def train(args):
             cfg.train.weight_decay,
             cfg.train.muon_momentum,
             fused=device.type == "cuda",
+            decay_scope=cfg.train.weight_decay_scope,
         )
         start_step, epoch, batch_offset, resumed_rng = 0, 0, 0, None
         if args.resume:
