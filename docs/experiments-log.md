@@ -5,11 +5,11 @@ Every run of the tr-combined study (DACVAE-TTS, Turkish zero-shot TTS): the ques
 | verdict | runs |
 |---|---|
 | reference | `base-s42`, `base-s43`, `x-s43`, `run-c-reference`, `y-base`, `y-s43` |
-| tie | `base-eager`, `x-no-negatives`, `x-pairs-tail`, `x-pairs-char-ctc`, `x-swiglu`, `x-attn-gate`, `x-long-skip`, `ft-w0`, `grpo`, `y-long-skip`, `y-final-adaln`, `y-cond-text-pool` |
+| tie | `base-eager`, `x-no-negatives`, `x-pairs-tail`, `x-pairs-char-ctc`, `x-swiglu`, `x-attn-gate`, `x-long-skip`, `ft-w0`, `grpo`, `y-long-skip`, `y-final-adaln`, `y-cond-text-pool`, `y-decay-matrices` |
 | rejected | `base-s42-pad64`, `x-latent-negatives`, `x-tla`, `ft-mg-w07`, `y-ffn-conv` |
 | adopted | `pairs-cross`, `x-char-units`, `x-char-units-s43`, `x-quality-cond`, `x-repa`, `full-cross`, `full-v2`, `y-value-residual` |
 | not run | `x-value-residual`, `x-ffn-conv`, `x-final-adaln`, `x-cond-text-pool`, `x-regularized`, `x-speaker-context`, `x-repa-tla`, `x-speaker-condition` |
-| pending | `y-swiglu`, `y-attn-gate`, `y-speaker-condition`, `y-decay-matrices`, `y-regularized` |
+| pending | `y-swiglu`, `y-attn-gate`, `y-speaker-condition`, `y-regularized` |
 
 ## Models side by side (refit duration predictor, seeds 42 + 1000 pooled)
 
@@ -1069,7 +1069,7 @@ No final evaluation yet.
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-speaker-condition) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-speaker-condition/logs)
 
-## `y-decay-matrices` (audit): pending
+## `y-decay-matrices` (audit): tie
 
 
 **Question.** Weight decay on matrices only (norm gains, biases, gates and embeddings undecayed), on the v2 recipe.
@@ -1080,10 +1080,22 @@ Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-
 
 **Baseline.** `y-base`
 
-No final evaluation yet.
+Final evaluation, sampling seeds 42 + 1000 pooled (y-decay-matrices/step-0020000, y-decay-matrices/step-0020000-s1000):
+
+| metric | `y-base` | `y-decay-matrices` | difference [95 % CI] | verdict |
+|---|---:|---:|---|---|
+| WER % | 4.32 | 3.77 | -0.55 [-1.25, 0.15] | tie |
+| CER % | 2.98 | 2.11 | -0.87 [-1.47, -0.27] | win |
+| SIM-o | 0.587 | 0.581 | -0.006 [-0.010, -0.002] | loss |
+| DNSMOS | 3.111 | 3.122 | +0.011 [-0.003, 0.026] | tie |
+| UTMOS | 2.486 | 2.480 | -0.006 [-0.024, 0.011] | tie |
 
 
-**Training.** final validation flow 0.7109 (step 4000); 0.270 s/update; 14,060 target frames/update
+**Trajectory** (WER / CER %; * = quick check, first 96 sentences): 5k: 12.3 / 7.7*, 10k: 7.4 / 5.1*, 15k: 5.0 / 3.0*, 20k: 3.7 / 2.0
+
+**Training.** final validation flow 0.6809 (step 20000); 0.153 s/update; 13,518 target frames/update
+
+**Verdict: tie.** Neutral at weight decay 0.01. CER 2.11 is below both base seeds (2.98 / 2.30) by less than their spread; WER 3.77, SIM-o 0.581 and DNSMOS 3.122 lie within the seeds; UTMOS 2.480 slightly below both. The unusual decay of norm gains and biases was not costing quality at this strength; the option matters for stronger decay (y-regularized).
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-decay-matrices) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-decay-matrices/logs)
 
@@ -1098,6 +1110,8 @@ Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-
 
 No final evaluation yet.
 
+
+**Training.** final validation flow 0.7153 (step 4000); 0.281 s/update; 14,103 target frames/update
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-regularized) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-regularized/logs)
 

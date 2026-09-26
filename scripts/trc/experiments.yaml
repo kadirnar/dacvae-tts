@@ -285,7 +285,8 @@ y-decay-matrices:
   question: "Weight decay on matrices only (norm gains, biases, gates and embeddings undecayed), on the v2 recipe."
   evidence: "Standard practice (AdamW exclusions in GPT/DiT training); the audit found decay on every parameter."
   baseline: y-base
-  verdict: pending
+  verdict: tie
+  conclusion: "Neutral at weight decay 0.01. CER 2.11 is below both base seeds (2.98 / 2.30) by less than their spread; WER 3.77, SIM-o 0.581 and DNSMOS 3.122 lie within the seeds; UTMOS 2.480 slightly below both. The unusual decay of norm gains and biases was not costing quality at this strength; the option matters for stronger decay (y-regularized)."
 y-regularized:
   issue: "#14"
   question: "Dropout 0.1 and weight decay 0.05 on matrices, on the v2 recipe. Caveat: the text-hinge negative pass draws its own dropout masks."
