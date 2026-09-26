@@ -50,7 +50,7 @@ def main():
         log(f"{arm}/{name}: {left} unscored rows left; WER {100 * summary['wer']:.2f} CER {100 * summary['cer']:.2f}")
         if args.push and not left and seed == 42:
             subprocess.run([PY, "scripts/trc/push_snapshot.py", "--run", str(Path(setting("RUNS")) / f"trc-{arm}"),
-                            "--repo", f"{setting('HF_ORG')}/dacvae-tts-trc-{arm}", "--step", str(step), "--eval",
+                            "--repo", setting("HUB_REPO"), "--subdir", arm, "--step", str(step), "--eval",
                             str(directory), "--no-checkpoint", "--title", f"DACVAE-TTS tr-combined A/B arm `{arm}`"],
                            cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 

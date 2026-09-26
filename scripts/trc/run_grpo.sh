@@ -34,7 +34,8 @@ for seed in 42 1000; do
   .venv/bin/python scripts/trc/eval_slot.py -- .venv/bin/python scripts/eval_sentences.py --checkpoint "$FINAL" \
     "${COMMON[@]}" --output "$dir" --seed "$seed" > "$dir.log" 2>&1
 done
-.venv/bin/python scripts/trc/push_snapshot.py --run "$RUN" --repo VoiceHub/dacvae-tts-trc-grpo --step "$STEPS" --public \
+.venv/bin/python scripts/trc/push_snapshot.py --run "$RUN" --repo VoiceHub/dacvae-tts-tr-combined --subdir grpo \
+  --step "$STEPS" --public --second-eval "$OUT/step-$(printf %07d "$STEPS")-s1000" \
   --eval "$OUT/step-$(printf %07d "$STEPS")" --title "DACVAE-TTS tr-combined: Flow-GRPO post-training (#16)" \
   --notes "Flow-GRPO ($STEPS updates, group 8 x 4 prompts, 16 steps, SDE window 2, sigma 0.5, KL 0.04, LR 1e-5; reward CER 1.0 + SIM 0.5 + DNSMOS 0.4 + UTMOS 0.4) from full-cross step 60000." > /dev/null
 touch "$OUT/done"

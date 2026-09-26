@@ -4,8 +4,10 @@ Each system is an eval_sentences.py output directory with the same prompt set an
 samples/<id>/{prompt.wav, <system>.wav}, a README table with the text, each system's Whisper transcript and WER, and the
 systems' corpus metrics, so differences can be heard sentence by sentence.
 
-  python scripts/trc/push_comparison.py --repo VoiceHub/dacvae-tts-trc-comparison --count 40 \
+  python scripts/trc/push_comparison.py --count 40 \
       old=outputs/trc/systems/old-auto new=outputs/trc/systems/new-auto
+
+It goes to the comparison/ folder of the experiments repo (--subdir; empty = the repo root).
 """
 
 import argparse
@@ -21,7 +23,8 @@ from huggingface_hub import HfApi
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("systems", nargs="+", help="LABEL=eval_sentences output directory")
-    parser.add_argument("--repo", required=True)
+    parser.add_argument("--repo", default="VoiceHub/dacvae-tts-tr-combined")
+    parser.add_argument("--subdir", default="comparison")
     parser.add_argument("--count", type=int, default=40)
     parser.add_argument("--title", default="DACVAE-TTS Turkish: old vs new, side by side")
     parser.add_argument("--notes", default="")
@@ -58,10 +61,12 @@ def main():
                 shutil.copy2(path / f"{sentence}.wav", folder / f"{label}.wav")
                 row = rows[label][sentence]
                 cells.append(f"{row.get('hypothesis', '').strip()} ({100 * row.get('wer', 0):.0f} %)")
-            link = f"[{sentence}](https://huggingface.co/{args.repo}/tree/main/samples/{sentence})"
+            prefix = f"{args.subdir}/" if args.subdir else ""
+            link = f"[{sentence}](https://huggingface.co/{args.repo}/tree/main/{prefix}samples/{sentence})"
             lines.append(f"| {link} | {rows[first][sentence]['text']} | " + " | ".join(cells) + " |")
         (root / "README.md").write_text("\n".join(lines) + "\n")
-        api.upload_folder(repo_id=args.repo, folder_path=str(root), commit_message="side-by-side listening set")
+        api.upload_folder(repo_id=args.repo, folder_path=str(root), path_in_repo=args.subdir or None,
+                          commit_message="side-by-side listening set")
     print(f"https://huggingface.co/{args.repo}")
 
 

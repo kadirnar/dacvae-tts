@@ -38,6 +38,7 @@ ENV = {
     "GUIDANCE": "5.0",
     "SAMPLE_STEPS": "32",
     "HF_ORG": "VoiceHub",
+    "HUB_REPO": "VoiceHub/dacvae-tts-tr-combined",  # every run is a folder of this one repo (scripts/trc/hub_index.py)
     "WANDB_PROJECT": "dacvae-tts-tr-combined",
 }
 
@@ -117,14 +118,16 @@ run.finish()
     subprocess.run([PY, "-c", code], cwd=REPO, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def push(arm, run, step, out, title, notes, slim=False):
-    """Returns True once the snapshot is on the Hub."""
+def push(arm, run, step, out, title, notes, slim=False, second=None):
+    """Returns True once the snapshot is on the Hub. `second`: the seed-1000 evaluation of a step already pushed."""
     if os.environ.get("NO_PUSH"):
         return False
-    command = [PY, "scripts/trc/push_snapshot.py", "--run", str(run), "--repo", f"{setting('HF_ORG')}/dacvae-tts-trc-{arm}",
+    command = [PY, "scripts/trc/push_snapshot.py", "--run", str(run), "--repo", setting("HUB_REPO"), "--subdir", arm,
                "--step", str(step), "--title", title, "--notes", notes, *(["--slim"] if slim else []),
                "--public"]  # public: the org's private storage quota is shared with other projects and ran full
-    if out is not None and (out / "summary.json").exists():
+    if second is not None:
+        command += ["--no-checkpoint", "--second-eval", str(second)]
+    elif out is not None and (out / "summary.json").exists():
         command += ["--eval", str(out)]
     for attempt in range(3):
         if subprocess.run(command, cwd=REPO).returncode == 0:
@@ -135,9 +138,13 @@ def push(arm, run, step, out, title, notes, slim=False):
 
 
 def pushed_steps(run, arm):
-    """Steps push_snapshot.py has put on the Hub (its state file next to the run)."""
-    state = run / f"pushed-dacvae-tts-trc-{arm}.json"
-    return set(json.loads(state.read_text())["steps"]) if state.exists() else set()
+    """Steps push_snapshot.py has put on the Hub (its state files next to the run: the experiments repo and the former
+    one-repo-per-arm layout)."""
+    steps = set()
+    for state in (run / f"pushed-{setting('HUB_REPO').split('/')[-1]}.json", run / f"pushed-dacvae-tts-trc-{arm}.json"):
+        if state.exists():
+            steps |= {step for step, entry in json.loads(state.read_text())["steps"].items() if entry.get("checkpoint")}
+    return steps
 
 
 def main():
@@ -208,6 +215,7 @@ def main():
             # 1000 differed by +0.9, a tie); compare_evals.py pools LABEL=dir,dir-s1000 as replicates.
             try:
                 evaluate(snapshot, results / f"step-{step:07d}-s1000", 0, args.gpu, seed=1000)
+                push(args.arm, run, step, out, title, notes, second=results / f"step-{step:07d}-s1000")
             except subprocess.CalledProcessError as error:
                 log(f"{args.arm}: seed-1000 evaluation failed ({error.returncode})")
     if trainer is not None:
