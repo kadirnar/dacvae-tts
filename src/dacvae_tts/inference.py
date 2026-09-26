@@ -54,8 +54,10 @@ class VoiceReference:
     speech_timing: dict = None
     # speaker-embedding condition [E] of speaker-conditioned models (Synthesizer.speaker_embedding); None until used
     speaker_embedding: torch.Tensor = None
-    # speaker context [L,C] of speaker-context models: the prompt and any extra clips (Synthesizer.context_latents)
+    # speaker context [L,C] of speaker-context models: the extra clips, if any (Synthesizer.context_latents)
     context: torch.Tensor = None
+    # the prompt as given (a path or a (waveform, rate) pair), for embedders trained on the codec's input audio
+    audio: object = None
 
 
 @dataclass
@@ -219,7 +221,8 @@ class Synthesizer:
             source = f"asr:{self.asr_model}"
         if not reference_text.strip():
             raise ValueError("A nonempty reference transcript is required internally")
-        voice = VoiceReference(latents, reference_text, source, timings, self.measure_speech_timing(ref_audio))
+        voice = VoiceReference(latents, reference_text, source, timings, self.measure_speech_timing(ref_audio),
+                               audio=ref_audio)
         if context_audio:
             clips = [self.encode_reference(*clip) if isinstance(clip, tuple) else self.reference(clip)
                      for clip in context_audio]
@@ -227,21 +230,23 @@ class Synthesizer:
         return voice
 
     def context_latents(self, reference, clips=()):
-        """Speaker context [L,C] of speaker-context models (None otherwise): the prompt's latents, then the given
-        extra clips' in order, whole clips while the total stays within the trained maximum (the prompt always
-        stays). Computed once per VoiceReference; references without extra clips use the prompt alone."""
+        """Speaker context [L,C] of speaker-context models (None otherwise): the given extra clips in order, whole
+        clips while the total stays within the trained maximum. Training contexts are other utterances of the
+        speaker, never the prompt, and rows without context add exactly zero; so a reference without extra clips
+        has no context (None), the in-distribution single-clip case, instead of repeating the prompt as context (a
+        context training never shows). Computed once per VoiceReference."""
         if getattr(self.model, "speaker_context", None) is None:
             return None
-        if getattr(reference, "context", None) is not None and not clips:
-            return reference.context
+        if not clips:
+            return getattr(reference, "context", None)
         train = self.checkpoint.get("config", {}).get("train", {}) if hasattr(self, "checkpoint") else {}
         limit = round(train.get("speaker_context_max_seconds", 30.0) * self.codec.sample_rate / self.codec.hop_length)
-        parts, total = [reference.latents.to(self.device)], len(reference.latents)
+        parts, total = [], 0
         for clip in clips:
             if total + len(clip) <= limit:
                 parts.append(clip.to(self.device))
                 total += len(clip)
-        reference.context = torch.cat(parts)
+        reference.context = torch.cat(parts) if parts else None
         return reference.context
 
     def measure_speech_timing(self, ref_audio):
@@ -280,8 +285,10 @@ class Synthesizer:
 
     def speaker_embedding(self, reference):
         """Speaker-embedding condition [E] of a voice for speaker-conditioned models, else None; computed once per
-        VoiceReference with the checkpoint's embedder on the prompt's codec reconstruction (speaker stores of
-        Parquet-prepared caches embed decoded latents as well, and every reference has latents)."""
+        VoiceReference with the checkpoint's embedder, on the audio its speaker store embedded: the codec's input
+        (the prompt at the codec rate and loudness) when the store was built from original audio
+        (`--audio-source parquet`), else the prompt's codec reconstruction (stores of decoded latents, and references
+        built from cached latents). The two differ by ECAPA cosine ~0.05, a third of a same-speaker spread."""
         if getattr(self.model, "speaker_condition", None) is None:
             return None
         if getattr(reference, "speaker_embedding", None) is None:
@@ -289,8 +296,14 @@ class Synthesizer:
                 from .speakers import condition_embedder
 
                 self._speaker_embedder = condition_embedder(self.speaker_record, str(self.device))
-            audio = self.codec.decode(reference.latents.to(self.device).float() * self.std + self.mean)
-            reference.speaker_embedding = self._speaker_embedder(audio.float().cpu().numpy(), self.codec.sample_rate)
+            sources = (self.speaker_record or {}).get("audio_sources") or {}
+            original = sources.get("original", 0) > 0 and not sources.get("decoded", 0)
+            if original and getattr(reference, "audio", None) is not None:
+                audio = self.codec_input(reference.audio)
+            else:
+                audio = self.codec.decode(reference.latents.to(self.device).float() * self.std + self.mean)
+            audio = audio.float().cpu().numpy() if torch.is_tensor(audio) else audio
+            reference.speaker_embedding = self._speaker_embedder(audio, self.codec.sample_rate)
         return reference.speaker_embedding
 
     @torch.inference_mode()
@@ -373,18 +386,15 @@ class Synthesizer:
             path.with_suffix(".json").write_text(json.dumps(metadata, indent=2))
         return SynthesisResult(audio, self.codec.sample_rate, metadata)
 
-    def reference(self, path):
-        audio = read_audio(path, self.codec.sample_rate, getattr(self.codec, "loudness", None))
-        seconds = len(audio) / self.codec.sample_rate
-        if not 0.5 <= seconds <= 30:
-            raise ValueError("Reference must be a complete .5–30 second utterance with an exact transcript")
-        return (self.codec.encode(audio) - self.mean) / self.std
-
-    def encode_reference(self, audio, sample_rate):
-        """Normalized latents of a mono waveform (numpy or tensor) at any sample rate; same preprocessing as files."""
+    def codec_input(self, source):
+        """The waveform the codec encodes for a prompt: a path, or a (waveform, rate) pair of a mono recording,
+        resampled to the codec rate and normalized to its loudness (float32 tensor)."""
         import numpy as np
         from scipy.signal import resample_poly
 
+        if not isinstance(source, tuple):
+            return read_audio(source, self.codec.sample_rate, getattr(self.codec, "loudness", None))
+        audio, sample_rate = source
         audio = np.asarray(audio.cpu() if torch.is_tensor(audio) else audio, dtype=np.float32).reshape(-1)
         if not len(audio) or not np.isfinite(audio).all():
             raise ValueError("Empty or nonfinite reference audio")
@@ -393,10 +403,22 @@ class Synthesizer:
             audio = resample_poly(audio, self.codec.sample_rate // factor, int(sample_rate) // factor).astype(np.float32)
         if getattr(self.codec, "loudness", None) is not None:
             audio = normalize_loudness(audio, self.codec.sample_rate, self.codec.loudness)
+        return torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32))
+
+    def reference(self, path):
+        audio = self.codec_input(path)
         seconds = len(audio) / self.codec.sample_rate
         if not 0.5 <= seconds <= 30:
             raise ValueError("Reference must be a complete .5–30 second utterance with an exact transcript")
-        return (self.codec.encode(torch.from_numpy(audio.copy())) - self.mean) / self.std
+        return (self.codec.encode(audio) - self.mean) / self.std
+
+    def encode_reference(self, audio, sample_rate):
+        """Normalized latents of a mono waveform (numpy or tensor) at any sample rate; same preprocessing as files."""
+        audio = self.codec_input((audio, sample_rate))
+        seconds = len(audio) / self.codec.sample_rate
+        if not 0.5 <= seconds <= 30:
+            raise ValueError("Reference must be a complete .5–30 second utterance with an exact transcript")
+        return (self.codec.encode(audio) - self.mean) / self.std
 
     def _articulation_timing(self, reference, seconds, duration_mode):
         """Prompt timing when the `articulation` rule will use it (rule-duration model, no fixed length), else None."""

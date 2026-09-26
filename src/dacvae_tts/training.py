@@ -681,6 +681,7 @@ def train(args):
             cfg.train.weight_decay,
             cfg.train.muon_momentum,
             fused=device.type == "cuda",
+            decay_scope=cfg.train.weight_decay_scope,
         )
         start_step, epoch, batch_offset, resumed_rng = 0, 0, 0, None
         if args.resume:

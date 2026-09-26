@@ -473,6 +473,7 @@ TRAIN_OFF = dict(
     tempo_prompt_factors=(), tempo_prompt_pairs="all", speaker_condition="", speaker_condition_source="other",
     speaker_condition_min_cosine=0.0, speaker_context_prob=0.0, speaker_context_min_seconds=3.0,
     speaker_context_max_seconds=30.0, speaker_context_max_utterances=8, quality_scores="", quality_dropout=0.1,
+    weight_decay_scope="all",
 )
 
 

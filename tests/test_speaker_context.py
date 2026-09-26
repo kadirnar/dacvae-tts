@@ -137,7 +137,9 @@ def test_a_context_branch_warm_starts_from_a_checkpoint_without_one():
         warm_start(base, model.state_dict())  # dropping a trained branch is not a warm start
 
 
-def test_inference_context_is_the_prompt_plus_whole_clips_up_to_the_trained_length():
+def test_inference_context_is_the_extra_clips_up_to_the_trained_length_and_none_without_them():
+    """Training contexts are other utterances (never the prompt) and rows without one add exactly zero: the prompt
+    alone is the no-context case, extra clips are the context (whole clips within the trained maximum)."""
     from dacvae_tts.inference import Synthesizer, VoiceReference
 
     tts = Synthesizer.__new__(Synthesizer)
@@ -148,13 +150,13 @@ def test_inference_context_is_the_prompt_plus_whole_clips_up_to_the_trained_leng
     tts.checkpoint = {"config": {"train": {"speaker_context_max_seconds": 1.0}}}  # 25 frames
     voice = VoiceReference(torch.randn(10, 4), "Önceki cümle.", "provided", {})
     clips = [torch.randn(8, 4), torch.randn(20, 4), torch.randn(5, 4)]
-    context = tts.context_latents(voice, clips)  # 10 + 8 fit, 20 would pass 25 and is skipped, 5 more fit
-    assert torch.equal(context, torch.cat([voice.latents, clips[0], clips[2]]))
+    context = tts.context_latents(voice, clips)  # 8 fits, 20 would pass 25 and is skipped, 5 more fit
+    assert torch.equal(context, torch.cat([clips[0], clips[2]]))
     assert tts.context_latents(voice) is context  # kept on the reference
     batch = tts.make_batch(voice.latents, voice.transcript, "Yeni bir cümle.", context=context)
-    assert batch["context"].shape == (1, 23, 4) and batch["context_mask"].all()
+    assert batch["context"].shape == (1, 13, 4) and batch["context_mask"].all()
     alone = VoiceReference(torch.randn(10, 4), "Önceki cümle.", "provided", {})
-    assert torch.equal(tts.context_latents(alone), alone.latents)  # no extra clips: the prompt itself
+    assert tts.context_latents(alone) is None  # no extra clips: no context, as in training's context-free rows
     plain = Synthesizer.__new__(Synthesizer)
     plain.model = FlowTTS(ModelConfig(**SMALL))
     assert plain.context_latents(voice) is None

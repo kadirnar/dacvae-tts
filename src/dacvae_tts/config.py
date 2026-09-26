@@ -183,6 +183,9 @@ class TrainConfig:
     learning_rate: float = 3e-4
     warmup: int = 5000
     weight_decay: float = 0.01
+    # `all` decays every parameter (every model trained so far); `matrices` leaves vectors, scalars and embedding
+    # tables undecayed (optim.decay_exempt: norm gains, biases, gates, value-residual weights)
+    weight_decay_scope: str = "all"
     optimizer: str = "muon"
     muon_momentum: float = 0.95
     ema_decay: float = 0.999
@@ -341,6 +344,8 @@ class TrainConfig:
             raise ValueError("Training counts/intervals must be positive")
         if self.precision not in {"fp32", "bf16"}:
             raise ValueError("precision must be fp32 or bf16")
+        if self.weight_decay_scope not in {"all", "matrices"}:
+            raise ValueError("train.weight_decay_scope must be all or matrices")
         if self.optimizer not in {"muon", "adamw"} or not 0 <= self.muon_momentum < 1:
             raise ValueError("optimizer must be muon or adamw, with Muon momentum in [0,1)")
         if self.workers < 0 or self.warmup < 0 or not 0 <= self.ema_decay < 1:

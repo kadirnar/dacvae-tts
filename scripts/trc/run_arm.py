@@ -14,6 +14,7 @@ metric. Everything is idempotent: a finished step is skipped, an interrupted run
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -56,7 +57,10 @@ def derive(base, output, overrides):
     for override in overrides:
         key, _, value = override.partition("=")
         section, _, field = key.partition(".")
-        config[section][field] = yaml.safe_load(value)
+        parsed = yaml.safe_load(value)
+        if isinstance(parsed, str) and re.fullmatch(r"[-+]?(\d+\.?\d*|\.\d+)[eE][-+]?\d+", parsed):
+            parsed = float(parsed)  # YAML 1.1 reads exponents without a dot ("1e-4") as strings
+        config[section][field] = parsed
     output.parent.mkdir(parents=True, exist_ok=True)
     header = f"# Derived from {base}; changed: {', '.join(overrides) or 'nothing'}\n"
     output.write_text(header + yaml.safe_dump(config, sort_keys=False))
