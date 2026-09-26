@@ -291,4 +291,5 @@ y-regularized:
   issue: "#14"
   question: "Dropout 0.1 and weight decay 0.05 on matrices, on the v2 recipe. Caveat: the text-hinge negative pass draws its own dropout masks."
   baseline: y-base
-  verdict: pending
+  verdict: rejected
+  conclusion: "Worse on quality beyond both base seeds: DNSMOS 3.043 vs 3.111 / 3.112 and UTMOS 2.397 vs 2.486 / 2.506; WER 4.58 and CER 3.05 at or above both; validation flow 0.6867 vs 0.6810 / 0.6833. Nothing to regularize: full-v2's validation flow keeps falling to 60k (0.691 at 10k, 0.681 at 20k, 0.670 at 60k), so there is no overfitting for dropout to fix at this data size."

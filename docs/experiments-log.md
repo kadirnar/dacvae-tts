@@ -6,10 +6,10 @@ Every run of the tr-combined study (DACVAE-TTS, Turkish zero-shot TTS): the ques
 |---|---|
 | reference | `base-s42`, `base-s43`, `x-s43`, `run-c-reference`, `y-base`, `y-s43` |
 | tie | `base-eager`, `x-no-negatives`, `x-pairs-tail`, `x-pairs-char-ctc`, `x-swiglu`, `x-attn-gate`, `x-long-skip`, `ft-w0`, `grpo`, `y-long-skip`, `y-final-adaln`, `y-cond-text-pool`, `y-decay-matrices` |
-| rejected | `base-s42-pad64`, `x-latent-negatives`, `x-tla`, `ft-mg-w07`, `y-ffn-conv` |
+| rejected | `base-s42-pad64`, `x-latent-negatives`, `x-tla`, `ft-mg-w07`, `y-ffn-conv`, `y-regularized` |
 | adopted | `pairs-cross`, `x-char-units`, `x-char-units-s43`, `x-quality-cond`, `x-repa`, `full-cross`, `full-v2`, `y-value-residual` |
 | not run | `x-value-residual`, `x-ffn-conv`, `x-final-adaln`, `x-cond-text-pool`, `x-regularized`, `x-speaker-context`, `x-repa-tla`, `x-speaker-condition` |
-| pending | `y-swiglu`, `y-attn-gate`, `y-speaker-condition`, `y-regularized` |
+| pending | `y-swiglu`, `y-attn-gate`, `y-speaker-condition` |
 
 ## Models side by side (refit duration predictor, seeds 42 + 1000 pooled)
 
@@ -1067,6 +1067,8 @@ Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-
 No final evaluation yet.
 
 
+**Training.** final validation flow 0.7111 (step 4000); 0.271 s/update; 14,123 target frames/update
+
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-speaker-condition) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-speaker-condition/logs)
 
 ## `y-decay-matrices` (audit): tie
@@ -1099,7 +1101,7 @@ Final evaluation, sampling seeds 42 + 1000 pooled (y-decay-matrices/step-0020000
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-decay-matrices) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-decay-matrices/logs)
 
-## `y-regularized` (#14): pending
+## `y-regularized` (#14): rejected
 
 
 **Question.** Dropout 0.1 and weight decay 0.05 on matrices, on the v2 recipe. Caveat: the text-hinge negative pass draws its own dropout masks.
@@ -1108,10 +1110,22 @@ Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-
 
 **Baseline.** `y-base`
 
-No final evaluation yet.
+Final evaluation, sampling seeds 42 + 1000 pooled (y-regularized/step-0020000, y-regularized/step-0020000-s1000):
+
+| metric | `y-base` | `y-regularized` | difference [95 % CI] | verdict |
+|---|---:|---:|---|---|
+| WER % | 4.32 | 4.58 | +0.26 [-0.28, 0.79] | tie |
+| CER % | 2.98 | 3.05 | +0.06 [-0.39, 0.52] | tie |
+| SIM-o | 0.587 | 0.572 | -0.015 [-0.021, -0.008] | loss |
+| DNSMOS | 3.111 | 3.043 | -0.067 [-0.081, -0.054] | loss |
+| UTMOS | 2.486 | 2.397 | -0.090 [-0.112, -0.067] | loss |
 
 
-**Training.** final validation flow 0.7153 (step 4000); 0.281 s/update; 14,103 target frames/update
+**Trajectory** (WER / CER %; * = quick check, first 96 sentences): 5k: 10.7 / 6.7*, 10k: 4.4 / 3.5*, 15k: 6.4 / 4.7*, 20k: 4.8 / 3.2
+
+**Training.** final validation flow 0.6867 (step 20000); 0.162 s/update; 13,518 target frames/update
+
+**Verdict: rejected.** Worse on quality beyond both base seeds: DNSMOS 3.043 vs 3.111 / 3.112 and UTMOS 2.397 vs 2.486 / 2.506; WER 4.58 and CER 3.05 at or above both; validation flow 0.6867 vs 0.6810 / 0.6833. Nothing to regularize: full-v2's validation flow keeps falling to 60k (0.691 at 10k, 0.681 at 20k, 0.670 at 60k), so there is no overfitting for dropout to fix at this data size.
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-regularized) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-regularized/logs)
 
