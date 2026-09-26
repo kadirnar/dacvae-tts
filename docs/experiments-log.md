@@ -5,11 +5,11 @@ Every run of the tr-combined study (DACVAE-TTS, Turkish zero-shot TTS): the ques
 | verdict | runs |
 |---|---|
 | reference | `base-s42`, `base-s43`, `x-s43`, `run-c-reference`, `y-base`, `y-s43` |
-| tie | `base-eager`, `x-no-negatives`, `x-pairs-tail`, `x-pairs-char-ctc`, `x-swiglu`, `x-attn-gate`, `x-long-skip`, `ft-w0`, `grpo`, `y-long-skip`, `y-final-adaln` |
+| tie | `base-eager`, `x-no-negatives`, `x-pairs-tail`, `x-pairs-char-ctc`, `x-swiglu`, `x-attn-gate`, `x-long-skip`, `ft-w0`, `grpo`, `y-long-skip`, `y-final-adaln`, `y-cond-text-pool` |
 | rejected | `base-s42-pad64`, `x-latent-negatives`, `x-tla`, `ft-mg-w07`, `y-ffn-conv` |
 | adopted | `pairs-cross`, `x-char-units`, `x-char-units-s43`, `x-quality-cond`, `x-repa`, `full-cross`, `full-v2`, `y-value-residual` |
 | not run | `x-value-residual`, `x-ffn-conv`, `x-final-adaln`, `x-cond-text-pool`, `x-regularized`, `x-speaker-context`, `x-repa-tla`, `x-speaker-condition` |
-| pending | `y-cond-text-pool`, `y-swiglu`, `y-attn-gate`, `y-speaker-condition`, `y-decay-matrices`, `y-regularized` |
+| pending | `y-swiglu`, `y-attn-gate`, `y-speaker-condition`, `y-decay-matrices`, `y-regularized` |
 
 ## Models side by side (refit duration predictor, seeds 42 + 1000 pooled)
 
@@ -993,7 +993,7 @@ Final evaluation, sampling seeds 42 + 1000 pooled (y-final-adaln/step-0020000, y
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-final-adaln) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-final-adaln/logs)
 
-## `y-cond-text-pool` (#9): pending
+## `y-cond-text-pool` (#9): tie
 
 
 **Question.** Pooled transcript added to the condition, on the v2 recipe (in the joined layout the pool covers prompt and target text).
@@ -1004,10 +1004,22 @@ Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-
 
 **Baseline.** `y-base`
 
-No final evaluation yet.
+Final evaluation, sampling seeds 42 + 1000 pooled (y-cond-text-pool/step-0020000, y-cond-text-pool/step-0020000-s1000):
+
+| metric | `y-base` | `y-cond-text-pool` | difference [95 % CI] | verdict |
+|---|---:|---:|---|---|
+| WER % | 4.32 | 4.53 | +0.20 [-0.53, 0.94] | tie |
+| CER % | 2.98 | 3.07 | +0.09 [-0.51, 0.69] | tie |
+| SIM-o | 0.587 | 0.590 | +0.003 [-0.001, 0.008] | tie |
+| DNSMOS | 3.111 | 3.112 | +0.001 [-0.012, 0.015] | tie |
+| UTMOS | 2.486 | 2.499 | +0.013 [-0.004, 0.029] | tie |
 
 
-**Training.** final validation flow 0.7106 (step 4000); 0.271 s/update; 14,118 target frames/update
+**Trajectory** (WER / CER %; * = quick check, first 96 sentences): 5k: 12.2 / 8.5*, 10k: 5.5 / 3.3*, 15k: 5.5 / 3.6*, 20k: 4.4 / 2.9
+
+**Training.** final validation flow 0.6809 (step 20000); 0.153 s/update; 13,518 target frames/update
+
+**Verdict: tie.** No gain. WER 4.53 and CER 3.07 sit slightly above both base seeds (4.32 / 3.64; within the spread of y-base); SIM-o 0.590, DNSMOS 3.112 and UTMOS 2.499 match y-base. +0.26M parameters; not adopted.
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-cond-text-pool) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-cond-text-pool/logs)
 
@@ -1070,6 +1082,8 @@ Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-
 
 No final evaluation yet.
 
+
+**Training.** final validation flow 0.7109 (step 4000); 0.270 s/update; 14,060 target frames/update
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-decay-matrices) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-decay-matrices/logs)
 

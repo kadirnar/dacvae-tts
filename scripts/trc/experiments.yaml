@@ -261,7 +261,8 @@ y-cond-text-pool:
   question: "Pooled transcript added to the condition, on the v2 recipe (in the joined layout the pool covers prompt and target text)."
   evidence: "DiTTo-TTS: pooled text WER 3.00 -> 2.93."
   baseline: y-base
-  verdict: pending
+  verdict: tie
+  conclusion: "No gain. WER 4.53 and CER 3.07 sit slightly above both base seeds (4.32 / 3.64; within the spread of y-base); SIM-o 0.590, DNSMOS 3.112 and UTMOS 2.499 match y-base. +0.26M parameters; not adopted."
 y-swiglu:
   issue: "#9"
   question: "SwiGLU feed-forward (equal parameters), retested on the v2 recipe."
