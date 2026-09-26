@@ -247,7 +247,8 @@ y-ffn-conv:
   question: "Depthwise convolution (k=5) inside the feed-forward, on the v2 recipe."
   evidence: "ZipVoice (removing its conv modules takes WER 1.69 -> 9.79), U-DiT, SANA."
   baseline: y-base
-  verdict: pending
+  verdict: rejected
+  conclusion: "A trade-off, not a gain. SIM-o 0.598 is above both base seeds (0.587 / 0.571) but DNSMOS (3.090 vs 3.111 / 3.112) and UTMOS (2.415 vs 2.486 / 2.506) fall below both, beyond the seed spread; WER 4.04 and CER 2.74 lie within it. Costs +22 % step time (0.188 vs 0.154 s/update). Not adopted."
 y-final-adaln:
   issue: "#9"
   question: "Final adaLN before the output projection, on the v2 recipe."
