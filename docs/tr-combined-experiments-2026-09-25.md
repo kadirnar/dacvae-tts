@@ -62,6 +62,7 @@ On top of cross prompts:
 | character CTC targets (#11) | 13.6 | 8.6 | 0.543 | 2.94 | tie |
 | **character units** (one token per Turkish letter) | **11.1 / 11.2** (seeds 42 / 1000) | **7.4 / 7.4** | 0.552 | 2.96 | best arm; training seed 43 pending |
 | **quality condition** (new, below) | 13.6 | 8.9 | 0.531 | 3.02 | **adopted** (quality control, WER neutral) |
+| **speech-REPA (#10)**, block 10 → mHuBERT-147 L12 (seeds 42+1000) | **5.6** | **3.8** | **0.585** | 2.88 | **adopted**: WER -6.7 [-8.0, -5.5], alignment ~4× earlier; DNSMOS -0.08, UTMOS -0.24 |
 
 **Why cross prompts matter so much here:** tr-combined clips are short, so within-utterance prompts are 0.4–2.2 s
 while inference prompts are 3.5–12 s. **Why latent negatives collapse:** the per-frame optimum of
@@ -128,6 +129,5 @@ of every batch; unpadded text crashes the compiled attention).
 
 ## 8. Open
 
-#9 (DiT block options), #10 (REPA/TLA, running), character units (training seed 43), #14 WSD/regularization, #15
-(other corpora), and a second full-length model with cross prompts + quality condition (+ character units if
-confirmed). Raw logs: `outputs/trc/RESULTS.md` on the GPU machine.
+#9 (DiT block options), #10 (TLA-SA and REPA+TLA), character units (training seed 43), #14 WSD/regularization, #15
+(other corpora), and the second full-length model (training): cross prompts + quality condition + speech-REPA + character units. Raw logs: `outputs/trc/RESULTS.md` on the GPU machine.
