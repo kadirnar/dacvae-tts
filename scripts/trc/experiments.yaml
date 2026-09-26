@@ -226,7 +226,8 @@ y-s43:
   issue: round 3
   question: "Noise floor of the v2 recipe: training seed 43. Is the 20k seed spread smaller once REPA aligns early?"
   baseline: y-base
-  verdict: pending
+  verdict: reference
+  conclusion: "Yes: the training-seed spread fell from 4.6 WER points (base+cross 12.3 vs 16.9) to 0.7 (4.32 vs 3.64); CER 0.7, SIM-o 0.016, DNSMOS 0.001, UTMOS 0.02. The paired interval calls the WER, CER and SIM-o differences significant although only the seed changed: it does not cover training variance. Rule for the y-* arms: an option counts when it beats both y-base and y-s43."
 y-long-skip:
   issue: "#9"
   question: "Input -> output long skip (concat + LayerNorm + Linear), on the v2 recipe."

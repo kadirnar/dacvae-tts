@@ -4,12 +4,12 @@ Every run of the tr-combined study (DACVAE-TTS, Turkish zero-shot TTS): the ques
 
 | verdict | runs |
 |---|---|
-| reference | `base-s42`, `base-s43`, `x-s43`, `run-c-reference`, `y-base` |
+| reference | `base-s42`, `base-s43`, `x-s43`, `run-c-reference`, `y-base`, `y-s43` |
 | tie | `base-eager`, `x-no-negatives`, `x-pairs-tail`, `x-pairs-char-ctc`, `x-swiglu`, `x-attn-gate`, `x-long-skip`, `ft-w0`, `grpo` |
 | rejected | `base-s42-pad64`, `x-latent-negatives`, `x-tla`, `ft-mg-w07` |
 | adopted | `pairs-cross`, `x-char-units`, `x-char-units-s43`, `x-quality-cond`, `x-repa`, `full-cross`, `full-v2` |
 | not run | `x-value-residual`, `x-ffn-conv`, `x-final-adaln`, `x-cond-text-pool`, `x-regularized`, `x-speaker-context`, `x-repa-tla`, `x-speaker-condition` |
-| pending | `y-s43`, `y-long-skip`, `y-value-residual`, `y-ffn-conv`, `y-final-adaln`, `y-cond-text-pool`, `y-swiglu`, `y-attn-gate`, `y-speaker-condition`, `y-decay-matrices`, `y-regularized` |
+| pending | `y-long-skip`, `y-value-residual`, `y-ffn-conv`, `y-final-adaln`, `y-cond-text-pool`, `y-swiglu`, `y-attn-gate`, `y-speaker-condition`, `y-decay-matrices`, `y-regularized` |
 
 ## Models side by side (refit duration predictor, seeds 42 + 1000 pooled)
 
@@ -845,7 +845,7 @@ Final evaluation, sampling seeds 42 + 1000 pooled (y-base/step-0020000, y-base/s
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-base) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-base/logs)
 
-## `y-s43` (round 3): pending
+## `y-s43` (round 3): reference
 
 
 **Question.** Noise floor of the v2 recipe: training seed 43. Is the 20k seed spread smaller once REPA aligns early?
@@ -854,12 +854,22 @@ Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-
 
 **Baseline.** `y-base`
 
-No final evaluation yet.
+Final evaluation, sampling seeds 42 + 1000 pooled (y-s43/step-0020000, y-s43/step-0020000-s1000):
+
+| metric | `y-base` | `y-s43` | difference [95 % CI] | verdict |
+|---|---:|---:|---|---|
+| WER % | 4.32 | 3.64 | -0.68 [-1.31, -0.04] | win |
+| CER % | 2.98 | 2.30 | -0.68 [-1.24, -0.12] | win |
+| SIM-o | 0.587 | 0.571 | -0.016 [-0.021, -0.010] | loss |
+| DNSMOS | 3.111 | 3.112 | +0.001 [-0.015, 0.017] | tie |
+| UTMOS | 2.486 | 2.506 | +0.019 [-0.002, 0.041] | tie |
 
 
-**Trajectory** (WER / CER %; * = quick check, first 96 sentences): 5k: 11.4 / 6.3*
+**Trajectory** (WER / CER %; * = quick check, first 96 sentences): 5k: 11.4 / 6.3*, 10k: 7.5 / 4.7*, 15k: 4.8 / 3.5*, 20k: 3.6 / 2.3
 
-**Training.** final validation flow 0.7015 (step 6000); 0.272 s/update; 13,483 target frames/update
+**Training.** final validation flow 0.6833 (step 20000); 0.154 s/update; 13,481 target frames/update
+
+**Verdict: reference.** Yes: the training-seed spread fell from 4.6 WER points (base+cross 12.3 vs 16.9) to 0.7 (4.32 vs 3.64); CER 0.7, SIM-o 0.016, DNSMOS 0.001, UTMOS 0.02. The paired interval calls the WER, CER and SIM-o differences significant although only the seed changed: it does not cover training variance. Rule for the y-* arms: an option counts when it beats both y-base and y-s43.
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-s43) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-s43/logs)
 
@@ -876,6 +886,8 @@ Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-
 
 No final evaluation yet.
 
+
+**Training.** final validation flow 0.7108 (step 4000); 0.273 s/update; 13,984 target frames/update
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-long-skip) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-long-skip/logs)
 
