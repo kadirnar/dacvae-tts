@@ -145,6 +145,6 @@ snapshot, and its seed twin `y-s43`. Every run with its result and verdict: `doc
 
 ## 9. Open
 
-#9 (DiT block options, running), #10 (REPA + TLA-SA), #14 WSD/regularization, #15 (other corpora). Remaining arms test
+#9 (DiT block options, running on the v2 recipe), #10 (REPA + TLA-SA, deferred), #14 WSD/regularization. #15 (other corpora) is out of scope: the dataset owner will grow tr-combined. Remaining arms test
 on base+cross; options that win there move to the `full-v2` recipe. Raw logs: `outputs/trc/RESULTS.md` on the GPU
 machine.
