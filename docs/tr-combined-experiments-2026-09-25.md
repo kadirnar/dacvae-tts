@@ -14,7 +14,7 @@ run C (`VoiceHub/dacvae-tts-tr-w512`); the second one cuts WER to less than a fi
 | **`full-v2`**: + quality condition + speech-REPA + character units | **0.93** [-5.35, -2.99] | **0.36** [-3.52, -1.62] | **0.556** | **3.128** | 2.533 (tie) |
 
 `full-v2` vs `full-cross`: WER -2.01 [-2.55, -1.46], CER -1.31 [-1.66, -0.95], SIM-o +0.021, DNSMOS +0.192, UTMOS
--0.039 (tie). Seed 42: 468 of 495 sentences without a word error. Every run, checkpoint, evaluation and listening set:
+-0.039 (tie). Seed 42: 468 of 495 sentences without a word error. With the plain prompt-rate rule instead of the predictor: run C 7.99 / 5.30, `full-cross` 6.46 / 4.40, `full-v2` 2.21 / 1.17 (SIM-o 0.577, DNSMOS 3.164; vs `full-cross` WER -4.24 [-5.50, -2.99]); the rule keeps the prompt's tempo, so SIM-o is higher than with the predictor (0.556). Every run, checkpoint, evaluation and listening set:
 [`VoiceHub/dacvae-tts-tr-combined`](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined) (one folder per run).
 
 ## 1. Data
