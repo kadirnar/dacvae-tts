@@ -187,6 +187,12 @@ full-v2:
   baseline: full-cross
   verdict: adopted
   conclusion: "The current best model. With the refit duration predictor, WER 0.93 / CER 0.36 vs run C 5.10 / 2.93 and full-cross 2.94 / 1.66; DNSMOS 3.13, SIM-o 0.556, UTMOS tie."
+full-v3:
+  issue: model
+  question: "Third full-length model: the v2 recipe + value residual at width 640 / 10 heads (104M parameters vs 67M), 60k updates."
+  evidence: "Value residual: the round-3 winner (DNSMOS/UTMOS above both v2 seeds). Width: DiTTo-TTS scaling; no overfitting at 67M."
+  baseline: full-v2
+  verdict: pending
 ft-w0:
   issue: "#14"
   question: "Control fine-tune. 8k more updates of full-cross without model guidance, sampled with CFG 5."

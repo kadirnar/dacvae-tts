@@ -127,3 +127,10 @@ ARMS["y-decay-matrices"] = ("audit: weight decay on matrices only, on v2", BASE,
 ARMS["y-regularized"] = ("#14 dropout 0.1 + weight decay 0.05 on matrices, on v2", BASE,
                          V2 + ["model.dropout=0.1", "train.weight_decay=0.05", "train.weight_decay_scope=matrices"],
                          V2_NEEDS)
+
+# Third full-length model candidate: the v2 recipe plus the round-3 winner (value residual: DNSMOS/UTMOS above both
+# v2 seeds at 24 parameters) at width 640 / 10 heads (104M parameters vs 67M). The other round-3 options gave no gain
+# or traded quality for SIM-o (ffn-conv, speaker condition). Width: DiTTo-TTS scaling; tr-combined shows no
+# overfitting at 67M (full-v2's validation flow still falls at 60k).
+ARMS["full-v3"] = ("model candidate v3: v2 + value residual, width 640 (104M), 60k", BASE,
+                   V2 + ["model.value_residual=true", "model.width=640", "model.heads=10"], V2_NEEDS)
