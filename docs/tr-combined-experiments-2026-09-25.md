@@ -143,8 +143,26 @@ the remaining options on the `full-v2` recipe (REPA aligns within ~5k updates) a
 snapshot, and its seed twin `y-s43`. Every run with its result and verdict: `docs/experiments-log.md` /
 [EXPERIMENTS.md](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/blob/main/EXPERIMENTS.md).
 
+Round 3 results (20k, seeds 42+1000; base seeds y-base / y-s43 = WER 4.32 / 3.64, CER 2.98 / 2.30, SIM-o 0.587 / 0.571,
+DNSMOS 3.111 / 3.112, UTMOS 2.486 / 2.506; an option counts when it beats both):
+
+| option (on the v2 recipe) | WER % | CER % | SIM-o | DNSMOS | UTMOS | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| value residual | 3.94 | 2.29 | 0.582 | **3.138** | **2.533** | **adopted**: DNSMOS/UTMOS above both seeds, 24 parameters |
+| long skip | 3.99 | 2.76 | 0.589 | 3.110 | 2.512 | no gain |
+| final adaLN | 4.04 | 2.27 | 0.588 | 3.128 | 2.495 | no gain (DNSMOS +0.016, CIs touch 0) |
+| cond text pool | 4.53 | 3.07 | 0.590 | 3.112 | 2.499 | no gain |
+| SwiGLU | 4.13 | 2.78 | 0.569 | 3.092 | 2.509 | no gain |
+| weight decay on matrices only | 3.77 | 2.11 | 0.581 | 3.122 | 2.480 | neutral at 0.01 |
+| ffn depthwise conv | 4.04 | 2.74 | 0.598 | 3.090 | 2.415 | rejected: SIM-o up, DNSMOS/UTMOS down, +22 % time |
+| ECAPA speaker condition | 3.66 | 2.40 | 0.599 | 3.039 | 2.295 | rejected: SIM-o up, UTMOS -0.2 |
+| dropout 0.1 + weight decay 0.05 | 4.58 | 3.05 | 0.572 | 3.043 | 2.397 | rejected: no overfitting to fix (full-v2 validation flow falls to 60k) |
+
+The attention-gate retest and `full-v3` (v2 + value residual at width 640, 104M parameters, defined in
+`scripts/trc/arms.py`) were stopped by the owner before training.
+
 ## 9. Open
 
-#9 (DiT block options, running on the v2 recipe), #10 (REPA + TLA-SA, deferred), #14 WSD/regularization. #15 (other corpora) is out of scope: the dataset owner will grow tr-combined. Remaining arms test
-on base+cross; options that win there move to the `full-v2` recipe. Raw logs: `outputs/trc/RESULTS.md` on the GPU
-machine.
+#10: REPA + TLA-SA (deferred). #14: WSD, uniform-t cooldown and dual EMA (untested). `full-v3`: v2 + value residual at
+width 640, stopped before training. #15 (other corpora) is out of scope: the dataset owner will grow tr-combined. Raw
+logs: `logs/notebook.md` in the experiments repo.

@@ -275,7 +275,8 @@ y-swiglu:
   question: "SwiGLU feed-forward (equal parameters), retested on the v2 recipe."
   evidence: "Positive in T5 / LightningDiT, neutral in the 140M SR-DiT."
   baseline: y-base
-  verdict: pending
+  verdict: tie
+  conclusion: "No gain on the v2 recipe either. WER 4.13, CER 2.78 and UTMOS 2.509 lie within the base seeds; SIM-o 0.569 matches the lower seed; DNSMOS 3.092 is 0.02 below both. Not adopted."
 y-attn-gate:
   issue: "#9"
   question: "Head-wise sigmoid gate on the attention output, retested on the v2 recipe."
