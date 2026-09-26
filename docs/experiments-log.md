@@ -8,8 +8,8 @@ Every run of the tr-combined study (DACVAE-TTS, Turkish zero-shot TTS): the ques
 | tie | `base-eager`, `x-no-negatives`, `x-pairs-tail`, `x-pairs-char-ctc`, `x-swiglu`, `x-attn-gate`, `x-long-skip`, `ft-w0`, `grpo`, `y-long-skip`, `y-final-adaln`, `y-cond-text-pool`, `y-decay-matrices` |
 | rejected | `base-s42-pad64`, `x-latent-negatives`, `x-tla`, `ft-mg-w07`, `y-ffn-conv`, `y-speaker-condition`, `y-regularized` |
 | adopted | `pairs-cross`, `x-char-units`, `x-char-units-s43`, `x-quality-cond`, `x-repa`, `full-cross`, `full-v2`, `y-value-residual` |
-| not run | `x-value-residual`, `x-ffn-conv`, `x-final-adaln`, `x-cond-text-pool`, `x-regularized`, `x-speaker-context`, `x-repa-tla`, `x-speaker-condition` |
-| pending | `y-swiglu`, `y-attn-gate` |
+| not run | `x-value-residual`, `x-ffn-conv`, `x-final-adaln`, `x-cond-text-pool`, `x-regularized`, `x-speaker-context`, `x-repa-tla`, `x-speaker-condition`, `full-v3`, `y-attn-gate` |
+| pending | `y-swiglu` |
 
 ## Models side by side (refit duration predictor, seeds 42 + 1000 pooled)
 
@@ -723,6 +723,24 @@ Final evaluation, sampling seeds 42 + 1000 pooled (full-v2/step-0060000, full-v2
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/full-v2) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/full-v2/logs)
 
+## `full-v3` (model): not run
+
+
+**Question.** Third full-length model: the v2 recipe + value residual at width 640 / 10 heads (104M parameters vs 67M), 60k updates.
+
+**Change.** `model.quality_condition=true`, `train.quality_scores=quality/dnsmos.json`, `model.quality_target=[4.0, 4.5, 3.8]`, `model.repa_layer=10`, `model.repa_dim=256`, `train.teacher_features=teacher/mhubert147-l12-pca256`, `train.repa_weight=1.0`, `train.repa_stop_step=0`, `train.repa_frames=all`, `model.text_units=chars`, `model.value_residual=true`, `model.width=640`, `model.heads=10`
+
+**Evidence.** Value residual: the round-3 winner (DNSMOS/UTMOS above both v2 seeds). Width: DiTTo-TTS scaling; no overfitting at 67M.
+
+**Baseline.** `full-v2`
+
+No final evaluation yet.
+
+
+**Verdict: not run.** Not run: the owner stopped training on 26 September before it started. The recipe is defined in scripts/trc/arms.py (full-v3) for a later run.
+
+Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/full-v3) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/full-v3/logs)
+
 ## `ft-w0` (#14): tie
 
 
@@ -1034,14 +1052,24 @@ Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-
 
 **Baseline.** `y-base`
 
-No final evaluation yet.
+Final evaluation, sampling seed 42 (y-swiglu/step-0020000):
+
+| metric | `y-base` | `y-swiglu` | difference [95 % CI] | verdict |
+|---|---:|---:|---|---|
+| WER % | 4.32 | 3.91 | -0.41 [-1.18, 0.37] | tie |
+| CER % | 2.98 | 2.59 | -0.39 [-1.04, 0.26] | tie |
+| SIM-o | 0.587 | 0.571 | -0.016 [-0.021, -0.011] | loss |
+| DNSMOS | 3.111 | 3.089 | -0.021 [-0.037, -0.006] | loss |
+| UTMOS | 2.486 | 2.520 | +0.033 [0.008, 0.058] | win |
 
 
-**Training.** final validation flow 0.7120 (step 4000); 0.269 s/update; 14,073 target frames/update
+**Trajectory** (WER / CER %; * = quick check, first 96 sentences): 5k: 12.6 / 7.7*, 10k: 7.1 / 5.1*, 15k: 6.5 / 4.4*, 20k: 3.9 / 2.6
+
+**Training.** final validation flow 0.6812 (step 20000); 0.153 s/update; 13,518 target frames/update
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-swiglu) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-swiglu/logs)
 
-## `y-attn-gate` (#9): pending
+## `y-attn-gate` (#9): not run
 
 
 **Question.** Head-wise sigmoid gate on the attention output, retested on the v2 recipe.
@@ -1054,6 +1082,10 @@ Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-
 
 No final evaluation yet.
 
+
+**Training.** 0.286 s/update; 15,845 target frames/update
+
+**Verdict: not run.** Not run: the owner stopped training on 26 September as this arm started.
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-attn-gate) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-attn-gate/logs)
 

@@ -192,7 +192,8 @@ full-v3:
   question: "Third full-length model: the v2 recipe + value residual at width 640 / 10 heads (104M parameters vs 67M), 60k updates."
   evidence: "Value residual: the round-3 winner (DNSMOS/UTMOS above both v2 seeds). Width: DiTTo-TTS scaling; no overfitting at 67M."
   baseline: full-v2
-  verdict: pending
+  verdict: not run
+  conclusion: "Not run: the owner stopped training on 26 September before it started. The recipe is defined in scripts/trc/arms.py (full-v3) for a later run."
 ft-w0:
   issue: "#14"
   question: "Control fine-tune. 8k more updates of full-cross without model guidance, sampled with CFG 5."
@@ -280,7 +281,8 @@ y-attn-gate:
   question: "Head-wise sigmoid gate on the attention output, retested on the v2 recipe."
   evidence: "Gated attention (arXiv 2505.06708), LLMs only."
   baseline: y-base
-  verdict: pending
+  verdict: not run
+  conclusion: "Not run: the owner stopped training on 26 September as this arm started."
 y-speaker-condition:
   issue: round 2
   question: "Frozen ECAPA speaker embedding -> adaLN, on the v2 recipe (after the audit fix: inference embeds the same audio as the store)."
