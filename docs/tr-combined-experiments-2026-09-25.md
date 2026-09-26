@@ -161,7 +161,24 @@ DNSMOS 3.111 / 3.112, UTMOS 2.486 / 2.506; an option counts when it beats both):
 The attention-gate retest and `full-v3` (v2 + value residual at width 640, 104M parameters, defined in
 `scripts/trc/arms.py`) were stopped by the owner before training.
 
-## 9. Open
+## 9. Demo and a limitation it exposed
+
+Demo: https://huggingface.co/spaces/Vyvo/dacvae-tts-tr-v2-demo (full-v2 by default; full-cross and run C for A/B).
+Testing it showed that the tr-combined models skip the words just before a sentence end (`.`, `;`, `:`) *inside* one
+chunk. The same two clauses joined by a comma read perfectly. On 3 voices x 2 seeds:
+
+| chunk | WER % |
+|---|---:|
+| "... on dört otuzda başlayacak**;** lütfen zamanında gelin." | 27.8 |
+| same with **.** | 27.8 |
+| same with **,** | 0.0 |
+
+tr-combined clips are mostly single sentences (median 3.6 s), so the model rarely saw a sentence end mid-target. The
+Freya-TR-Eval numbers are single sentences and are unaffected. The demo therefore generates one sentence per chunk and
+reads in-sentence `;`/`: ` as a comma: 0 errors in 198 words on the same inputs. A training-side fix would be
+multi-sentence targets (consecutive clips of one recording joined into one target).
+
+## 10. Open
 
 #10: REPA + TLA-SA (deferred). #14: WSD, uniform-t cooldown and dual EMA (untested). `full-v3`: v2 + value residual at
 width 640, stopped before training. #15 (other corpora) is out of scope: the dataset owner will grow tr-combined. Raw
