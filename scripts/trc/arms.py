@@ -98,3 +98,11 @@ ARMS["grpo"] = ("#16 Flow-GRPO from full-cross 60k", "", [], [])
 # Second training seed of the best x-arm (character units beat both base seeds at 20k): the strict test of #4's rule.
 ARMS["x-char-units-s43"] = ("round 2 char units, training seed 43", BASE,
                             EXECUTION + CROSS + ["model.text_units=chars", "train.seed=43"], [])
+
+# Second full-length model candidate: every option with a clear 20k win on top of cross prompts. Quality condition
+# (requested quality 4.0/4.5/3.8: DNSMOS +0.135 at equal WER), speech-REPA (WER 10.5 at 10k vs 29.6-36.7), character
+# units (11.1/7.4 at 20k, below both base seeds). Its 20k snapshot is the interaction check against the single arms.
+QUALITY = ["model.quality_condition=true", "train.quality_scores=quality/dnsmos.json", "model.quality_target=[4.0, 4.5, 3.8]"]
+ARMS["full-v2"] = ("model candidate v2: cross + quality + REPA + char units, 60k", BASE,
+                   EXECUTION + CROSS + QUALITY + REPA + ["model.text_units=chars"],
+                   ["quality/dnsmos.json", "teacher/mhubert147-l12-pca256"])
