@@ -254,7 +254,8 @@ y-final-adaln:
   question: "Final adaLN before the output projection, on the v2 recipe."
   evidence: "Standard in DiT and F5-TTS."
   baseline: y-base
-  verdict: pending
+  verdict: tie
+  conclusion: "No clear gain. WER 4.04, SIM-o 0.588 and UTMOS 2.495 lie within the base seeds; CER 2.27 matches the better seed (2.30); DNSMOS 3.128 is +0.016 above both, but both intervals touch 0. +0.10M parameters, no time cost. Not adopted on this evidence."
 y-cond-text-pool:
   issue: "#9"
   question: "Pooled transcript added to the condition, on the v2 recipe (in the joined layout the pool covers prompt and target text)."
