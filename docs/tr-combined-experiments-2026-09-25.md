@@ -1,20 +1,21 @@
 # tr-combined: GPU evidence for the roadmap issues and a new Turkish model (25 September 2026)
 
 Everything below ran on one RTX 5090 (32 GB). Branch: `trc/tr-combined-experiments`. Tooling: `scripts/trc/`.
-Checkpoints, per-checkpoint scores and listening sets: private `VoiceHub/dacvae-tts-trc-*` model repos.
+Checkpoints, per-checkpoint scores and listening sets: one folder per run in `VoiceHub/dacvae-tts-tr-combined`.
 
-**Headline.** With identical inference (single sample, no reranking), the new 60k model trained on
-[Codyfederer/tr-combined](https://huggingface.co/datasets/Codyfederer/tr-combined) with cross-utterance prompts
-beats run C (`VoiceHub/dacvae-tts-tr-w512`) on every metric:
+**Headline.** With identical inference (single sample, no reranking, duration predictor refit on tr-combined), both
+new 60k models trained on [Codyfederer/tr-combined](https://huggingface.co/datasets/Codyfederer/tr-combined) beat
+run C (`VoiceHub/dacvae-tts-tr-w512`); the second one cuts WER to less than a fifth:
 
-| 60k updates, duration predictor refit on tr-combined, seeds 42+1000 | WER % | CER % | SIM-o | DNSMOS | UTMOS |
+| 60k updates, seeds 42+1000, [95 % CI of the difference to run C] | WER % | CER % | SIM-o | DNSMOS | UTMOS |
 |---|---:|---:|---:|---:|---:|
 | run C (Vyvo/tr-dataset-12, 70 h) | 5.10 | 2.93 | 0.519 | 2.860 | 2.493 |
-| **new: tr-combined + cross prompts** (`VoiceHub/dacvae-tts-trc-full-cross`) | **2.94** | **1.66** | **0.536** | **2.936** | **2.572** |
-| paired difference [95 % CI] | -2.16 [-3.27, -1.05] | -1.26 [-2.18, -0.34] | +0.017 [0.004, 0.029] | +0.076 [0.042, 0.110] | +0.078 [0.023, 0.133] |
+| `full-cross`: tr-combined + cross prompts | 2.94 [-3.27, -1.05] | 1.66 [-2.18, -0.34] | 0.536 | 2.936 | 2.572 |
+| **`full-v2`**: + quality condition + speech-REPA + character units | **0.93** [-5.35, -2.99] | **0.36** [-3.52, -1.62] | **0.556** | **3.128** | 2.533 (tie) |
 
-With the plain prompt-rate rule: WER 7.99 → 6.46, CER 5.30 → 4.40 (ties), SIM-o/DNSMOS/UTMOS wins. Side by side:
-`VoiceHub/dacvae-tts-trc-comparison` (prompt / run C / new, 40 sentences).
+`full-v2` vs `full-cross`: WER -2.01 [-2.55, -1.46], CER -1.31 [-1.66, -0.95], SIM-o +0.021, DNSMOS +0.192, UTMOS
+-0.039 (tie). Seed 42: 468 of 495 sentences without a word error. Every run, checkpoint, evaluation and listening set:
+[`VoiceHub/dacvae-tts-tr-combined`](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined) (one folder per run).
 
 ## 1. Data
 
@@ -131,5 +132,6 @@ of every batch; unpadded text crashes the compiled attention).
 
 ## 8. Open
 
-#9 (DiT block options), #10 (TLA-SA and REPA+TLA), character units (training seed 43), #14 WSD/regularization, #15
-(other corpora), and the second full-length model (training): cross prompts + quality condition + speech-REPA + character units. Raw logs: `outputs/trc/RESULTS.md` on the GPU machine.
+#9 (DiT block options, running), #10 (REPA + TLA-SA), #14 WSD/regularization, #15 (other corpora). Remaining arms test
+on base+cross; options that win there move to the `full-v2` recipe. Raw logs: `outputs/trc/RESULTS.md` on the GPU
+machine.
