@@ -121,51 +121,60 @@ x-long-skip:
   question: "Input -> output long skip (concat + LayerNorm + Linear)."
   evidence: "DiTTo-TTS: WER 3.30 -> 2.93; counter-evidence F5 4.17 -> 5.17."
   baseline: pairs-cross
-  verdict: pending
+  verdict: tie
+  conclusion: "WER +0.7 [-0.6, 2.0], CER, SIM-o and DNSMOS ties; UTMOS -0.04. No gain on base+cross; retested on the v2 recipe (y-long-skip)."
 x-value-residual:
   issue: "#9"
   question: "Value residual (v_l <- l1 v_l + l2 v_1)."
   evidence: "ResFormer (arXiv 2410.17897); SR-DiT FID 4.02 -> 3.64."
   baseline: pairs-cross
-  verdict: pending
+  verdict: not run
+  conclusion: "Not run on base+cross: after the audit the option moved to the v2 recipe as y-value-residual."
 x-ffn-conv:
   issue: "#9"
   question: "Depthwise convolution (k=5) inside the feed-forward."
   evidence: "ZipVoice (removing its conv modules takes WER 1.69 -> 9.79), U-DiT, SANA."
   baseline: pairs-cross
-  verdict: pending
+  verdict: not run
+  conclusion: "Not run on base+cross: after the audit the option moved to the v2 recipe as y-ffn-conv."
 x-final-adaln:
   issue: "#9"
   question: "Final adaLN before the output projection."
   evidence: "Standard in DiT and F5-TTS."
   baseline: pairs-cross
-  verdict: pending
+  verdict: not run
+  conclusion: "Not run on base+cross: after the audit the option moved to the v2 recipe as y-final-adaln."
 x-cond-text-pool:
   issue: "#9"
   question: "Pooled target text added to the condition."
   evidence: "DiTTo-TTS: pooled text WER 3.00 -> 2.93."
   baseline: pairs-cross
-  verdict: pending
+  verdict: not run
+  conclusion: "Not run on base+cross: after the audit the option moved to the v2 recipe as y-cond-text-pool."
 x-regularized:
   issue: "#14"
   question: "Dropout 0.1 and weight decay 0.05."
   baseline: pairs-cross
-  verdict: pending
+  verdict: not run
+  conclusion: "Not run on base+cross: after the audit the option moved to the v2 recipe as y-regularized (with weight decay on matrices only)."
 x-speaker-context:
   issue: round 2
   question: "Multi-clip speaker context vector (50 % of updates)."
   baseline: pairs-cross
-  verdict: pending
+  verdict: not run
+  conclusion: "Not run: deferred after the audit (the single-prompt evaluation has no extra clips, so it cannot show a context gain)."
 x-repa-tla:
   issue: "#10"
   question: "Speech-REPA and TLA-SA together. Does TLA-SA hurt less once REPA supplies the alignment?"
   baseline: x-repa
-  verdict: pending
+  verdict: not run
+  conclusion: "Not run: deferred after the audit (TLA-SA alone lost clearly; the v2 recipe already has REPA)."
 x-speaker-condition:
   issue: round 2
   question: "Frozen ECAPA speaker embedding -> adaLN."
   baseline: pairs-cross
-  verdict: pending
+  verdict: not run
+  conclusion: "Not run on base+cross: after the audit the option moved to the v2 recipe as y-speaker-condition."
 full-cross:
   issue: model
   question: "First full-length model. Run C's recipe + cross prompts, 60k updates."
