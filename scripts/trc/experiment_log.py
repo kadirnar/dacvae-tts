@@ -25,7 +25,7 @@ import yaml
 from huggingface_hub import HfApi
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from arms import ARMS, CROSS, EXECUTION  # noqa: E402
+from arms import ARMS, CROSS, EXECUTION, V2  # noqa: E402
 from run_arm import setting  # noqa: E402
 
 from dacvae_tts.comparison import compare_evaluations  # noqa: E402
@@ -83,6 +83,7 @@ def change(run):
         return ""
     purpose, _, overrides, _ = ARMS[run]
     shared = set(EXECUTION) | (set(CROSS) if run.startswith(("x-", "full-")) or "cross" in purpose else set())
+    shared |= set(V2) if run.startswith("y-") else set()
     return ", ".join(f"`{o}`" for o in overrides if o not in shared)
 
 

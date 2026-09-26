@@ -63,9 +63,9 @@ On top of cross prompts:
 | character CTC targets (#11) | 13.6 | 8.6 | 0.543 | 2.94 | tie |
 | character units (one token per Turkish letter), training seeds 42 / 43 | 11.2 / 16.1 | 7.4 / 9.7 | 0.551 / 0.546 | 2.97 / 2.93 | same-seed ΔWER -1.1 / -0.9 (ties), SIM-o +0.011 / +0.013 (wins), RTF -30 %: small consistent gain, **adopted** |
 | **quality condition** (new, below) | 13.6 | 8.9 | 0.531 | 3.02 | **adopted** (quality control, WER neutral) |
-| no text-negative contrastive loss (#8 ablation) | 13.9 | 9.9 | 0.540 | 2.97 | same-seed +1.6 [0.2, 3.1]: keep the negatives (they cost ~20 % update time) |
-| SwiGLU FFN (#9) | 17.5 | 9.9 | 0.524 | 2.90 | rejected: +5.2 WER, loses SIM-o/DNSMOS/UTMOS |
-| attention output gate per head (#9) | 16.7 | 10.3 | 0.529 | 2.92 | rejected: +4.4 WER, loses every metric |
+| no text-negative contrastive loss (#8 ablation) | 13.9 | 9.9 | 0.540 | 2.97 | same-seed +1.6 [0.2, 3.1], inside the seed spread: not resolved; the negatives stay |
+| SwiGLU FFN (#9) | 17.5 | 9.9 | 0.524 | 2.90 | no gain: level with the seed-43 base on every metric (retest on v2) |
+| attention output gate per head (#9) | 16.7 | 10.3 | 0.529 | 2.92 | no gain: level with the seed-43 base although it starts as the base function (retest on v2) |
 | TLA-SA (#10), all layers, ECAPA targets, weight 0.5 | 24.7 | 14.1 | 0.455 | 2.77 | **rejected**: +12.4 WER, slower alignment at every snapshot |
 | **speech-REPA (#10)**, block 10 → mHuBERT-147 L12 (seeds 42+1000) | **5.6** | **3.8** | **0.585** | 2.88 | **adopted**: WER -6.7 [-8.0, -5.5], alignment ~4× earlier; DNSMOS -0.08, UTMOS -0.24 |
 
@@ -132,7 +132,18 @@ of every batch; unpadded text crashes the compiled attention).
 - `Synthesizer.generate` dropped the quality condition; a stale test stub; protobuf 7 broke wandb; onnx2torch replaced
   the CUDA torch build (setup now installs it with `--no-deps`).
 
-## 8. Open
+## 8. Architecture audit and round 3
+
+An audit of every optional architecture path (on small CPU models) found no bugs; see #9 for the list of checks.
+The same audit showed why single-seed 20k A/Bs on base + cross were unresolvable: a zero-init option that starts as
+exactly the base function, with the same data order, moved the 20k WER by ~5 points. That WER records when alignment
+happened. Four risks were fixed: `train.weight_decay_scope: matrices`, TLA-SA masks prompt-free rows, the speaker
+condition embeds the same audio at inference as its store, and a single-prompt speaker context is empty. Round 3 runs
+the remaining options on the `full-v2` recipe (REPA aligns within ~5k updates) against `y-base`, full-v2's 20k
+snapshot, and its seed twin `y-s43`. Every run with its result and verdict: `docs/experiments-log.md` /
+[EXPERIMENTS.md](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/blob/main/EXPERIMENTS.md).
+
+## 9. Open
 
 #9 (DiT block options, running), #10 (REPA + TLA-SA), #14 WSD/regularization, #15 (other corpora). Remaining arms test
 on base+cross; options that win there move to the `full-v2` recipe. Raw logs: `outputs/trc/RESULTS.md` on the GPU

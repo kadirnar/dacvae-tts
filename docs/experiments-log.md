@@ -4,11 +4,11 @@ Every run of the tr-combined study (DACVAE-TTS, Turkish zero-shot TTS): the ques
 
 | verdict | runs |
 |---|---|
-| reference | `base-s42`, `base-s43`, `x-s43`, `run-c-reference` |
-| tie | `base-eager`, `x-pairs-tail`, `x-pairs-char-ctc`, `ft-w0`, `grpo` |
-| rejected | `base-s42-pad64`, `x-latent-negatives`, `x-no-negatives`, `x-tla`, `x-swiglu`, `x-attn-gate`, `ft-mg-w07` |
+| reference | `base-s42`, `base-s43`, `x-s43`, `run-c-reference`, `y-base` |
+| tie | `base-eager`, `x-no-negatives`, `x-pairs-tail`, `x-pairs-char-ctc`, `x-swiglu`, `x-attn-gate`, `ft-w0`, `grpo` |
+| rejected | `base-s42-pad64`, `x-latent-negatives`, `x-tla`, `ft-mg-w07` |
 | adopted | `pairs-cross`, `x-char-units`, `x-char-units-s43`, `x-quality-cond`, `x-repa`, `full-cross`, `full-v2` |
-| pending | `x-long-skip`, `x-value-residual`, `x-ffn-conv`, `x-final-adaln`, `x-cond-text-pool`, `x-regularized`, `x-speaker-context`, `x-repa-tla`, `x-speaker-condition` |
+| pending | `x-long-skip`, `x-value-residual`, `x-ffn-conv`, `x-final-adaln`, `x-cond-text-pool`, `x-regularized`, `x-speaker-context`, `x-repa-tla`, `x-speaker-condition`, `y-s43`, `y-long-skip`, `y-value-residual`, `y-ffn-conv`, `y-final-adaln`, `y-cond-text-pool`, `y-swiglu`, `y-attn-gate`, `y-speaker-condition`, `y-decay-matrices`, `y-regularized` |
 
 ## Models side by side (refit duration predictor, seeds 42 + 1000 pooled)
 
@@ -208,7 +208,7 @@ Final evaluation, sampling seeds 42 + 1000 pooled (x-latent-negatives/step-00200
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/x-latent-negatives) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/x-latent-negatives/logs)
 
-## `x-no-negatives` (#8): rejected
+## `x-no-negatives` (#8): tie
 
 
 **Question.** Are run C's existing text negatives (contrastive loss) useful? Turned off.
@@ -232,7 +232,7 @@ Final evaluation, sampling seeds 42 + 1000 pooled (x-no-negatives/step-0020000, 
 
 **Training.** final validation flow 0.6713 (step 20000); 0.119 s/update; 13,518 target frames/update
 
-**Verdict: rejected.** WER +1.6 and CER +1.7 against the same seed (within the seed spread). Keep the text negatives; they cost ~20 % update time.
+**Verdict: tie.** WER +1.6 and CER +1.7 against the same seed, inside the ~5-point training-seed spread: not resolved. The text negatives stay (no evidence to remove them); removing them would save ~20 % update time.
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/x-no-negatives) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/x-no-negatives/logs)
 
@@ -415,7 +415,7 @@ Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-
 ## `x-tla` (#10): rejected
 
 
-**Question.** TLA-SA. Per-layer speaker alignment of token features to frozen ECAPA embeddings, weight 0.5.
+**Question.** TLA-SA. Per-layer speaker alignment of token features to frozen ECAPA embeddings, weight 0.5 (trained before the audit fix that masks prompt-free rows).
 
 **Change.** `model.tla_layers=all`, `model.tla_dim=192`, `model.tla_hidden=256`, `train.speaker_embeddings=teacher/ecapa-speechbrain`, `train.tla_weight=0.5`, `train.tla_entropy=0.01`
 
@@ -442,7 +442,7 @@ Final evaluation, sampling seeds 42 + 1000 pooled (x-tla/step-0020000, x-tla/ste
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/x-tla) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/x-tla/logs)
 
-## `x-swiglu` (#9): rejected
+## `x-swiglu` (#9): tie
 
 
 **Question.** SwiGLU feed-forward (equal parameters).
@@ -468,11 +468,11 @@ Final evaluation, sampling seeds 42 + 1000 pooled (x-swiglu/step-0020000, x-swig
 
 **Training.** final validation flow 0.6732 (step 20000); 0.153 s/update; 13,518 target frames/update
 
-**Verdict: rejected.** WER +5.2 against the same seed, worse than both base seeds, and SIM-o/DNSMOS/UTMOS losses.
+**Verdict: tie.** No gain. WER +5.2 against the same seed, but level with the seed-43 base (17.5 vs 16.9) on every metric; the audit found the code correct (Shazeer form, equal parameters). Not adopted; retested on the v2 recipe (y-swiglu).
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/x-swiglu) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/x-swiglu/logs)
 
-## `x-attn-gate` (#9): rejected
+## `x-attn-gate` (#9): tie
 
 
 **Question.** Head-wise sigmoid gate on the attention output.
@@ -498,7 +498,7 @@ Final evaluation, sampling seeds 42 + 1000 pooled (x-attn-gate/step-0020000, x-a
 
 **Training.** final validation flow 0.6723 (step 20000); 0.279 s/update; 13,518 target frames/update
 
-**Verdict: rejected.** WER +4.4 against the same seed and losses on every metric; alignment not faster.
+**Verdict: tie.** No gain. WER +4.4 against the same seed, but level with the seed-43 base (16.7 vs 16.9) on every metric, although it starts as exactly the base function (zero-init gate): a zero-init change alone moves the base+cross 20k WER by ~5 points. Not adopted; retested on the v2 recipe (y-attn-gate).
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/x-attn-gate) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/x-attn-gate/logs)
 
@@ -516,9 +516,9 @@ Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-
 No final evaluation yet.
 
 
-**Trajectory** (WER / CER %; * = quick check, first 96 sentences): 5k: 90.5 / 56.4*
+**Trajectory** (WER / CER %; * = quick check, first 96 sentences): 5k: 90.5 / 56.4*, 10k: 30.6 / 18.3*, 15k: 17.4 / 10.9*
 
-**Training.** final validation flow 0.6846 (step 10000); 0.167 s/update; 13,662 target frames/update
+**Training.** final validation flow 0.6732 (step 18000); 0.155 s/update; 13,592 target frames/update
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/x-long-skip) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/x-long-skip/logs)
 
@@ -793,4 +793,190 @@ Final evaluation, sampling seeds 42 + 1000 pooled (inference-runc/base, inferenc
 **Verdict: reference.** WER 7.54 / CER 4.89 / SIM-o 0.535 with the prompt-rate rule (the published 4.3 used podcast prompts whose voices occur in training).
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/run-c-reference) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/run-c-reference/logs)
+
+## `y-base` (round 3): reference
+
+
+**Question.** The full-v2 recipe (cross prompts + quality condition + speech-REPA + character units) at 20k updates: full-v2's own 20k snapshot, evaluated in full.
+
+**Baseline.** `pairs-cross`
+
+No final evaluation yet.
+
+
+**Trajectory** (WER / CER %; * = quick check, first 96 sentences): 5k: 11.3 / 6.7*, 10k: 6.8 / 4.9*, 15k: 5.8 / 4.5*
+
+**Training.** final validation flow 0.6810 (step 20000); 0.153 s/update; 13,518 target frames/update
+
+Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-base) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-base/logs)
+
+## `y-s43` (round 3): pending
+
+
+**Question.** Noise floor of the v2 recipe: training seed 43. Is the 20k seed spread smaller once REPA aligns early?
+
+**Change.** `train.seed=43`
+
+**Baseline.** `y-base`
+
+No final evaluation yet.
+
+
+Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-s43) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-s43/logs)
+
+## `y-long-skip` (#9): pending
+
+
+**Question.** Input -> output long skip (concat + LayerNorm + Linear), on the v2 recipe.
+
+**Change.** `model.long_skip=true`
+
+**Evidence.** DiTTo-TTS: WER 3.30 -> 2.93; counter-evidence F5 4.17 -> 5.17.
+
+**Baseline.** `y-base`
+
+No final evaluation yet.
+
+
+Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-long-skip) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-long-skip/logs)
+
+## `y-value-residual` (#9): pending
+
+
+**Question.** Value residual (v_l <- l1 v_l + l2 v_1), on the v2 recipe.
+
+**Change.** `model.value_residual=true`
+
+**Evidence.** ResFormer (arXiv 2410.17897); SR-DiT FID 4.02 -> 3.64.
+
+**Baseline.** `y-base`
+
+No final evaluation yet.
+
+
+Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-value-residual) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-value-residual/logs)
+
+## `y-ffn-conv` (#9): pending
+
+
+**Question.** Depthwise convolution (k=5) inside the feed-forward, on the v2 recipe.
+
+**Change.** `model.ffn_conv_kernel=5`
+
+**Evidence.** ZipVoice (removing its conv modules takes WER 1.69 -> 9.79), U-DiT, SANA.
+
+**Baseline.** `y-base`
+
+No final evaluation yet.
+
+
+Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-ffn-conv) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-ffn-conv/logs)
+
+## `y-final-adaln` (#9): pending
+
+
+**Question.** Final adaLN before the output projection, on the v2 recipe.
+
+**Change.** `model.final_adaln=true`
+
+**Evidence.** Standard in DiT and F5-TTS.
+
+**Baseline.** `y-base`
+
+No final evaluation yet.
+
+
+Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-final-adaln) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-final-adaln/logs)
+
+## `y-cond-text-pool` (#9): pending
+
+
+**Question.** Pooled transcript added to the condition, on the v2 recipe (in the joined layout the pool covers prompt and target text).
+
+**Change.** `model.cond_text_pool=true`
+
+**Evidence.** DiTTo-TTS: pooled text WER 3.00 -> 2.93.
+
+**Baseline.** `y-base`
+
+No final evaluation yet.
+
+
+Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-cond-text-pool) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-cond-text-pool/logs)
+
+## `y-swiglu` (#9): pending
+
+
+**Question.** SwiGLU feed-forward (equal parameters), retested on the v2 recipe.
+
+**Change.** `model.ffn_activation=swiglu`
+
+**Evidence.** Positive in T5 / LightningDiT, neutral in the 140M SR-DiT.
+
+**Baseline.** `y-base`
+
+No final evaluation yet.
+
+
+Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-swiglu) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-swiglu/logs)
+
+## `y-attn-gate` (#9): pending
+
+
+**Question.** Head-wise sigmoid gate on the attention output, retested on the v2 recipe.
+
+**Change.** `model.attn_gate=head`
+
+**Evidence.** Gated attention (arXiv 2505.06708), LLMs only.
+
+**Baseline.** `y-base`
+
+No final evaluation yet.
+
+
+Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-attn-gate) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-attn-gate/logs)
+
+## `y-speaker-condition` (round 2): pending
+
+
+**Question.** Frozen ECAPA speaker embedding -> adaLN, on the v2 recipe (after the audit fix: inference embeds the same audio as the store).
+
+**Change.** `model.speaker_condition_dim=192`, `train.speaker_condition=teacher/ecapa-speechbrain`
+
+**Baseline.** `y-base`
+
+No final evaluation yet.
+
+
+Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-speaker-condition) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-speaker-condition/logs)
+
+## `y-decay-matrices` (audit): pending
+
+
+**Question.** Weight decay on matrices only (norm gains, biases, gates and embeddings undecayed), on the v2 recipe.
+
+**Change.** `train.weight_decay_scope=matrices`
+
+**Evidence.** Standard practice (AdamW exclusions in GPT/DiT training); the audit found decay on every parameter.
+
+**Baseline.** `y-base`
+
+No final evaluation yet.
+
+
+Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-decay-matrices) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-decay-matrices/logs)
+
+## `y-regularized` (#14): pending
+
+
+**Question.** Dropout 0.1 and weight decay 0.05 on matrices, on the v2 recipe. Caveat: the text-hinge negative pass draws its own dropout masks.
+
+**Change.** `model.dropout=0.1`, `train.weight_decay=0.05`, `train.weight_decay_scope=matrices`
+
+**Baseline.** `y-base`
+
+No final evaluation yet.
+
+
+Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-regularized) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-regularized/logs)
 

@@ -106,3 +106,24 @@ QUALITY = ["model.quality_condition=true", "train.quality_scores=quality/dnsmos.
 ARMS["full-v2"] = ("model candidate v2: cross + quality + REPA + char units, 60k", BASE,
                    EXECUTION + CROSS + QUALITY + REPA + ["model.text_units=chars"],
                    ["quality/dnsmos.json", "teacher/mhubert147-l12-pca256"])
+
+# Round 3 (26 September): A/Bs on the full-v2 recipe. The architecture audit showed that on base+cross a zero-init
+# option (identical initial function and data order) still moved the 20k WER by ~5 points: that WER mostly records
+# when alignment happened. With speech-REPA the text aligns within ~5k updates (quick WER 11 at 5k vs ~95), so the
+# 20k scores should measure the options instead. "y-<option>" = the full-v2 recipe + the option, stopped at 20k of
+# the same 60k schedule; y-base is full-v2's own 20k snapshot (identical training up to there), y-s43 its seed twin.
+V2 = EXECUTION + CROSS + QUALITY + REPA + ["model.text_units=chars"]
+V2_NEEDS = ["quality/dnsmos.json", "teacher/mhubert147-l12-pca256"]
+ARMS["y-s43"] = ("noise floor of the v2 recipe", BASE, V2 + ["train.seed=43"], V2_NEEDS)
+for _name in ("long-skip", "value-residual", "ffn-conv", "final-adaln", "cond-text-pool", "swiglu", "attn-gate",
+              "speaker-condition"):
+    _issue, _config, _overrides, _needs = ARMS[_name]
+    _own = [o for o in _overrides if o not in EXECUTION]
+    ARMS[f"y-{_name}"] = (f"{_issue}, on v2", BASE, V2 + _own, V2_NEEDS + [n for n in _needs if n not in V2_NEEDS])
+# Weight decay only on matrices (audit: 'all' also shrinks norm gains, biases and gates), alone and as #14's
+# regularization (dropout 0.1, weight decay 0.05 on matrices).
+ARMS["y-decay-matrices"] = ("audit: weight decay on matrices only, on v2", BASE,
+                            V2 + ["train.weight_decay_scope=matrices"], V2_NEEDS)
+ARMS["y-regularized"] = ("#14 dropout 0.1 + weight decay 0.05 on matrices, on v2", BASE,
+                         V2 + ["model.dropout=0.1", "train.weight_decay=0.05", "train.weight_decay_scope=matrices"],
+                         V2_NEEDS)

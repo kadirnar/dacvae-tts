@@ -16,7 +16,7 @@ from pathlib import Path
 from huggingface_hub import HfApi, hf_hub_download
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from arms import ARMS, CROSS, EXECUTION  # noqa: E402
+from arms import ARMS, CROSS, EXECUTION, V2  # noqa: E402
 
 HEADER = Path(__file__).resolve().parent / "hub_header.md"
 FULL = 495  # sentences of a final evaluation; fewer = the quick intermediate check
@@ -34,6 +34,7 @@ def describe(folder):
         return OTHER.get(folder, "")
     purpose, _, overrides, _ = ARMS[folder]
     shared = set(EXECUTION) | (set(CROSS) if "cross" in purpose or folder.startswith(("x-", "full-")) else set())
+    shared |= set(V2) if folder.startswith("y-") else set()
     own = [o.split(".", 1)[-1] for o in overrides if o not in shared]
     text = purpose + (f": `{', '.join(own)}`" if own else "")
     return text if len(text) <= 160 else text[:157] + "...`"
@@ -58,7 +59,7 @@ def cell(value, scale):
 
 
 def order(folder):
-    for rank, prefix in enumerate(("full-", "run-c", "ft-", "grpo", "base-", "pairs-", "x-")):
+    for rank, prefix in enumerate(("full-", "run-c", "y-", "ft-", "grpo", "base-", "pairs-", "x-")):
         if folder.startswith(prefix):
             return rank, folder
     return 9, folder

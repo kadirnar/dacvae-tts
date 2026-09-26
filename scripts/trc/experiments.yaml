@@ -53,8 +53,8 @@ x-no-negatives:
   issue: "#8"
   question: "Are run C's existing text negatives (contrastive loss) useful? Turned off."
   baseline: pairs-cross
-  verdict: rejected
-  conclusion: "WER +1.6 and CER +1.7 against the same seed (within the seed spread). Keep the text negatives; they cost ~20 % update time."
+  verdict: tie
+  conclusion: "WER +1.6 and CER +1.7 against the same seed, inside the ~5-point training-seed spread: not resolved. The text negatives stay (no evidence to remove them); removing them would save ~20 % update time."
 x-pairs-tail:
   issue: "#11"
   question: "Tail silence, long prompts / short targets and quiet prompt cuts."
@@ -97,7 +97,7 @@ x-repa:
   conclusion: "The largest single win. WER 12.3 -> 5.6, alignment ~4x earlier (quick WER 13.6 at 5k vs ~98), SIM-o +0.045; DNSMOS -0.08 and UTMOS -0.24 (recovered in full-v2 by the quality condition)."
 x-tla:
   issue: "#10"
-  question: "TLA-SA. Per-layer speaker alignment of token features to frozen ECAPA embeddings, weight 0.5."
+  question: "TLA-SA. Per-layer speaker alignment of token features to frozen ECAPA embeddings, weight 0.5 (trained before the audit fix that masks prompt-free rows)."
   evidence: "TLA-SA (arXiv 2511.09995)."
   baseline: pairs-cross
   verdict: rejected
@@ -107,15 +107,15 @@ x-swiglu:
   question: "SwiGLU feed-forward (equal parameters)."
   evidence: "Positive in T5 / LightningDiT, neutral in the 140M SR-DiT."
   baseline: pairs-cross
-  verdict: rejected
-  conclusion: "WER +5.2 against the same seed, worse than both base seeds, and SIM-o/DNSMOS/UTMOS losses."
+  verdict: tie
+  conclusion: "No gain. WER +5.2 against the same seed, but level with the seed-43 base (17.5 vs 16.9) on every metric; the audit found the code correct (Shazeer form, equal parameters). Not adopted; retested on the v2 recipe (y-swiglu)."
 x-attn-gate:
   issue: "#9"
   question: "Head-wise sigmoid gate on the attention output."
   evidence: "Gated attention (arXiv 2505.06708), LLMs only; no TTS ablation."
   baseline: pairs-cross
-  verdict: rejected
-  conclusion: "WER +4.4 against the same seed and losses on every metric; alignment not faster."
+  verdict: tie
+  conclusion: "No gain. WER +4.4 against the same seed, but level with the seed-43 base (16.7 vs 16.9) on every metric, although it starts as exactly the base function (zero-init gate): a zero-init change alone moves the base+cross 20k WER by ~5 points. Not adopted; retested on the v2 recipe (y-attn-gate)."
 x-long-skip:
   issue: "#9"
   question: "Input -> output long skip (concat + LayerNorm + Linear)."
@@ -205,3 +205,74 @@ run-c-reference:
   baseline: null
   verdict: reference
   conclusion: "WER 7.54 / CER 4.89 / SIM-o 0.535 with the prompt-rate rule (the published 4.3 used podcast prompts whose voices occur in training)."
+
+# Round 3: A/Bs on the full-v2 recipe (REPA aligns within ~5k updates; see scripts/trc/arms.py). Baseline: y-base.
+y-base:
+  issue: round 3
+  question: "The full-v2 recipe (cross prompts + quality condition + speech-REPA + character units) at 20k updates: full-v2's own 20k snapshot, evaluated in full."
+  dirs: [y-base/step-0020000, y-base/step-0020000-s1000]
+  baseline: pairs-cross
+  verdict: reference
+y-s43:
+  issue: round 3
+  question: "Noise floor of the v2 recipe: training seed 43. Is the 20k seed spread smaller once REPA aligns early?"
+  baseline: y-base
+  verdict: pending
+y-long-skip:
+  issue: "#9"
+  question: "Input -> output long skip (concat + LayerNorm + Linear), on the v2 recipe."
+  evidence: "DiTTo-TTS: WER 3.30 -> 2.93; counter-evidence F5 4.17 -> 5.17."
+  baseline: y-base
+  verdict: pending
+y-value-residual:
+  issue: "#9"
+  question: "Value residual (v_l <- l1 v_l + l2 v_1), on the v2 recipe."
+  evidence: "ResFormer (arXiv 2410.17897); SR-DiT FID 4.02 -> 3.64."
+  baseline: y-base
+  verdict: pending
+y-ffn-conv:
+  issue: "#9"
+  question: "Depthwise convolution (k=5) inside the feed-forward, on the v2 recipe."
+  evidence: "ZipVoice (removing its conv modules takes WER 1.69 -> 9.79), U-DiT, SANA."
+  baseline: y-base
+  verdict: pending
+y-final-adaln:
+  issue: "#9"
+  question: "Final adaLN before the output projection, on the v2 recipe."
+  evidence: "Standard in DiT and F5-TTS."
+  baseline: y-base
+  verdict: pending
+y-cond-text-pool:
+  issue: "#9"
+  question: "Pooled transcript added to the condition, on the v2 recipe (in the joined layout the pool covers prompt and target text)."
+  evidence: "DiTTo-TTS: pooled text WER 3.00 -> 2.93."
+  baseline: y-base
+  verdict: pending
+y-swiglu:
+  issue: "#9"
+  question: "SwiGLU feed-forward (equal parameters), retested on the v2 recipe."
+  evidence: "Positive in T5 / LightningDiT, neutral in the 140M SR-DiT."
+  baseline: y-base
+  verdict: pending
+y-attn-gate:
+  issue: "#9"
+  question: "Head-wise sigmoid gate on the attention output, retested on the v2 recipe."
+  evidence: "Gated attention (arXiv 2505.06708), LLMs only."
+  baseline: y-base
+  verdict: pending
+y-speaker-condition:
+  issue: round 2
+  question: "Frozen ECAPA speaker embedding -> adaLN, on the v2 recipe (after the audit fix: inference embeds the same audio as the store)."
+  baseline: y-base
+  verdict: pending
+y-decay-matrices:
+  issue: audit
+  question: "Weight decay on matrices only (norm gains, biases, gates and embeddings undecayed), on the v2 recipe."
+  evidence: "Standard practice (AdamW exclusions in GPT/DiT training); the audit found decay on every parameter."
+  baseline: y-base
+  verdict: pending
+y-regularized:
+  issue: "#14"
+  question: "Dropout 0.1 and weight decay 0.05 on matrices, on the v2 recipe. Caveat: the text-hinge negative pass draws its own dropout masks."
+  baseline: y-base
+  verdict: pending
