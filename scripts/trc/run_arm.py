@@ -134,6 +134,12 @@ def push(arm, run, step, out, title, notes, slim=False):
     return False
 
 
+def pushed_steps(run, arm):
+    """Steps push_snapshot.py has put on the Hub (its state file next to the run)."""
+    state = run / f"pushed-dacvae-tts-trc-{arm}.json"
+    return set(json.loads(state.read_text())["steps"]) if state.exists() else set()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--arm", required=True)
@@ -170,8 +176,7 @@ def main():
     notes = args.notes or f"Trained on [Codyfederer/tr-combined](https://huggingface.co/datasets/Codyfederer/tr-combined). " \
                           f"Config: `{config.name}` ({', '.join(args.set) or 'as given'}); frame budget " \
                           f"{setting('FRAME_BUDGET')}, {setting('AB_STEPS')}-update schedule stopped at {stop}."
-    state = run / f"pushed-dacvae-tts-trc-{args.arm}.json"
-    on_hub = set(json.loads(state.read_text())["steps"]) if state.exists() else set()
+    on_hub = pushed_steps(run, args.arm)
     for step in steps:
         snapshot = run / f"step-{step:07d}.pt"
         if not snapshot.exists() and (trainer is None or str(step) in on_hub):
@@ -209,6 +214,8 @@ def main():
         trainer.wait()
     if final.exists() and (run / "last.pt").exists():
         (run / "last.pt").unlink()  # the final snapshot is the same state
+    if final.exists() and not args.arm.startswith("full-") and str(stop) in pushed_steps(run, args.arm):
+        final.unlink()  # on the Hub with its evaluations; only the model candidates (full-*) are reused locally
     (results / "done").touch()
     log(f"{args.arm}: done")
 

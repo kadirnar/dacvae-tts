@@ -60,8 +60,10 @@ On top of cross prompts:
 | latent negatives (#8, λ 0.2/0.2, no cap) | 61.9 | 38.8 | 0.136 | 1.93 | **rejected: collapse** |
 | tail silence + short targets + quiet cut (#11) | 13.0 | 8.9 | 0.544 | 2.97 | tie |
 | character CTC targets (#11) | 13.6 | 8.6 | 0.543 | 2.94 | tie |
-| **character units** (one token per Turkish letter) | **11.1 / 11.2** (seeds 42 / 1000) | **7.4 / 7.4** | 0.552 | 2.96 | best arm; training seed 43 pending |
+| character units (one token per Turkish letter), training seeds 42 / 43 | 11.2 / 16.1 | 7.4 / 9.7 | 0.551 / 0.546 | 2.97 / 2.93 | same-seed ΔWER -1.1 / -0.9 (ties), SIM-o +0.011 / +0.013 (wins), RTF -30 %: small consistent gain, **adopted** |
 | **quality condition** (new, below) | 13.6 | 8.9 | 0.531 | 3.02 | **adopted** (quality control, WER neutral) |
+| no text-negative contrastive loss (#8 ablation) | 13.9 | 9.9 | 0.540 | 2.97 | same-seed +1.6 [0.2, 3.1]: keep the negatives (they cost ~20 % update time) |
+| TLA-SA (#10), all layers, ECAPA targets, weight 0.5 | 24.7 | 14.1 | 0.455 | 2.77 | **rejected**: +12.4 WER, slower alignment at every snapshot |
 | **speech-REPA (#10)**, block 10 → mHuBERT-147 L12 (seeds 42+1000) | **5.6** | **3.8** | **0.585** | 2.88 | **adopted**: WER -6.7 [-8.0, -5.5], alignment ~4× earlier; DNSMOS -0.08, UTMOS -0.24 |
 
 **Why cross prompts matter so much here:** tr-combined clips are short, so within-utterance prompts are 0.4–2.2 s
