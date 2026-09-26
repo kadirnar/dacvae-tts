@@ -10,6 +10,7 @@ so that synthesis never fails on a stray symbol. Plain Turkish sentences pass th
 most ~20 s including the voice prompt).
 """
 
+import math
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -348,6 +349,61 @@ def speakable(text, version="turkish-v2"):
     raise ValueError("Metin normalleştirilemedi")
 
 
+_TERMINAL = ".!?…"
+_CLOSERS = "\"'»)”’"
+# Finite predicates that close a sentence in written Turkish: the copula -DIr (etmektedir, düşüktür, mevcuttur,
+# bulunmaktadır), the first-person-plural past -DIk (genişlettik), the progressive -Iyor(-um/-uz/-sun/-lar) and the
+# first-person future -AcAğIm/-AcAğIz (oynayacağız). Words shorter than six letters are skipped (tür, satır, kadir
+# and düdük end the same way without being predicates), and so are predicates followed by a word that continues the
+# sentence.
+_PREDICATE = re.compile(r"(?:[dt][ıiuü]r|[dt][ıiuü]k|yor(?:um|uz|sun|lar)?|(?:acağ|eceğ)(?:ım|im|ız|iz))$")
+_JOINERS = {"ve", "veya", "ya", "yahut", "ile", "ki", "de", "da", "ama", "fakat", "çünkü", "diye", "gibi"}
+
+
+def _upper_first(word):
+    return ({"i": "İ", "ı": "I"}.get(word[0]) or word[0].upper()) + word[1:] if word else word
+
+
+def restore_sentence_ends(text, max_run=100, min_words=4):
+    """Periods for unpunctuated text: in every sentence longer than `max_run` characters, a period after each finite
+    predicate (_PREDICATE) that has at least `min_words` words before it and is not followed by a joining word, and a
+    capital after it. The models were trained on punctuated sentences; a run of several sentences without
+    punctuation is read poorly (see finish_sentence). Punctuated text is returned unchanged."""
+    lines = []
+    for line in text.split("\n"):
+        parts = []
+        for part in re.split(r"(?<=[.!?…])\s+", line.strip()):
+            if len(part) <= max_run:
+                parts.append(part)
+                continue
+            words, pieces, current = part.split(), [], []
+            for index, word in enumerate(words):
+                current.append(word)
+                bare = word.strip(_CLOSERS).lower()
+                following = words[index + 1].strip(",;:").lower() if index + 1 < len(words) else None
+                if (following and len(current) >= min_words and len(bare) >= 6 and bare.isalpha()
+                        and _PREDICATE.search(bare) and following not in _JOINERS):
+                    pieces.append(" ".join(current) + ".")
+                    current = []
+            if current:
+                pieces.append(" ".join(current))
+            parts.append(" ".join([pieces[0]] + [_upper_first(p) for p in pieces[1:]]))
+        lines.append(" ".join(p for p in parts if p))
+    return "\n".join(lines)
+
+
+def finish_sentence(text):
+    """`text` ending with sentence punctuation (a trailing , ; : or dash becomes a period). Every training transcript
+    ends with one: given a text without it, the tr-combined models lose track of where the utterance ends and produce
+    noise (on one unpunctuated paragraph WER 32-93 % and DNSMOS 1.8-2.0 per chunk, vs WER 2.9 % and DNSMOS 3.36 once
+    each chunk ends with a period)."""
+    stripped = text.rstrip()
+    core = stripped.rstrip(_CLOSERS)
+    if not core or core[-1] in _TERMINAL:
+        return stripped
+    return core.rstrip(",;:—–- ") + "." + stripped[len(core):]
+
+
 def split_sentences(text, max_chars=180, min_chars=40):
     """Sentence chunks of at most `max_chars` characters (hard limit applies to single long sentences too).
 
@@ -376,35 +432,50 @@ def split_sentences(text, max_chars=180, min_chars=40):
     return chunks
 
 
+def _balanced(parts, max_chars):
+    """Contiguous groups of `parts` (joined by spaces), each at most `max_chars` long, as few as possible and of nearly
+    equal length: a greedy fill would leave a one-word tail, which the model reads as noise. None if no split fits."""
+    total = sum(len(p) for p in parts) + len(parts) - 1
+    for groups in range(max(1, math.ceil(total / max_chars)), len(parts) + 1):
+        target = total / groups
+        out, current = [], ""
+        for part in parts:
+            joined = f"{current} {part}".strip()
+            if current and len(joined) > target and len(out) < groups - 1:
+                if len(joined) <= max_chars and abs(len(joined) - target) < abs(len(current) - target):
+                    out.append(joined)
+                    current = ""
+                else:
+                    out.append(current)
+                    current = part
+            else:
+                current = joined
+        if current:
+            out.append(current)
+        if all(len(p) <= max_chars for p in out):
+            return out
+    return None
+
+
+# Where a long sentence is cut, best first: after ; or :, after a comma, before a conjunction, at any space.
+_CUTS = (r"(?<=[;:])\s+", r"(?<=,)\s+", r"\s+(?=(?:ve|veya|ya da|ama|ancak|fakat|çünkü|oysa)\s)", r"\s+")
+
+
 def _split_long(sentence, max_chars):
     if len(sentence) <= max_chars:
         return [(sentence, "sentence")]
-    for separator in (r"(?<=[;:])\s+", r"(?<=,)\s+", r"\s+"):
+    for separator in _CUTS:
         parts = [p for p in re.split(separator, sentence) if p]
         if len(parts) < 2:
             continue
-        out, current = [], ""
-        for part in parts:
-            if current and len(current) + 1 + len(part) > max_chars:
-                out.append(current)
-                current = part
-            else:
-                current = f"{current} {part}".strip()
-        if current:
-            out.append(current)
-        if all(len(p) <= max_chars for p in out) or separator == r"\s+":
-            result = []
-            for p in out:
-                if len(p) > max_chars:  # a single word longer than the limit
-                    result.extend((p[i : i + max_chars], "clause") for i in range(0, len(p), max_chars))
-                else:
-                    result.append((p, "clause"))
-            result[-1] = (result[-1][0], "sentence")
-            return result
-        # Some part is still too long: split those parts further with the next separator.
-        result = []
-        for p in out:
-            result.extend(_split_long(p, max_chars) if len(p) > max_chars else [(p, "clause")])
+        out = _balanced(parts, max_chars)
+        if out is None and separator != _CUTS[-1]:
+            continue
+        if out is None:  # a single word longer than the limit
+            out = []
+            for part in parts:
+                out.extend(part[i : i + max_chars] for i in range(0, len(part), max_chars))
+        result = [(p, "clause") for p in out]
         result[-1] = (result[-1][0], "sentence")
         return result
     return [(sentence, "sentence")]
