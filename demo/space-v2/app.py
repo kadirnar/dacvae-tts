@@ -18,7 +18,7 @@ from dacvae_tts.frontend import speakable  # noqa: E402
 
 CUSTOM = "Custom checkpoint (repository below)"
 RATE_AUTO, RATE_PROMPT, RATE_FIXED = "Automatic (recommended)", "Prompt rate", "Fixed rate"
-GUIDE_CFG, GUIDE_RESCALE, GUIDE_APG, GUIDE_SPLIT = "CFG (lowest WER)", "CFG + rescale", "APG (cleaner audio)", "Separate text/speaker"
+GUIDE_CFG, GUIDE_RESCALE, GUIDE_APG, GUIDE_SPLIT = "CFG", "CFG + rescale", "APG (highest quality)", "Separate text/speaker"
 DURATION_MODELS = {"Automatic": None, "Duration predictor (refit on tr-combined)": "predictor",
                    "Prompt rate (rule)": "rule", "Rule + fast-prompt clamp": "clamp",
                    "Hybrid (predictor when slow, clamp when fast)": "auto", "Syllable rule": "syllable"}
@@ -325,17 +325,29 @@ Whisper large-v3:
 | **full-v2** | **0.93** | **0.36** | **0.556** | **3.128** | 2.533 |
 
 ### Settings
-- **Defaults** are the measured ones: one sample per sentence and the duration predictor refit on tr-combined. The demo
-  shows the model's raw output; *Number of candidates* > 1 turns on best-of-N (Whisper picks the candidate it transcribes
-  best, which makes the displayed WER optimistic).
+- **Defaults = the highest audio quality** (one sample per sentence, no reranking): the quality condition asked for
+  DNSMOS SIG/BAK/OVRL 4.6/4.9/4.4 (the model's own default is 4.0/4.5/3.8) and APG guidance (η 0.5). Same evaluation,
+  full-v2, 495 sentences, seeds 42 + 1000:
+
+| full-v2 setting | WER % | CER % | SIM-o | DNSMOS | UTMOS | clipped % |
+|---|---:|---:|---:|---:|---:|---:|
+| trained default quality + CFG (the table above) | 0.93 | 0.36 | 0.556 | 3.128 | 2.533 | 0.031 |
+| **demo default: quality 4.6/4.9/4.4 + APG** | 1.02 | 0.31 | 0.520 | **3.332** | **2.761** | **0.003** |
+
+  Naturalness (UTMOS +0.23) and cleanliness (DNSMOS +0.20) rise, clipping falls tenfold and WER is unchanged; the output
+  is cleaner than a typical reference, so its similarity to the reference recording drops (SIM-o −0.04). For the closest
+  voice match choose *CFG* under Advanced settings. Asking for 5.0/5.0/5.0 leaves the trained range (similarity collapses).
+- *Number of candidates* > 1 turns on best-of-N (Whisper picks the candidate it transcribes best, which makes the
+  displayed WER optimistic).
 - **Speaking rate · Automatic** uses the refit duration predictor (syllables, words, punctuation and the prompt's own
   rate). *Prompt rate* copies the prompt's rate (+ duration scale); *Fixed rate* uses the characters/s you set. With the
   prompt-rate rule full-v2 measures WER 2.21 %: an over-long target is the main source of repeated words.
 - **Long text:** split into sentences (reference + chunk within the lengths seen in training); the chunks are generated in
   one batched GPU call and joined with short pauses. Numbers, dates/clock times, currencies, units, abbreviations and
   symbols are converted to their spoken form; the text the model reads is shown in "Text read by the model".
-- **Guidance:** CFG 5 gives the lowest WER. *APG* and *CFG + rescale* give a more natural level at a small WER cost;
-  *Separate text/speaker* is three-branch guidance (text = Guidance, speaker = its own scale).
+- **Guidance:** *APG* (default) removes CFG's saturation: the highest naturalness and DNSMOS with no measurable WER cost.
+  *CFG* keeps the closest voice match; *CFG + rescale* lowered naturalness in our sweep; *Separate text/speaker* is
+  three-branch guidance (text = Guidance, speaker = its own scale).
 - Outputs are normalized to −16 LUFS and delivered as 48 kHz / 16-bit WAV. The DACVAE decoder keeps Meta's embedded
   watermark.
 
@@ -353,7 +365,7 @@ audio, info, text, metrics, transcript, reference = client.predict(
     handle_file("reference.wav"), "Referans kaydın tam transkripti.", "Söylenecek metin.",  # Turkish transcript, Turkish text
     "Automatic (recommended)", 15, 1, 42, True,                   # rate mode, fixed rate, candidates, seed, verification
     "full-v2 60k · tr-combined (WER 0.93 %)", "", "", "model",   # checkpoint (or custom repo/file/type)
-    5.0, 32, "CFG (lowest WER)", 0.7, 0.5, 3.0, 1.0, 1.0, "Automatic",  # guidance, steps, guidance type and parameters
+    5.0, 32, "APG (highest quality)", 0.7, 0.5, 3.0, 1.0, 1.0, "Automatic",  # guidance, steps, guidance type and parameters
     api_name="/synthesize")
 ```
 
@@ -371,7 +383,8 @@ with gr.Blocks(title="DACVAE-TTS Turkish") as demo:
         "to their spoken form. "
         "Model: **full-v2** ([VoiceHub/dacvae-tts-tr-combined](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined)) · 67M · "
         "trained on Codyfederer/tr-combined · Freya-TR-Eval WER **0.93 %** with unseen voices, one sample per sentence (the "
-        "previous model: 5.10 %). The defaults show the model's raw output; details: About.\n\n"
+        "previous model: 5.10 %). Defaults are set for the highest audio quality (one sample per sentence, no reranking): "
+        "UTMOS 2.76, DNSMOS 3.33; details: About.\n\n"
         "ℹ️ The GPU quota (ZeroGPU) is granted per Hugging Face account: visitors who are not logged in can make only a few "
         "requests; once you log in, your own quota is used. For the API use "
         "`Client(\"Vyvo/dacvae-tts-tr-v2-demo\", token=\"hf_...\")`."
@@ -413,12 +426,12 @@ with gr.Blocks(title="DACVAE-TTS Turkish") as demo:
                         with gr.Row():
                             guidance = gr.Slider(1.0, 8.0, value=E.DEFAULTS["guidance"], step=0.5, label="Guidance (text)")
                             steps = gr.Slider(8, 64, value=E.DEFAULTS["steps"], step=4, label="Euler steps")
-                        guide_mode = gr.Radio([GUIDE_CFG, GUIDE_RESCALE, GUIDE_APG, GUIDE_SPLIT], value=GUIDE_CFG,
+                        guide_mode = gr.Radio([GUIDE_CFG, GUIDE_RESCALE, GUIDE_APG, GUIDE_SPLIT], value=GUIDE_APG,
                                               label="Guidance type")
                         with gr.Row():
                             rescale = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Rescale φ", visible=False)
                             apg_eta = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="APG η (parallel component)",
-                                                visible=False)
+                                                visible=True)
                             speaker_guidance = gr.Slider(1.0, 8.0, value=3.0, step=0.5, label="Speaker guidance",
                                                          visible=False)
                         with gr.Row():

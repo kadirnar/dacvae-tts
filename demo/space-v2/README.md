@@ -36,8 +36,9 @@ one sample per sentence: WER 0.93 %, CER 0.36 % (previous model: 5.10 % / 2.93 %
 - **Synthesis:** 3–15 s reference (upload or microphone; transcript filled in by Whisper and editable) + any length of text.
   Long text is split into sentences and generated in one batched GPU call; numbers, dates, clock times, currencies, units,
   abbreviations, acronyms and symbols are rewritten into spoken Turkish.
-- **Defaults = the measured setting:** one sample per sentence, duration predictor refit on tr-combined. Best-of-N is
-  available as an option.
+- **Defaults = the highest audio quality:** one sample per sentence (no reranking), the quality condition asked for
+  DNSMOS 4.6/4.9/4.4 and APG guidance: UTMOS 2.76, DNSMOS 3.33, clipping 0.003 % at WER 1.0 % (the trained defaults:
+  2.53, 3.13, 0.031 %, WER 0.9 %). Best-of-N and CFG remain available as options.
 - **Models:** full-v2 (default), full-cross and the previous run C side by side (*A/B comparison*); any other checkpoint of
   the experiments repo via *Custom checkpoint*.
 - ZeroGPU: models are loaded once at start-up; GPU time per request is a few seconds.
