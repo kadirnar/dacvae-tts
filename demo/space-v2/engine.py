@@ -36,7 +36,7 @@ from scipy.signal import resample_poly
 from dacvae_tts.audio import finalize, join, loudness, to_pcm16, trim_silence
 from dacvae_tts.codec import Codec, read_audio
 from dacvae_tts.duration import speaking_rate
-from dacvae_tts.frontend import speakable, split_sentences
+from dacvae_tts.frontend import finish_sentence, restore_sentence_ends, speakable, split_sentences
 from dacvae_tts.inference import Synthesizer, VoiceReference
 from dacvae_tts.metrics import DNSMOS, error_counts
 
@@ -482,13 +482,15 @@ def plan_text(text, reference_seconds, rate=15.0, fixed_rate=None):
     max_chars = int(target_seconds * (fixed_rate or rate))
     # One sentence per chunk (min_chars=0: no merging of short neighbours) and in-sentence ";"/": " read as a comma:
     # the tr-combined models were trained on single-sentence clips and skip the words before a sentence end (. ; :)
-    # inside one chunk (WER 28-39 % on such two-sentence chunks vs 0 % with a comma or separate chunks).
-    spoken = re.sub(r"\s*[;:]\s+", ", ", prepared.text)
+    # inside one chunk (WER 28-39 % on such two-sentence chunks vs 0 % with a comma or separate chunks). Unpunctuated
+    # text first gets its sentence ends back (frontend.restore_sentence_ends), and every chunk ends with a period
+    # (frontend.finish_sentence; Synthesizer applies it too): a chunk without one is read as noise.
+    spoken = restore_sentence_ends(re.sub(r"\s*[;:]\s+", ", ", prepared.text))
     pieces = split_sentences(spoken, max_chars=max(max_chars, 80), min_chars=0)
     chunks, pauses, changes = [], [], list(prepared.changes)
     for piece, kind in pieces:
         try:
-            normalized, extra = speakable(piece)
+            normalized, extra = speakable(finish_sentence(piece))
         except ValueError:
             continue
         changes.extend(c for c in extra if c not in changes)

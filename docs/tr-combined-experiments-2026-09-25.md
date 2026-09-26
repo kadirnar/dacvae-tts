@@ -178,6 +178,22 @@ Freya-TR-Eval numbers are single sentences and are unaffected. The demo therefor
 reads in-sentence `;`/`: ` as a comma: 0 errors in 198 words on the same inputs. A training-side fix would be
 multi-sentence targets (consecutive clips of one recording joined into one target).
 
+A second limitation: **a chunk must end with sentence punctuation.** Every training transcript does. Given a chunk
+without a final `.`/`!`/`?`, the models lose track of where the utterance ends and produce noise. One unpunctuated
+paragraph measured WER 32–93 % and DNSMOS 1.8–2.0 per chunk; with a period on every chunk it measured WER 2.9 % and
+DNSMOS 3.36.
+
+Three fixes follow from this:
+- `frontend.finish_sentence` adds the final period, and `Synthesizer` applies it to every target text. This leaves
+  Freya-TR-Eval unchanged: all 495 sentences are punctuated.
+- `frontend.restore_sentence_ends` puts periods back into unpunctuated text after Turkish finite predicates (-DIr,
+  -DIk, -Iyor, -AcAğIz), unless a conjunction follows.
+- `split_sentences` cuts long sentences into balanced parts, preferring conjunctions. A greedy fill left one-word
+  tails, which the model also reads as noise.
+
+On the reporter's paragraph (3 voices × 2 seeds) this moved WER 31.9 → 4.5 %, DNSMOS 2.02 → 3.46 and UTMOS 1.82 → 3.03.
+Most of the remaining "errors" are Whisper spacing and a typo in the input.
+
 Demo defaults for the highest audio quality (inference only, full-v2). A sweep on the quick set (96 sentences) found
 two quality levers:
 - **The quality condition.** Asking for DNSMOS 4.6/4.9/4.4 gave UTMOS +0.21 and DNSMOS +0.17. Asking for 5.0/5.0/5.0

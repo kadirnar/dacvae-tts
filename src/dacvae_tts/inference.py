@@ -11,6 +11,7 @@ import torch
 from .codec import Codec, backend_options, check_compatibility, normalize_loudness, read_audio
 from .contracts import normalization_stats, target_mask
 from .duration import DurationPredictor, articulation_seconds, auto_mode, clamp_scale, rule_frames
+from .frontend import finish_sentence
 from .model import quality_features, sample, text_only_rows
 from .quality import MOMENT_MATCH, latent_moments, match_moments
 from .text import BYTE_OFFSET, normalize, tokenize
@@ -496,6 +497,7 @@ class Synthesizer:
         `context`: its speaker context [L,C] (context_latents) for speaker-context models."""
         if not math.isfinite(duration_scale) or duration_scale <= 0:
             raise ValueError("duration_scale must be finite and positive")
+        text = finish_sentence(text)  # every training target ends with sentence punctuation (frontend.finish_sentence)
         reference = reference.to(self.device)
         layout = self.model.cfg.text_layout
         tokens, segments = tokenize(reference_text, text, version=self.text_version, layout=layout,
@@ -704,6 +706,7 @@ class Synthesizer:
         layout = self.model.cfg.text_layout
         timing = self._articulation_timing(reference, seconds, duration_mode)
         speaker, context = self.speaker_embedding(reference), self.context_latents(reference)
+        texts = [finish_sentence(text) for text in texts]  # every training target ends with sentence punctuation
         requests = []
         for text in texts:
             tokens, segments = tokenize(reference.transcript, text, version=self.text_version, layout=layout, units=self.text_units)
