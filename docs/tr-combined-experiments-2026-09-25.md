@@ -64,6 +64,8 @@ On top of cross prompts:
 | character units (one token per Turkish letter), training seeds 42 / 43 | 11.2 / 16.1 | 7.4 / 9.7 | 0.551 / 0.546 | 2.97 / 2.93 | same-seed ΔWER -1.1 / -0.9 (ties), SIM-o +0.011 / +0.013 (wins), RTF -30 %: small consistent gain, **adopted** |
 | **quality condition** (new, below) | 13.6 | 8.9 | 0.531 | 3.02 | **adopted** (quality control, WER neutral) |
 | no text-negative contrastive loss (#8 ablation) | 13.9 | 9.9 | 0.540 | 2.97 | same-seed +1.6 [0.2, 3.1]: keep the negatives (they cost ~20 % update time) |
+| SwiGLU FFN (#9) | 17.5 | 9.9 | 0.524 | 2.90 | rejected: +5.2 WER, loses SIM-o/DNSMOS/UTMOS |
+| attention output gate per head (#9) | 16.7 | 10.3 | 0.529 | 2.92 | rejected: +4.4 WER, loses every metric |
 | TLA-SA (#10), all layers, ECAPA targets, weight 0.5 | 24.7 | 14.1 | 0.455 | 2.77 | **rejected**: +12.4 WER, slower alignment at every snapshot |
 | **speech-REPA (#10)**, block 10 → mHuBERT-147 L12 (seeds 42+1000) | **5.6** | **3.8** | **0.585** | 2.88 | **adopted**: WER -6.7 [-8.0, -5.5], alignment ~4× earlier; DNSMOS -0.08, UTMOS -0.24 |
 
