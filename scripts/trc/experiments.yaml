@@ -240,7 +240,8 @@ y-value-residual:
   question: "Value residual (v_l <- l1 v_l + l2 v_1), on the v2 recipe."
   evidence: "ResFormer (arXiv 2410.17897); SR-DiT FID 4.02 -> 3.64."
   baseline: y-base
-  verdict: pending
+  verdict: adopted
+  conclusion: "A small quality gain beyond both base seeds at no cost (+24 parameters, +2 % step time): DNSMOS 3.138 vs 3.111 / 3.112 (+0.026; seed spread 0.001) and UTMOS 2.533 vs 2.486 / 2.506 (+0.03-0.05; seed spread 0.02). WER 3.94, CER 2.29 and SIM-o 0.582 lie within the seed spread (neutral). Candidate for full-v3; the margin rests on two base seeds."
 y-ffn-conv:
   issue: "#9"
   question: "Depthwise convolution (k=5) inside the feed-forward, on the v2 recipe."
