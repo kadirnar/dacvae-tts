@@ -71,7 +71,10 @@ def page(repo, folders, scores, header):
              "Training on [Codyfederer/tr-combined](https://huggingface.co/datasets/Codyfederer/tr-combined), code and "
              "write-up: https://github.com/kadirnar/dacvae-tts (branch `trc/tr-combined-experiments`). One folder per "
              "run: `checkpoints/step-*.pt`, `eval/step-*/` (scores, per-sentence Whisper transcripts, audio), "
-             "`train.jsonl`, `config.json` and its own README.", ""]
+             "`train.jsonl`, `config.json`, its own README, `RESULT.md` (question, result against its baseline, "
+             "verdict) and `logs/`.", "",
+             f"**[EXPERIMENTS.md](https://huggingface.co/{repo}/blob/main/EXPERIMENTS.md)**: the result log of every "
+             "experiment (question, evidence, paired result against its baseline, trajectory, verdict and why).", ""]
     if header:
         lines += [header.strip(), ""]
     lines += ["## Final evaluation of every run", "",

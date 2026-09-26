@@ -72,6 +72,9 @@ def readme(title, repo, state, notes, subdir=""):
     lines = [f"# {title}", "", f"Checkpoints and evaluations of `{name}` (DACVAE-TTS, Turkish zero-shot voice cloning, "
              "https://github.com/kadirnar/dacvae-tts)." + (f" All experiments: https://huggingface.co/{repo}." if subdir
                                                              else ""), ""]
+    if subdir:
+        lines += [f"Result against its baseline and verdict: [RESULT.md](https://huggingface.co/{repo}/blob/main/{subdir}/"
+                  f"RESULT.md) · logs: [logs/]({tree(repo, subdir, 'logs')})", ""]
     if notes:
         lines += [notes, ""]
     lines += ["Evaluation: Freya-TR-Eval sentences spoken by leak-free Common Voice test voices (48 speakers), "

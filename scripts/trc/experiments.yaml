@@ -1,0 +1,207 @@
+# Registry of the tr-combined experiments: what each run asks, the evidence behind it, its baseline and the verdict.
+# scripts/trc/experiment_log.py adds the measured numbers (paired against the baseline, both sampling seeds pooled),
+# the quick-set trajectory and training statistics, and writes EXPERIMENTS.md plus <run>/RESULT.md and <run>/logs/ in
+# the experiments repo. Verdicts are set by hand once a run's final evaluation exists ("pending" until then).
+# Protocol: Freya-TR-Eval 495 sentences x 48 leak-free Common Voice voices, one sample per sentence, guidance 5,
+# 32 steps, prompt-rate duration rule, Whisper large-v3, turkish-v2; A/B arms stop at 20k of the 60k schedule.
+
+base-s42:
+  issue: "#7"
+  question: "Baseline. Run C's recipe with the #7 speed options (compiled blocks, selective checkpointing, pad 8) on tr-combined."
+  baseline: null
+  verdict: reference
+  conclusion: "WER 30.1 at 20k. Its seed-43 twin reached 24.9, so the training-seed spread at 20k is ~5 WER points; an option counts only when it beats both seeds."
+base-s43:
+  issue: "#4"
+  question: "Noise floor. The same recipe with training seed 43."
+  baseline: base-s42
+  verdict: reference
+  conclusion: "5 WER points better than seed 42 with nothing changed. This spread is the bar for every 20k A/B."
+base-eager:
+  issue: "#7"
+  question: "Does the compiled execution change the result? Run C's exact eager execution."
+  baseline: base-s42
+  verdict: tie
+  conclusion: "4.8 WER below the better compiled seed, the size of the seed spread itself; at equal frames seen the runs match (parity)."
+base-s42-pad64:
+  issue: "#7"
+  question: "First baseline, with lengths padded to multiples of 64."
+  baseline: base-s42
+  verdict: rejected
+  conclusion: "20 % of every batch was padding with tr-combined's short clips (13.8k vs 17.3k target frames per update). Replaced by pad 8."
+pairs-cross:
+  issue: "#11"
+  question: "Cross-utterance prompts. The prompt comes from other clips of the same speaker (40 %, up to 3 clips / 12 s) instead of the start of the target clip."
+  evidence: "VoiceStar (arXiv 2505.19462). tr-combined's within-utterance prompts are 0.4-2.2 s while inference prompts are 3.5-12 s."
+  baseline: base-s42
+  verdict: adopted
+  conclusion: "WER 30.1 -> 12.3 (seed 43: 24.9 -> 16.9), better on every metric. The base of all later arms."
+x-s43:
+  issue: "#4"
+  question: "Noise floor of the new base (base + cross prompts, training seed 43)."
+  baseline: pairs-cross
+  verdict: reference
+  conclusion: "16.9 vs 12.3 WER; the seed spread stays ~5 points."
+x-latent-negatives:
+  issue: "#8"
+  question: "Latent negatives (contrastive flow matching against shifted/corrupted latents, lambda 0.2/0.2)."
+  evidence: "RobustSpeechFlow (arXiv 2605.22083); Delta-FM (arXiv 2506.05350)."
+  baseline: pairs-cross
+  verdict: rejected
+  conclusion: "Collapse (WER 62, SIM-o 0.14). Without a cap the per-frame optimum is F+ + 1/3(F+ - F_rand) + 1/3(F+ - F_aug), a target pushed away from real speech."
+x-no-negatives:
+  issue: "#8"
+  question: "Are run C's existing text negatives (contrastive loss) useful? Turned off."
+  baseline: pairs-cross
+  verdict: rejected
+  conclusion: "WER +1.6 and CER +1.7 against the same seed (within the seed spread). Keep the text negatives; they cost ~20 % update time."
+x-pairs-tail:
+  issue: "#11"
+  question: "Tail silence, long prompts / short targets and quiet prompt cuts."
+  evidence: "Robustness to end-of-utterance fillers and to short targets."
+  baseline: pairs-cross
+  verdict: tie
+  conclusion: "WER 13.3 vs 12.3, inside the seed spread; no measurable effect."
+x-pairs-char-ctc:
+  issue: "#11"
+  question: "Character targets for the alignment CTC head."
+  baseline: pairs-cross
+  verdict: tie
+  conclusion: "WER 13.6 vs 12.3, inside the seed spread."
+x-char-units:
+  issue: round 2
+  question: "Character units. One text token per Turkish letter instead of the BPE-like units."
+  evidence: "Turkish orthography is close to phonemic; a character vocabulary is the future-work item of the roadmap."
+  baseline: pairs-cross
+  verdict: adopted
+  conclusion: "WER -1.1 / CER -0.8 and SIM-o +0.011 against the same seed; the seed-43 repeat agrees (x-char-units-s43). Small but consistent, and 30 % faster inference."
+x-char-units-s43:
+  issue: round 2
+  question: "Character units, training seed 43 (the strict test of the rule from #4)."
+  baseline: x-s43
+  verdict: adopted
+  conclusion: "WER -0.9 (tie), SIM-o +0.013 (win), UTMOS -0.05 against the seed-43 base. Same direction as seed 42."
+x-quality-cond:
+  issue: new
+  question: "Quality condition. The target clip's DNSMOS [SIG, BAK, OVRL] enters the voice condition (zero-init); inference requests high quality."
+  evidence: "QA-MDT (arXiv 2405.15863); Lyth & King (arXiv 2402.01912)."
+  baseline: pairs-cross
+  verdict: adopted
+  conclusion: "WER neutral. Requesting 4.0/4.5/3.8 raises DNSMOS by +0.135 and UTMOS by +0.19 on the same checkpoint. A quality control, not a WER option."
+x-repa:
+  issue: "#10"
+  question: "Speech-REPA. Align block 10 with mHuBERT-147 layer 12 (PCA 256), weight 1.0."
+  evidence: "A-DMA (arXiv 2505.19595): ~2x faster alignment; BareWave (arXiv 2606.09048): WavLM REPA WER 3.32 -> 2.86."
+  baseline: pairs-cross
+  verdict: adopted
+  conclusion: "The largest single win. WER 12.3 -> 5.6, alignment ~4x earlier (quick WER 13.6 at 5k vs ~98), SIM-o +0.045; DNSMOS -0.08 and UTMOS -0.24 (recovered in full-v2 by the quality condition)."
+x-tla:
+  issue: "#10"
+  question: "TLA-SA. Per-layer speaker alignment of token features to frozen ECAPA embeddings, weight 0.5."
+  evidence: "TLA-SA (arXiv 2511.09995)."
+  baseline: pairs-cross
+  verdict: rejected
+  conclusion: "WER 24.7 vs 12.3, SIM-o 0.455 vs 0.540, slower alignment at every snapshot. Outside the seed spread."
+x-swiglu:
+  issue: "#9"
+  question: "SwiGLU feed-forward (equal parameters)."
+  evidence: "Positive in T5 / LightningDiT, neutral in the 140M SR-DiT."
+  baseline: pairs-cross
+  verdict: rejected
+  conclusion: "WER +5.2 against the same seed, worse than both base seeds, and SIM-o/DNSMOS/UTMOS losses."
+x-attn-gate:
+  issue: "#9"
+  question: "Head-wise sigmoid gate on the attention output."
+  evidence: "Gated attention (arXiv 2505.06708), LLMs only; no TTS ablation."
+  baseline: pairs-cross
+  verdict: rejected
+  conclusion: "WER +4.4 against the same seed and losses on every metric; alignment not faster."
+x-long-skip:
+  issue: "#9"
+  question: "Input -> output long skip (concat + LayerNorm + Linear)."
+  evidence: "DiTTo-TTS: WER 3.30 -> 2.93; counter-evidence F5 4.17 -> 5.17."
+  baseline: pairs-cross
+  verdict: pending
+x-value-residual:
+  issue: "#9"
+  question: "Value residual (v_l <- l1 v_l + l2 v_1)."
+  evidence: "ResFormer (arXiv 2410.17897); SR-DiT FID 4.02 -> 3.64."
+  baseline: pairs-cross
+  verdict: pending
+x-ffn-conv:
+  issue: "#9"
+  question: "Depthwise convolution (k=5) inside the feed-forward."
+  evidence: "ZipVoice (removing its conv modules takes WER 1.69 -> 9.79), U-DiT, SANA."
+  baseline: pairs-cross
+  verdict: pending
+x-final-adaln:
+  issue: "#9"
+  question: "Final adaLN before the output projection."
+  evidence: "Standard in DiT and F5-TTS."
+  baseline: pairs-cross
+  verdict: pending
+x-cond-text-pool:
+  issue: "#9"
+  question: "Pooled target text added to the condition."
+  evidence: "DiTTo-TTS: pooled text WER 3.00 -> 2.93."
+  baseline: pairs-cross
+  verdict: pending
+x-regularized:
+  issue: "#14"
+  question: "Dropout 0.1 and weight decay 0.05."
+  baseline: pairs-cross
+  verdict: pending
+x-speaker-context:
+  issue: round 2
+  question: "Multi-clip speaker context vector (50 % of updates)."
+  baseline: pairs-cross
+  verdict: pending
+x-repa-tla:
+  issue: "#10"
+  question: "Speech-REPA and TLA-SA together. Does TLA-SA hurt less once REPA supplies the alignment?"
+  baseline: x-repa
+  verdict: pending
+x-speaker-condition:
+  issue: round 2
+  question: "Frozen ECAPA speaker embedding -> adaLN."
+  baseline: pairs-cross
+  verdict: pending
+full-cross:
+  issue: model
+  question: "First full-length model. Run C's recipe + cross prompts, 60k updates."
+  baseline: run-c-reference
+  verdict: adopted
+  conclusion: "Beats run C on every metric (refit duration predictor, seeds pooled; WER 5.10 -> 2.94)."
+full-v2:
+  issue: model
+  question: "Second full-length model. Cross prompts + quality condition + speech-REPA + character units, 60k updates."
+  baseline: full-cross
+  verdict: adopted
+  conclusion: "The current best model. With the refit duration predictor, WER 0.93 / CER 0.36 vs run C 5.10 / 2.93 and full-cross 2.94 / 1.66; DNSMOS 3.13, SIM-o 0.556, UTMOS tie."
+ft-w0:
+  issue: "#14"
+  question: "Control fine-tune. 8k more updates of full-cross without model guidance, sampled with CFG 5."
+  baseline: full-cross
+  verdict: tie
+  conclusion: "WER 6.58 vs 6.46, a tie; extra updates alone change nothing."
+ft-mg-w07:
+  issue: "#14"
+  question: "Model-guidance fine-tune (w = 0.7), sampled without CFG (half the network evaluations)."
+  evidence: "Model guidance (arXiv 2504.20334)."
+  baseline: full-cross
+  verdict: rejected
+  conclusion: "WER 9.0 vs 6.5 and SIM-o -0.02 (clipping / 5, DNSMOS +0.05). Not worth half the NFE at this size."
+grpo:
+  issue: "#16"
+  question: "Flow-GRPO, 600 updates, composite reward (CER 1.0 + SIM 0.5 + DNSMOS 0.4 + UTMOS 0.4) from full-cross 60k."
+  evidence: "FlowTTS-GRPO (arXiv 2606.23190)."
+  baseline: full-cross
+  verdict: tie
+  conclusion: "No measurable effect at this budget (WER 6.83 vs 6.46, SIM-o +0.005)."
+run-c-reference:
+  issue: "#3"
+  dirs: [inference-runc/base, inference-runc/seed1000]
+  question: "Run C (VoiceHub/dacvae-tts-tr-w512, trained on Vyvo/tr-dataset-12) re-measured under the leak-free protocol."
+  baseline: null
+  verdict: reference
+  conclusion: "WER 7.54 / CER 4.89 / SIM-o 0.535 with the prompt-rate rule (the published 4.3 used podcast prompts whose voices occur in training)."

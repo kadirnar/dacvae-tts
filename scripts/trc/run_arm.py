@@ -225,6 +225,8 @@ def main():
     if final.exists() and not args.arm.startswith("full-") and str(stop) in pushed_steps(run, args.arm):
         final.unlink()  # on the Hub with its evaluations; only the model candidates (full-*) are reused locally
     (results / "done").touch()
+    if not os.environ.get("NO_PUSH"):  # the run's RESULT.md (paired against its baseline) and logs/ on the Hub
+        subprocess.run([PY, "scripts/trc/experiment_log.py", "--runs", args.arm], cwd=REPO)
     log(f"{args.arm}: done")
 
 
