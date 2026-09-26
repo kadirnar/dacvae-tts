@@ -233,7 +233,8 @@ y-long-skip:
   question: "Input -> output long skip (concat + LayerNorm + Linear), on the v2 recipe."
   evidence: "DiTTo-TTS: WER 3.30 -> 2.93; counter-evidence F5 4.17 -> 5.17."
   baseline: y-base
-  verdict: pending
+  verdict: tie
+  conclusion: "No gain beyond the seed spread. WER 3.99 lies between the two base seeds (4.32 / 3.64); CER, SIM-o (0.589 vs 0.587 / 0.571), DNSMOS and UTMOS within them. +0.53M parameters; not adopted."
 y-value-residual:
   issue: "#9"
   question: "Value residual (v_l <- l1 v_l + l2 v_1), on the v2 recipe."
