@@ -122,7 +122,8 @@ def push(arm, run, step, out, title, notes, slim=False):
     if os.environ.get("NO_PUSH"):
         return False
     command = [PY, "scripts/trc/push_snapshot.py", "--run", str(run), "--repo", f"{setting('HF_ORG')}/dacvae-tts-trc-{arm}",
-               "--step", str(step), "--title", title, "--notes", notes, *(["--slim"] if slim else [])]
+               "--step", str(step), "--title", title, "--notes", notes, *(["--slim"] if slim else []),
+               "--public"]  # public: the org's private storage quota is shared with other projects and ran full
     if out is not None and (out / "summary.json").exists():
         command += ["--eval", str(out)]
     for attempt in range(3):
@@ -169,10 +170,13 @@ def main():
     notes = args.notes or f"Trained on [Codyfederer/tr-combined](https://huggingface.co/datasets/Codyfederer/tr-combined). " \
                           f"Config: `{config.name}` ({', '.join(args.set) or 'as given'}); frame budget " \
                           f"{setting('FRAME_BUDGET')}, {setting('AB_STEPS')}-update schedule stopped at {stop}."
+    state = run / f"pushed-dacvae-tts-trc-{args.arm}.json"
+    on_hub = set(json.loads(state.read_text())["steps"]) if state.exists() else set()
     for step in steps:
         snapshot = run / f"step-{step:07d}.pt"
-        if not snapshot.exists() and trainer is None:
-            # A restarted arm: pushed snapshots were deleted locally; their evaluations and pushes are done.
+        if not snapshot.exists() and (trainer is None or str(step) in on_hub):
+            # A restarted arm: pushed snapshots were deleted locally; their evaluations and pushes are done. (A
+            # resumed trainer never writes them again: waiting for them stalled full-v2 until its trainer exited.)
             log(f"{args.arm}: step {step} snapshot not on disk (already pushed); skipping")
             continue
         while not snapshot.exists():

@@ -43,16 +43,47 @@ def training_active(arm):
     return found.returncode == 0
 
 
+def arm_command(arm, gpu, cache):
+    """The run_arm.py (or post-training script) command line and environment of an arm."""
+    issue, config, overrides, _ = ARMS[arm]
+    command = [PY, "scripts/trc/run_arm.py", "--arm", arm, "--config", config, "--gpu", gpu,
+               "--notes", f"Trained on [Codyfederer/tr-combined](https://huggingface.co/datasets/Codyfederer/"
+                          f"tr-combined). Issue {issue}. Base `{config}`; overrides: {', '.join(overrides) or 'none'}. "
+                          f"Frame budget {setting('FRAME_BUDGET')}, {setting('AB_STEPS')}-update LR schedule "
+                          f"stopped at {setting('AB_STOP')}; cache {cache.name} of tr-combined."]
+    if overrides:
+        command += ["--set", *overrides]
+    if arm in POSTTRAIN:  # an exclusive post-training job with its own script (training, evaluation, push)
+        command = ["bash", POSTTRAIN[arm]["script"]]
+    # "full-*" arms train the whole 60k schedule (the model candidates), the others stop at AB_STOP.
+    env = {**os.environ, **({"AB_STOP": os.environ.get("AB_STEPS", "60000")} if arm.startswith("full-") else {})}
+    if arm in FINETUNE:  # warm-started fine-tune: its own schedule length, guidance and initial weights
+        fine = FINETUNE[arm]
+        env.update(AB_STEPS=fine["steps"], AB_STOP=fine["steps"], GUIDANCE=fine["guidance"])
+        command += ["--init-from", fine["init"]]
+    return command, env
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("arms", nargs="+")
     parser.add_argument("--parallel", type=int, default=1)
     parser.add_argument("--gpu", default="0")
+    parser.add_argument("--finish", action="store_true",
+                        help="Arms whose training ended: run their runners one after another now, without a training "
+                             "slot or done-marker check (evaluates missing steps, retries failed pushes)")
     args = parser.parse_args()
     unknown = [arm for arm in args.arms if arm not in ARMS]
     if unknown:
         sys.exit(f"unknown arms: {unknown}; known: {sorted(ARMS)}")
     out, cache = Path(setting("OUT")), Path(setting("CACHE"))
+    if args.finish:
+        for arm in args.arms:
+            command, env = arm_command(arm, args.gpu, cache)
+            with open(out / f"queue-{arm}.log", "a") as stream:
+                code = subprocess.run(command, cwd=REPO, stdout=stream, stderr=subprocess.STDOUT, env=env).returncode
+            log(f"finish {arm}: exit {code}")
+        return
     pending = [arm for arm in args.arms if not (out / arm / "done").exists()]
     running, failed, started, streak = {}, [], {}, 0
     while pending or running:
@@ -81,26 +112,11 @@ def main():
                 break
             arm = ready[0]
             pending.remove(arm)
-            issue, config, overrides, _ = ARMS[arm]
-            command = [PY, "scripts/trc/run_arm.py", "--arm", arm, "--config", config, "--gpu", args.gpu,
-                       "--notes", f"Trained on [Codyfederer/tr-combined](https://huggingface.co/datasets/Codyfederer/"
-                                  f"tr-combined). Issue {issue}. Base `{config}`; overrides: {', '.join(overrides) or 'none'}. "
-                                  f"Frame budget {setting('FRAME_BUDGET')}, {setting('AB_STEPS')}-update LR schedule "
-                                  f"stopped at {setting('AB_STOP')}; cache {cache.name} of tr-combined."]
-            if overrides:
-                command += ["--set", *overrides]
-            if arm in POSTTRAIN:  # an exclusive post-training job with its own script (training, evaluation, push)
-                command = ["bash", POSTTRAIN[arm]["script"]]
+            command, env = arm_command(arm, args.gpu, cache)
             stream = open(out / f"queue-{arm}.log", "a")
-            # "full-*" arms train the whole 60k schedule (the model candidates), the others stop at AB_STOP.
-            env = {**os.environ, **({"AB_STOP": os.environ.get("AB_STEPS", "60000")} if arm.startswith("full-") else {})}
-            if arm in FINETUNE:  # warm-started fine-tune: its own schedule length, guidance and initial weights
-                fine = FINETUNE[arm]
-                env.update(AB_STEPS=fine["steps"], AB_STOP=fine["steps"], GUIDANCE=fine["guidance"])
-                command += ["--init-from", fine["init"]]
             running[arm] = subprocess.Popen(command, cwd=REPO, stdout=stream, stderr=subprocess.STDOUT, env=env)
             started[arm] = time.time()
-            log(f"start {arm} ({issue})")
+            log(f"start {arm} ({ARMS[arm][0]})")
             time.sleep(90)  # stagger compilation and loader start-up
         if pending and not running and not any(all((cache / n).exists() for n in ARMS[a][3]) for a in pending):
             log(f"waiting for stores of {pending}")
