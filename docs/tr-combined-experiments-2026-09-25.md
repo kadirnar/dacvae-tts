@@ -178,6 +178,23 @@ Freya-TR-Eval numbers are single sentences and are unaffected. The demo therefor
 reads in-sentence `;`/`: ` as a comma: 0 errors in 198 words on the same inputs. A training-side fix would be
 multi-sentence targets (consecutive clips of one recording joined into one target).
 
+Demo defaults for the highest audio quality (inference only, full-v2). A sweep on the quick set (96 sentences) found
+two quality levers:
+- **The quality condition.** Asking for DNSMOS 4.6/4.9/4.4 gave UTMOS +0.21 and DNSMOS +0.17. Asking for 5.0/5.0/5.0
+  leaves the trained range: SIM-o falls to 0.36 and WER rises.
+- **APG guidance** (η 0.5). UTMOS +0.06, DNSMOS +0.07, and clipping is halved.
+
+Guidance 3, a lower late guidance, CFG rescale (UTMOS −0.09), 64 steps and the prompt-rate rule did not help quality.
+The two levers add up. Confirmed on the full protocol (495 sentences, seeds 42 + 1000):
+
+| full-v2 | WER % | CER % | SIM-o | DNSMOS | UTMOS | clipped % |
+|---|---:|---:|---:|---:|---:|---:|
+| trained quality target + CFG | 0.93 | 0.36 | 0.556 | 3.128 | 2.533 | 0.031 |
+| **quality 4.6/4.9/4.4 + APG (demo default)** | 1.02 (tie) | 0.31 | 0.520 | **3.332** | **2.761** | **0.003** |
+
+UTMOS +0.23 [0.19, 0.27] closes more than half of the gap to the codec ceiling (2.93). The cost is SIM-o −0.036: the
+output is cleaner than the Common Voice reference recordings, so it matches them less.
+
 ## 10. Open
 
 #10: REPA + TLA-SA (deferred). #14: WSD, uniform-t cooldown and dual EMA (untested). `full-v3`: v2 + value residual at

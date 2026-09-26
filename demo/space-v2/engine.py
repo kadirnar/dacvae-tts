@@ -62,9 +62,11 @@ CHECKPOINTS = OrderedDict(
 )
 DEFAULT_MODEL = next(iter(CHECKPOINTS))
 
-# Defaults of the reported numbers: guidance 5, 32 Euler steps, sway -1, the duration predictor refit on tr-combined,
-# one sample per sentence (the model's raw output; best-of-N stays available as an option).
-DEFAULTS = dict(guidance=5.0, steps=32, sway=-1.0, duration_mode="predictor", candidates=1)
+# Highest-quality defaults (demo-quality sweep on full-v2, docs/tr-combined-experiments-2026-09-25.md §9): guidance 5
+# with APG (eta 0.5, set in app.py), 32 Euler steps, sway -1, the duration predictor refit on tr-combined, one sample
+# per sentence, and the quality condition asked for DNSMOS SIG/BAK/OVRL 4.6/4.9/4.4 (the trained default is 4.0/4.5/3.8;
+# 5.0/5.0/5.0 leaves the trained range: voice similarity collapses). Models without a quality condition ignore it.
+DEFAULTS = dict(guidance=5.0, steps=32, sway=-1.0, duration_mode="predictor", candidates=1, quality=(4.6, 4.9, 4.4))
 PAUSES = {"sentence": 0.30, "clause": 0.15}
 
 
@@ -107,6 +109,7 @@ del _first
 MODELS = {DEFAULT_MODEL: Synthesizer(PATHS[DEFAULT_MODEL], device=DEVICE, codec=CODEC, asr_language="tr",
                                      duration_model=DURATION)}
 MODELS[DEFAULT_MODEL].checkpoint = slim(MODELS[DEFAULT_MODEL].checkpoint)
+MODELS[DEFAULT_MODEL].quality_target = DEFAULTS["quality"]
 
 from transformers import (  # noqa: E402
     AutoFeatureExtractor,
@@ -242,6 +245,7 @@ def model_for(path):
             torch.cuda.empty_cache() if DEVICE == "cuda" else None
         synth = Synthesizer(path, device=DEVICE, codec=CODEC, asr_language="tr", duration_model=DURATION)
         synth.checkpoint = slim(synth.checkpoint)
+        synth.quality_target = DEFAULTS["quality"]
         _WORKER_MODELS[path] = synth
     _WORKER_MODELS.move_to_end(path)
     return _WORKER_MODELS[path]
