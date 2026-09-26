@@ -279,7 +279,8 @@ y-speaker-condition:
   issue: round 2
   question: "Frozen ECAPA speaker embedding -> adaLN, on the v2 recipe (after the audit fix: inference embeds the same audio as the store)."
   baseline: y-base
-  verdict: pending
+  verdict: rejected
+  conclusion: "A trade-off against quality. SIM-o 0.599 is above both base seeds (0.587 / 0.571) and WER 3.66 matches the better seed, but DNSMOS (3.039 vs 3.111 / 3.112) and UTMOS (2.295 vs 2.486 / 2.506, -0.2) fall far below both. Likely the embedding also carries the prompt's recording conditions (the Common Voice prompts are noisier than the training speech), which the output then copies. Not adopted."
 y-decay-matrices:
   issue: audit
   question: "Weight decay on matrices only (norm gains, biases, gates and embeddings undecayed), on the v2 recipe."

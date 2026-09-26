@@ -6,10 +6,10 @@ Every run of the tr-combined study (DACVAE-TTS, Turkish zero-shot TTS): the ques
 |---|---|
 | reference | `base-s42`, `base-s43`, `x-s43`, `run-c-reference`, `y-base`, `y-s43` |
 | tie | `base-eager`, `x-no-negatives`, `x-pairs-tail`, `x-pairs-char-ctc`, `x-swiglu`, `x-attn-gate`, `x-long-skip`, `ft-w0`, `grpo`, `y-long-skip`, `y-final-adaln`, `y-cond-text-pool`, `y-decay-matrices` |
-| rejected | `base-s42-pad64`, `x-latent-negatives`, `x-tla`, `ft-mg-w07`, `y-ffn-conv`, `y-regularized` |
+| rejected | `base-s42-pad64`, `x-latent-negatives`, `x-tla`, `ft-mg-w07`, `y-ffn-conv`, `y-speaker-condition`, `y-regularized` |
 | adopted | `pairs-cross`, `x-char-units`, `x-char-units-s43`, `x-quality-cond`, `x-repa`, `full-cross`, `full-v2`, `y-value-residual` |
 | not run | `x-value-residual`, `x-ffn-conv`, `x-final-adaln`, `x-cond-text-pool`, `x-regularized`, `x-speaker-context`, `x-repa-tla`, `x-speaker-condition` |
-| pending | `y-swiglu`, `y-attn-gate`, `y-speaker-condition` |
+| pending | `y-swiglu`, `y-attn-gate` |
 
 ## Models side by side (refit duration predictor, seeds 42 + 1000 pooled)
 
@@ -1037,6 +1037,8 @@ Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-
 No final evaluation yet.
 
 
+**Training.** final validation flow 0.7120 (step 4000); 0.269 s/update; 14,073 target frames/update
+
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-swiglu) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-swiglu/logs)
 
 ## `y-attn-gate` (#9): pending
@@ -1055,7 +1057,7 @@ No final evaluation yet.
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-attn-gate) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-attn-gate/logs)
 
-## `y-speaker-condition` (round 2): pending
+## `y-speaker-condition` (round 2): rejected
 
 
 **Question.** Frozen ECAPA speaker embedding -> adaLN, on the v2 recipe (after the audit fix: inference embeds the same audio as the store).
@@ -1064,10 +1066,22 @@ Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-
 
 **Baseline.** `y-base`
 
-No final evaluation yet.
+Final evaluation, sampling seeds 42 + 1000 pooled (y-speaker-condition/step-0020000, y-speaker-condition/step-0020000-s1000):
+
+| metric | `y-base` | `y-speaker-condition` | difference [95 % CI] | verdict |
+|---|---:|---:|---|---|
+| WER % | 4.32 | 3.66 | -0.66 [-1.29, -0.04] | win |
+| CER % | 2.98 | 2.40 | -0.58 [-1.05, -0.11] | win |
+| SIM-o | 0.587 | 0.599 | +0.012 [0.005, 0.019] | win |
+| DNSMOS | 3.111 | 3.039 | -0.072 [-0.087, -0.056] | loss |
+| UTMOS | 2.486 | 2.295 | -0.191 [-0.219, -0.164] | loss |
 
 
-**Training.** final validation flow 0.7111 (step 4000); 0.271 s/update; 14,123 target frames/update
+**Trajectory** (WER / CER %; * = quick check, first 96 sentences): 5k: 10.1 / 6.2*, 10k: 7.2 / 5.1*, 15k: 4.1 / 3.5*, 20k: 3.7 / 2.4
+
+**Training.** final validation flow 0.6804 (step 20000); 0.153 s/update; 13,518 target frames/update
+
+**Verdict: rejected.** A trade-off against quality. SIM-o 0.599 is above both base seeds (0.587 / 0.571) and WER 3.66 matches the better seed, but DNSMOS (3.039 vs 3.111 / 3.112) and UTMOS (2.295 vs 2.486 / 2.506, -0.2) fall far below both. Likely the embedding also carries the prompt's recording conditions (the Common Voice prompts are noisier than the training speech), which the output then copies. Not adopted.
 
 Files: [checkpoints, evaluations, audio](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-speaker-condition) · [logs](https://huggingface.co/VoiceHub/dacvae-tts-tr-combined/tree/main/y-speaker-condition/logs)
 
